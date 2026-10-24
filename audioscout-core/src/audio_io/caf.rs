@@ -16,15 +16,10 @@ impl PcmFile for CafFile {
         let mut bits_per_sample: u16 = 16;
         let mut is_float = false;
         let mut audio_data: Vec<u8> = Vec::new();
-
         while pos + 12 <= data.len() {
             let chunk_type = &data[pos..pos + 4];
-            let chunk_size = u64::from_be_bytes([
-                data[pos+4], data[pos+5], data[pos+6], data[pos+7],
-                data[pos+8], data[pos+9], data[pos+10], data[pos+11],
-            ]) as usize;
+            let chunk_size = u64::from_be_bytes([data[pos+4], data[pos+5], data[pos+6], data[pos+7], data[pos+8], data[pos+9], data[pos+10], data[pos+11]]) as usize;
             pos += 12;
-
             if chunk_type == b"desc" && pos + 32 <= data.len() {
                 let sr_bytes = &data[pos..pos + 8];
                 let sr_f64 = f64::from_be_bytes([sr_bytes[0], sr_bytes[1], sr_bytes[2], sr_bytes[3], sr_bytes[4], sr_bytes[5], sr_bytes[6], sr_bytes[7]]);
@@ -40,18 +35,15 @@ impl PcmFile for CafFile {
             }
             pos += chunk_size;
         }
-
         let sample_type = if is_float { SampleType::Float32 } else {
             match bits_per_sample { 8 => SampleType::UInt8, 16 => SampleType::Int16, 24 => SampleType::Int24, 32 => SampleType::Int32, _ => SampleType::Int16 }
         };
         let samples = decode_caf_pcm(&audio_data, bits_per_sample, is_float);
         Ok((samples, sample_rate, channels, sample_type))
     }
-
     fn save(path: &Path, samples: &[f32], sample_rate: u32, channels: u16, sample_type: SampleType) -> Result<()> {
         let bits_per_sample: u16 = match sample_type {
-            SampleType::UInt8 => 8, SampleType::Int16 => 16, SampleType::Int24 => 24,
-            SampleType::Int32 => 32, SampleType::Float32 => 32, _ => 16,
+            SampleType::UInt8 => 8, SampleType::Int16 => 16, SampleType::Int24 => 24, SampleType::Int32 => 32, SampleType::Float32 => 32, _ => 16,
         };
         let is_float = matches!(sample_type, SampleType::Float32 | SampleType::Float64);
         let pcm_data = encode_caf_pcm(samples, bits_per_sample, is_float);
@@ -76,7 +68,6 @@ impl PcmFile for CafFile {
         file.write_all(&pcm_data)?;
         Ok(())
     }
-
     fn probe(path: &Path) -> Result<AudioMeta> {
         let (samples, sr, ch, st) = Self::load(path)?;
         let total_frames = if ch == 0 { 0 } else { samples.len() / ch as usize };

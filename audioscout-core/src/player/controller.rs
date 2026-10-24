@@ -26,7 +26,6 @@ impl Controller {
     pub fn set_space_behavior(&mut self, is_stop: bool) { self.space_is_stop = is_stop; }
     pub fn set_skip_seconds(&mut self, secs: u32) { self.skip_seconds = secs.clamp(1, 60); }
     pub fn skip_seconds(&self) -> u32 { self.skip_seconds }
-
     pub fn play(&mut self, doc: &Document, selection: Option<(u64, u64)>) {
         let (start, end) = if let Some((s, e)) = selection { (s, e) } else { (self.resume_frame, doc.total_frames()) };
         self.start_frame = start; self.end_frame = end; self.current_frame = start;
@@ -64,7 +63,7 @@ impl Controller {
         let target = (current + skip_frames as i64).max(0) as u64;
         self.seek(target, doc, CursorSource::User);
     }
-    pub fn tick(&mut self, doc: &Document) -> bool {
+    pub fn tick(&mut self, _doc: &Document) -> bool {
         if self.state != TransportState::Playing { return false; }
         self.current_frame += 1;
         if self.current_frame >= self.end_frame && self.end_frame > self.start_frame {
@@ -83,6 +82,8 @@ impl Controller {
         self.playhead.set_playing(false); self.meter.reset();
     }
     pub fn meter_data(&self) -> MeterData {
-        MeterData { peak_l: self.meter.peak_l, peak_r: self.meter.peak_r, rms_l: self.meter.rms_l, rms_r: self.meter.rms_r }
+        let rms_l = if self.meter.sample_count > 0 { (self.meter.rms_sum_l / self.meter.sample_count as f64).sqrt() as f32 } else { 0.0 };
+        let rms_r = if self.meter.sample_count > 0 { (self.meter.rms_sum_r / self.meter.sample_count as f64).sqrt() as f32 } else { 0.0 };
+        MeterData { peak_l: self.meter.peak_l, peak_r: self.meter.peak_r, rms_l, rms_r }
     }
 }

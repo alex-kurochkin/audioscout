@@ -4,7 +4,7 @@ use rustfft::num_complex::Complex;
 
 const FFT_SIZE: usize = 512;
 
-pub fn render_spectrogram(samples: &[f32], sample_rate: u32, channels: u16, width: u32, height: u32) -> RgbaImage {
+pub fn render_spectrogram(samples: &[f32], _sample_rate: u32, channels: u16, width: u32, height: u32) -> RgbaImage {
     let ch = channels.max(1) as usize;
     let total_frames = if ch == 0 { 0 } else { samples.len() / ch };
     let mut img = ImageBuffer::new(width, height);
@@ -19,28 +19,27 @@ pub fn render_spectrogram(samples: &[f32], sample_rate: u32, channels: u16, widt
     for x in 0..width as usize {
         let center = x * hop_size + FFT_SIZE / 2;
         if center + FFT_SIZE / 2 > total_frames { break; }
-        let mut fft_input: Vec<Complex<f32>> = (0..FFT_SIZE).map(|i| {
+        let mut fft_buffer: Vec<Complex<f32>> = (0..FFT_SIZE).map(|i| {
             let sample_idx = center - FFT_SIZE / 2 + i;
             let val = if sample_idx < total_frames { mono[sample_idx] * window[i] } else { 0.0 };
             Complex::new(val, 0.0)
         }).collect();
-        let mut fft_output = fft_input.clone();
-        fft.process(&mut fft_input, &mut fft_output);
+        fft.process(&mut fft_buffer);
         for y in 0..height as usize {
             let t = y as f32 / height as f32;
             let freq_bin = (t * t * freq_bins as f32) as usize;
             let freq_bin = freq_bin.min(freq_bins - 1);
-            let magnitude = fft_output[freq_bin].norm();
+            let magnitude = fft_buffer[freq_bin].norm();
             let db = 20.0 * magnitude.max(1e-10).log10();
             let normalized = ((db + 80.0) / 80.0).clamp(0.0, 1.0);
             let color = heat_colormap(normalized as f32);
-            img.put_pixel(x as u32, (height - 1 - y) as u32, color);
+            img.put_pixel(x as u32, (height as usize - 1 - y) as u32, color);
         }
     }
     img
 }
 
-pub fn render_spectrogram_view(samples: &[f32], sample_rate: u32, channels: u16, start_frame: u64, end_frame: u64, width: u32, height: u32) -> RgbaImage {
+pub fn render_spectrogram_view(samples: &[f32], _sample_rate: u32, channels: u16, start_frame: u64, end_frame: u64, width: u32, height: u32) -> RgbaImage {
     let ch = channels.max(1) as usize;
     let view_len = (end_frame - start_frame) as usize;
     let mut img = ImageBuffer::new(width, height);
@@ -57,22 +56,21 @@ pub fn render_spectrogram_view(samples: &[f32], sample_rate: u32, channels: u16,
     for x in 0..width as usize {
         let center = x * hop_size + FFT_SIZE / 2;
         if center + FFT_SIZE / 2 > view_len { break; }
-        let mut fft_input: Vec<Complex<f32>> = (0..FFT_SIZE).map(|i| {
+        let mut fft_buffer: Vec<Complex<f32>> = (0..FFT_SIZE).map(|i| {
             let sample_idx = center - FFT_SIZE / 2 + i;
             let val = if sample_idx < view_len { mono[sample_idx] * window[i] } else { 0.0 };
             Complex::new(val, 0.0)
         }).collect();
-        let mut fft_output = fft_input.clone();
-        fft.process(&mut fft_input, &mut fft_output);
+        fft.process(&mut fft_buffer);
         for y in 0..height as usize {
             let t = y as f32 / height as f32;
             let freq_bin = (t * t * freq_bins as f32) as usize;
             let freq_bin = freq_bin.min(freq_bins - 1);
-            let magnitude = fft_output[freq_bin].norm();
+            let magnitude = fft_buffer[freq_bin].norm();
             let db = 20.0 * magnitude.max(1e-10).log10();
             let normalized = ((db + 80.0) / 80.0).clamp(0.0, 1.0);
             let color = heat_colormap(normalized as f32);
-            img.put_pixel(x as u32, (height - 1 - y) as u32, color);
+            img.put_pixel(x as u32, (height as usize - 1 - y) as u32, color);
         }
     }
     img

@@ -1,4 +1,4 @@
-use crate::{FileRow, is_audio_file};
+use crate::{table::FileRow, is_audio_file};
 use crossbeam_channel::Sender;
 use crate::UiEvent;
 use std::path::PathBuf;

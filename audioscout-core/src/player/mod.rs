@@ -1,6 +1,5 @@
 pub mod controller;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransportState { Stopped, Playing, Paused }
@@ -27,7 +26,7 @@ impl Default for PlayheadState { fn default() -> Self { Self::new() } }
 pub struct MeterData { pub peak_l: f32, pub peak_r: f32, pub rms_l: f32, pub rms_r: f32 }
 
 pub struct MeteringSource {
-    peak_l: f32, peak_r: f32, rms_sum_l: f64, rms_sum_r: f64, sample_count: usize, channels: u16,
+    pub peak_l: f32, pub peak_r: f32, pub rms_sum_l: f64, pub rms_sum_r: f64, pub sample_count: usize, channels: u16,
 }
 
 impl MeteringSource {

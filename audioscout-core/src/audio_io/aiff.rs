@@ -21,12 +21,10 @@ impl PcmFile for AiffFile {
         let mut form_type = [0u8; 4];
         cursor.read_exact(&mut form_type).map_err(|e| AudioIoError::DecodeError(e.to_string()))?;
         if &form_type != AIFF_AIFF { return Err(AudioIoError::DecodeError("Wrong form type".to_string())); }
-
         let mut num_channels: u16 = 1;
         let mut bits_per_sample: u16 = 16;
         let mut sample_rate: u32 = 44100;
         let mut audio_data: Vec<u8> = Vec::new();
-
         loop {
             let mut chunk_id = [0u8; 4];
             if cursor.read_exact(&mut chunk_id).is_err() { break; }
@@ -34,11 +32,11 @@ impl PcmFile for AiffFile {
             if cursor.read_exact(&mut chunk_size_buf).is_err() { break; }
             let chunk_size = u32::from_be_bytes(chunk_size_buf) as usize;
             let chunk_start = cursor.position() as usize;
-
             if &chunk_id == AIFF_COMM {
                 let mut buf = [0u8; 2]; cursor.read_exact(&mut buf).ok();
                 num_channels = u16::from_be_bytes(buf);
                 let mut buf4 = [0u8; 4]; cursor.read_exact(&mut buf4).ok();
+                let _num_frames = u32::from_be_bytes(buf4);
                 let mut buf2 = [0u8; 2]; cursor.read_exact(&mut buf2).ok();
                 bits_per_sample = u16::from_be_bytes(buf2);
                 let mut sr_bytes = [0u8; 10]; cursor.read_exact(&mut sr_bytes).ok();
@@ -53,20 +51,15 @@ impl PcmFile for AiffFile {
             let aligned = if chunk_size % 2 != 0 { end_pos + 1 } else { end_pos };
             cursor.set_position(aligned as u64);
         }
-
         let sample_type = match bits_per_sample {
-            8 => SampleType::UInt8, 16 => SampleType::Int16,
-            24 => SampleType::Int24, 32 => SampleType::Int32,
-            _ => SampleType::Int16,
+            8 => SampleType::UInt8, 16 => SampleType::Int16, 24 => SampleType::Int24, 32 => SampleType::Int32, _ => SampleType::Int16,
         };
         let samples = decode_aiff_pcm(&audio_data, bits_per_sample);
         Ok((samples, sample_rate, num_channels, sample_type))
     }
-
     fn save(path: &Path, samples: &[f32], sample_rate: u32, channels: u16, sample_type: SampleType) -> Result<()> {
         let bits_per_sample: u16 = match sample_type {
-            SampleType::UInt8 => 8, SampleType::Int16 => 16,
-            SampleType::Int24 => 24, SampleType::Int32 => 32, _ => 16,
+            SampleType::UInt8 => 8, SampleType::Int16 => 16, SampleType::Int24 => 24, SampleType::Int32 => 32, _ => 16,
         };
         let num_frames = if channels == 0 { 0 } else { samples.len() / channels as usize };
         let pcm_data = encode_aiff_pcm(samples, bits_per_sample);
@@ -91,7 +84,6 @@ impl PcmFile for AiffFile {
         file.write_all(&pcm_data)?;
         Ok(())
     }
-
     fn probe(path: &Path) -> Result<AudioMeta> {
         let (samples, sr, ch, st) = Self::load(path)?;
         let total_frames = if ch == 0 { 0 } else { samples.len() / ch as usize };

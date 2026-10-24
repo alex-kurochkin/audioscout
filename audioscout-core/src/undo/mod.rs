@@ -27,14 +27,14 @@ impl Stack {
     pub fn push(&mut self, entry: UndoEntry) {
         self.clear_redo();
         while self.undo_stack.len() >= self.max_depth {
-            if let Some(old) = self.undo_stack.pop_front() { self.delete_entry_files(&old); }
+            if let Some(old) = self.undo_stack.pop_front() { Self::delete_entry_files_static(&old); }
         }
         if let Some(size) = Self::dump_size(&entry) {
             self.current_disk_usage += size;
             while self.current_disk_usage > self.disk_limit_bytes && !self.undo_stack.is_empty() {
                 if let Some(old) = self.undo_stack.pop_front() {
                     if let Some(size) = Self::dump_size(&old) { self.current_disk_usage -= size; }
-                    self.delete_entry_files(&old);
+                    Self::delete_entry_files_static(&old);
                 }
             }
         }
@@ -49,11 +49,17 @@ impl Stack {
     pub fn can_undo(&self) -> bool { !self.undo_stack.is_empty() }
     pub fn can_redo(&self) -> bool { !self.redo_stack.is_empty() }
     pub fn clear(&mut self) {
-        for entry in self.undo_stack.drain(..) { self.delete_entry_files(&entry); }
-        self.clear_redo(); self.current_disk_usage = 0;
+        let undo_entries: Vec<UndoEntry> = self.undo_stack.drain(..).collect();
+        let redo_entries: Vec<UndoEntry> = self.redo_stack.drain(..).collect();
+        for entry in undo_entries { Self::delete_entry_files_static(&entry); }
+        for entry in redo_entries { Self::delete_entry_files_static(&entry); }
+        self.current_disk_usage = 0;
     }
-    fn clear_redo(&mut self) { for entry in self.redo_stack.drain(..) { self.delete_entry_files(&entry); } }
-    fn delete_entry_files(&self, entry: &UndoEntry) {
+    fn clear_redo(&mut self) {
+        let redo_entries: Vec<UndoEntry> = self.redo_stack.drain(..).collect();
+        for entry in redo_entries { Self::delete_entry_files_static(&entry); }
+    }
+    fn delete_entry_files_static(entry: &UndoEntry) {
         match &entry.op {
             UndoOp::Mute { dump_path, .. } | UndoOp::Normalize { dump_path, .. } | UndoOp::DeleteSelection { dump_path, .. } => { let _ = std::fs::remove_file(dump_path); }
         }

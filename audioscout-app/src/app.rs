@@ -1,6 +1,7 @@
 use audioscout_core::config::{ConfigStore, PreviewMode};
 use audioscout_core::player::controller::Controller;
 use audioscout_core::player::{PlayheadState, TransportState};
+use audioscout_core::audio_io::PcmFile;
 use audioscout_core::scanner::Scanner;
 use audioscout_core::table::{Column, ColumnLayout, FileRow};
 use audioscout_core::audio_view::AudioView;
@@ -409,7 +410,7 @@ impl eframe::App for AudioScoutApp {
                         let color = if self.audio_view.active_marker == Some(idx) { egui::Color32::YELLOW } else { egui::Color32::from_rgb(100, 180, 255) };
                         let mut y = rect.top();
                         while y < rect.bottom() { let seg_end = (y + 4.0).min(rect.bottom()); ui.painter().line_segment([egui::pos2(screen_x, y), egui::pos2(screen_x, seg_end)], egui::Stroke::new(1.0, color)); y += 8.0; }
-                        ui.painter().text(egui::pos2(screen_x + 2.0, rect.top() + 2.0), egui::Align::LEFT, &marker.name, egui::FontId::proportional(10.0), color);
+                        ui.painter().text(egui::pos2(screen_x + 2.0, rect.top() + 2.0), egui::Align2::LEFT_TOP, &marker.name, egui::FontId::proportional(10.0), color);
                     }
                 }
                 if let Some(sel) = self.audio_view.selection_range() {
@@ -450,7 +451,7 @@ impl eframe::App for AudioScoutApp {
                 }
             }
             ui.input(|i| {
-                let scroll = i.scroll_delta;
+                let scroll = i.smooth_scroll_delta;
                 if i.modifiers.ctrl {
                     if scroll.y > 0.0 { if let Some(pos) = i.pointer.hover_pos() { let x_ratio = ((pos.x - rect.left()) / rect.width()).clamp(0.0, 1.0); self.audio_view.zoom_at_x(1.25, x_ratio as f64); } }
                     else if scroll.y < 0.0 { if let Some(pos) = i.pointer.hover_pos() { let x_ratio = ((pos.x - rect.left()) / rect.width()).clamp(0.0, 1.0); self.audio_view.zoom_at_x(1.0 / 1.25, x_ratio as f64); } }

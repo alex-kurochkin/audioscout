@@ -1,6 +1,6 @@
 use image::{ImageBuffer, Rgba, RgbaImage};
 
-pub fn render_waveform(samples: &[f32], sample_rate: u32, channels: u16, width: u32, height: u32) -> RgbaImage {
+pub fn render_waveform(samples: &[f32], _sample_rate: u32, channels: u16, width: u32, height: u32) -> RgbaImage {
     let ch = channels.max(1) as usize;
     let total_frames = if ch == 0 { 0 } else { samples.len() / ch };
     let mut img = ImageBuffer::new(width, height);
@@ -29,14 +29,13 @@ pub fn render_waveform(samples: &[f32], sample_rate: u32, channels: u16, width: 
     img
 }
 
-pub fn render_waveform_view(samples: &[f32], sample_rate: u32, channels: u16, start_frame: u64, end_frame: u64, width: u32, height: u32, stereo: bool) -> RgbaImage {
+pub fn render_waveform_view(samples: &[f32], _sample_rate: u32, channels: u16, start_frame: u64, end_frame: u64, width: u32, height: u32, stereo: bool) -> RgbaImage {
     let ch = channels.max(1) as usize;
-    let total_frames = if ch == 0 { 0 } else { samples.len() / ch };
     let view_frames = (end_frame - start_frame) as usize;
     let row_height = if stereo { height / 2 } else { height };
     let mut img = ImageBuffer::new(width, height);
     for pixel in img.pixels_mut() { *pixel = Rgba([30, 30, 35, 255]); }
-    if view_frames == 0 || width == 0 || total_frames == 0 { return img; }
+    if view_frames == 0 || width == 0 { return img; }
     let frames_per_pixel = (view_frames as f64 / width as f64).max(1.0);
     let wave_color = Rgba([50, 220, 80, 255]);
     for row in 0..if stereo { 2 } else { 1 } {
