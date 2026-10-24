@@ -2,6 +2,7 @@ pub mod audio_io;
 pub mod audio_view;
 pub mod config;
 pub mod db;
+pub mod disk;
 pub mod player;
 pub mod preview_worker;
 pub mod render;
@@ -12,15 +13,36 @@ pub mod undo;
 use crossbeam_channel::{Receiver, Sender};
 use std::path::PathBuf;
 
+/// Events sent from background threads to UI
 #[derive(Debug, Clone)]
 pub enum UiEvent {
-    ScanDone { dir: PathBuf, rows: Vec<table::FileRow>, generation: u64 },
-    PreviewReady { path: PathBuf, uuid: String, mode: config::PreviewMode, generation: u64 },
-    PlayheadUpdate { position_secs: f64 },
+    ScanDone {
+        dir: PathBuf,
+        rows: Vec<table::FileRow>,
+        generation: u64,
+    },
+    PreviewReady {
+        path: PathBuf,
+        uuid: String,
+        mode: config::PreviewMode,
+        generation: u64,
+    },
+    PlayheadUpdate {
+        position_secs: f64,
+    },
     PlaybackFinished,
-    VolumeMeterUpdate { peak_l: f32, peak_r: f32, rms_l: f32, rms_r: f32 },
+    VolumeMeterUpdate {
+        peak_l: f32,
+        peak_r: f32,
+        rms_l: f32,
+        rms_r: f32,
+    },
+    DisksChanged {
+        disks: Vec<disk::DiskInfo>,
+    },
 }
 
+/// Application-wide event channel
 pub struct EventChannel {
     pub sender: Sender<UiEvent>,
     pub receiver: Receiver<UiEvent>,
@@ -34,12 +56,23 @@ impl EventChannel {
 }
 
 impl Default for EventChannel {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
+/// Sample type enumeration for audio files
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum SampleType {
-    UInt8, Int16, Int24, Int32, Float32, Float64, ALaw, ULaw, Compressed,
+    UInt8,
+    Int16,
+    Int24,
+    Int32,
+    Float32,
+    Float64,
+    ALaw,
+    ULaw,
+    Compressed,
 }
 
 impl std::fmt::Display for SampleType {
@@ -58,9 +91,15 @@ impl std::fmt::Display for SampleType {
     }
 }
 
+/// Probe status for audio files
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum ProbeStatus { Ok, Broken, Unavailable }
+pub enum ProbeStatus {
+    Ok,
+    Broken,
+    Unavailable,
+}
 
+/// Audio file metadata from probing
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AudioMeta {
     pub duration_secs: f64,
@@ -71,6 +110,7 @@ pub struct AudioMeta {
     pub status: ProbeStatus,
 }
 
+/// Marker (label) on the timeline
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Marker {
     pub name: String,
@@ -78,6 +118,7 @@ pub struct Marker {
     pub time_sec: f64,
 }
 
+/// Document state - loaded audio file
 #[derive(Debug, Clone)]
 pub struct Document {
     pub samples: Vec<f32>,
@@ -93,32 +134,63 @@ pub struct Document {
 impl Document {
     pub fn new() -> Self {
         Self {
-            samples: Vec::new(), sample_rate: 44100, channels: 1,
-            markers: Vec::new(), source_path: PathBuf::new(),
-            temp_path: None, dirty: false, sample_type: SampleType::Float32,
+            samples: Vec::new(),
+            sample_rate: 44100,
+            channels: 1,
+            markers: Vec::new(),
+            source_path: PathBuf::new(),
+            temp_path: None,
+            dirty: false,
+            sample_type: SampleType::Float32,
         }
     }
+
     pub fn total_frames(&self) -> u64 {
-        if self.channels == 0 { 0 } else { (self.samples.len() as u64) / (self.channels as u64) }
+        if self.channels == 0 {
+            0
+        } else {
+            (self.samples.len() as u64) / (self.channels as u64)
+        }
     }
+
     pub fn duration_secs(&self) -> f64 {
-        if self.sample_rate == 0 { 0.0 } else { self.total_frames() as f64 / self.sample_rate as f64 }
+        if self.sample_rate == 0 {
+            0.0
+        } else {
+            self.total_frames() as f64 / self.sample_rate as f64
+        }
     }
-    pub fn is_stereo(&self) -> bool { self.channels == 2 }
+
+    pub fn is_stereo(&self) -> bool {
+        self.channels == 2
+    }
 }
 
-impl Default for Document { fn default() -> Self { Self::new() } }
+impl Default for Document {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
+/// Supported audio file extensions
 pub const AUDIO_EXTENSIONS: &[&str] = &[
-    "wav", "aiff", "aif", "caf", "flac", "mp3", "ogg", "oga", "m4a", "aac", "wma", "opus", "wv", "au", "mp2",
+    "wav", "aiff", "aif", "caf", "flac", "mp3", "ogg", "oga", "m4a", "aac", "wma", "opus", "wv",
+    "au", "mp2",
 ];
+
+/// Editable file extensions (PCM read/write)
 pub const EDITABLE_EXTENSIONS: &[&str] = &["wav", "aiff", "aif", "caf"];
 
 pub fn is_audio_file(path: &std::path::Path) -> bool {
-    path.extension().and_then(|e| e.to_str())
-        .map(|e| AUDIO_EXTENSIONS.contains(&e.to_lowercase().as_str())).unwrap_or(false)
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| AUDIO_EXTENSIONS.contains(&e.to_lowercase().as_str()))
+        .unwrap_or(false)
 }
+
 pub fn is_editable_file(path: &std::path::Path) -> bool {
-    path.extension().and_then(|e| e.to_str())
-        .map(|e| EDITABLE_EXTENSIONS.contains(&e.to_lowercase().as_str())).unwrap_or(false)
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| EDITABLE_EXTENSIONS.contains(&e.to_lowercase().as_str()))
+        .unwrap_or(false)
 }

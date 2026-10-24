@@ -39,6 +39,7 @@ pub struct AudioScoutApp {
     status_message: String,
     normalize_dbfs: f32,
     expanded_dirs: HashMap<PathBuf, Vec<PathBuf>>,
+    disks: Vec<audioscout_core::disk::DiskInfo>,
 }
 
 impl AudioScoutApp {
@@ -67,6 +68,7 @@ impl AudioScoutApp {
             table_preview_mode: PreviewMode::Wave, player_preview_mode: PreviewMode::Wave,
             show_settings: false, show_columns_dialog: false, status_message: String::new(),
             normalize_dbfs: -1.0, expanded_dirs: HashMap::new(),
+            disks: Vec::new(),
         };
 
         if let Some(dir_str) = app.db.load_session("lastDir") {
@@ -74,6 +76,34 @@ impl AudioScoutApp {
             if dir.exists() { app.current_dir = Some(dir.clone()); app.scanner.scan(dir, app.event_tx.clone()); }
         }
         if let Some(dir) = start_dir { app.current_dir = Some(dir.clone()); app.scanner.scan(dir, app.event_tx.clone()); }
+
+        // Auto-expand home directory on startup
+        if let Some(home) = dirs_next::home_dir() {
+            if let Ok(entries) = std::fs::read_dir(&home) {
+                let mut subdirs: Vec<PathBuf> = entries
+                    .filter_map(|e| e.ok())
+                    .filter(|e| e.path().is_dir())
+                    .map(|e| e.path())
+                    .collect();
+                subdirs.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
+                app.expanded_dirs.insert(home, subdirs);
+            }
+        }
+
+        // Start background thread for disk auto-refresh
+        let disk_event_tx = app.event_tx.clone();
+        std::thread::spawn(move || {
+            let mut provider = audioscout_core::disk::SysinfoDiskProvider::new();
+            loop {
+                provider.refresh();
+                let disks = provider.list_disks();
+                if disk_event_tx.send(UiEvent::DisksChanged { disks }).is_err() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_secs(5));
+            }
+        });
+
         app
     }
 
@@ -103,6 +133,9 @@ impl AudioScoutApp {
                 }
                 UiEvent::PlaybackFinished => { self.status_message = "Playback finished".to_string(); }
                 UiEvent::VolumeMeterUpdate { .. } => {}
+                UiEvent::DisksChanged { disks } => {
+                    self.disks = disks;
+                }
             }
         }
     }
@@ -264,6 +297,83 @@ impl AudioScoutApp {
         }
     }
 
+    fn render_folder_node(
+        &mut self,
+        ui: &mut egui::Ui,
+        path: &Path,
+        name: &str,
+        depth: usize,
+        dir_to_select: &mut Option<PathBuf>,
+        dir_to_expand: &mut Option<PathBuf>,
+        dir_to_collapse: &mut Option<PathBuf>,
+    ) {
+        let is_current = self.current_dir.as_ref() == Some(&path.to_path_buf());
+        let is_expanded = self.expanded_dirs.contains_key(path);
+
+        let text_color = if is_current {
+            egui::Color32::YELLOW
+        } else {
+            ui.visuals().text_color()
+        };
+
+        // Create a button-like label for the folder
+        let icon = if is_expanded { "▼" } else { "▶" };
+        let label = format!("{} {} {}", icon, if is_expanded { "📂" } else { "📁" }, name);
+
+        let response = ui.add(
+            egui::Button::new(egui::RichText::new(&label).color(text_color))
+                .fill(if is_current { egui::Color32::from_rgba_premultiplied(50, 50, 50, 100) } else { egui::Color32::TRANSPARENT })
+                .stroke(egui::Stroke::NONE)
+        );
+
+        // Change cursor to hand on hover
+        if response.hovered() {
+            ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::PointingHand);
+        }
+
+        // Handle clicks
+        if response.clicked() {
+            // Single click - select the directory
+            *dir_to_select = Some(path.to_path_buf());
+            // Also toggle expand/collapse
+            if is_expanded {
+                *dir_to_collapse = Some(path.to_path_buf());
+            } else {
+                *dir_to_expand = Some(path.to_path_buf());
+            }
+        }
+
+        // Render children if expanded
+        if is_expanded {
+            ui.indent(egui::Id::new(path), |ui| {
+                if let Some(children) = self.expanded_dirs.get(path).cloned() {
+                    for child in children {
+                        let child_name = child.file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or("")
+                            .to_string();
+
+                        // Skip hidden directories
+                        if child_name.starts_with('.') {
+                            continue;
+                        }
+
+                        // Recursive call for child
+                        self.render_folder_node(
+                            ui,
+                            &child,
+                            &child_name,
+                            depth + 1,
+                            dir_to_select,
+                            dir_to_expand,
+                            dir_to_collapse,
+                        );
+                    }
+                }
+            });
+        }
+    }
+
     fn handle_keyboard(&mut self, ctx: &egui::Context) {
         let config = self.config_store.config().clone();
         ctx.input(|i| {
@@ -339,6 +449,89 @@ impl eframe::App for AudioScoutApp {
 
         // Declare paths_to_load BEFORE CentralPanel to avoid borrow conflicts
         let mut paths_to_load: Vec<PathBuf> = Vec::new();
+
+        // Left panel - Folder tree
+        // Collect actions to perform after the closure (avoid borrow conflicts)
+        let mut dir_to_select: Option<PathBuf> = None;
+        let mut dir_to_expand: Option<PathBuf> = None;
+        let mut dir_to_collapse: Option<PathBuf> = None;
+
+        egui::SidePanel::left("folder_tree")
+            .default_width(200.0)
+            .resizable(true)
+            .show(ctx, |ui| {
+                ui.heading("Folders");
+                ui.separator();
+
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    // Show Home directory
+                    if let Some(home) = dirs_next::home_dir() {
+                        self.render_folder_node(
+                            ui,
+                            &home,
+                            "Home",
+                            0,
+                            &mut dir_to_select,
+                            &mut dir_to_expand,
+                            &mut dir_to_collapse,
+                        );
+                    }
+
+                    // Show root directory
+                    let root = PathBuf::from("/");
+                    self.render_folder_node(
+                        ui,
+                        &root,
+                        "/",
+                        0,
+                        &mut dir_to_select,
+                        &mut dir_to_expand,
+                        &mut dir_to_collapse,
+                    );
+
+                    // Show connected disks (excluding Home and /)
+                    let home = dirs_next::home_dir();
+                    for disk in &self.disks {
+                        // Skip if it's Home or root (already shown)
+                        if home.as_ref() == Some(&disk.mount_point) {
+                            continue;
+                        }
+                        if disk.mount_point == PathBuf::from("/") {
+                            continue;
+                        }
+
+                        self.render_folder_node(
+                            ui,
+                            &disk.mount_point,
+                            &disk.name,
+                            0,
+                            &mut dir_to_select,
+                            &mut dir_to_expand,
+                            &mut dir_to_collapse,
+                        );
+                    }
+                });
+            });
+
+        // Apply actions after closure
+        if let Some(dir) = dir_to_select {
+            self.current_dir = Some(dir.clone());
+            self.scanner.scan(dir, self.event_tx.clone());
+        }
+        if let Some(dir) = dir_to_expand {
+            if let Ok(entries) = std::fs::read_dir(&dir) {
+                let mut subdirs: Vec<PathBuf> = entries
+                    .filter_map(|e| e.ok())
+                    .filter(|e| e.path().is_dir())
+                    .map(|e| e.path())
+                    .collect();
+                subdirs.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
+                self.expanded_dirs.insert(dir, subdirs);
+            }
+        }
+        if let Some(dir) = dir_to_collapse {
+            self.expanded_dirs.remove(&dir);
+        }
 
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -422,7 +615,38 @@ impl eframe::App for AudioScoutApp {
             ui.label(&self.status_message);
         });
 
-        // Audio view panel
+        // Player panel (above status, below audio_view)
+        egui::TopBottomPanel::bottom("player").default_height(80.0).show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                if ui.button("|<").clicked() { self.navigate_file(-1); }
+                let play_text = match self.player.state() { TransportState::Playing => "⏸", _ => "▶" };
+                if ui.button(play_text).clicked() { let sel = self.audio_view.selection_range(); self.player.play_pause(&self.document, sel); }
+                if ui.button("⏹").clicked() { self.player.stop(); }
+                if ui.button(">|").clicked() { self.navigate_file(1); }
+                let loop_color = if self.player.is_looping() && self.player.state() == TransportState::Playing { egui::Color32::YELLOW } else if self.player.is_looping() { egui::Color32::GREEN } else { ui.visuals().text_color() };
+                if ui.colored_label(loop_color, "🔁").clicked() { self.player.toggle_loop(); }
+                ui.separator();
+                if ui.button("+").clicked() { self.audio_view.zoom_in(); }
+                if ui.button("−").clicked() { self.audio_view.zoom_out(); }
+                ui.separator();
+                ui.label("Vol:");
+                let mut vol = self.player.volume() * 100.0;
+                if ui.add(egui::Slider::new(&mut vol, 0.0..=100.0)).changed() { self.player.set_volume(vol / 100.0); }
+                ui.separator();
+                let save_color = if self.document.dirty { egui::Color32::YELLOW } else { ui.visuals().text_color() };
+                let save_label = if self.document.dirty { "Save*" } else { "Save" };
+                if ui.colored_label(save_color, save_label).clicked() { self.save_file(); }
+            });
+            ui.horizontal(|ui| {
+                let duration = self.document.duration_secs();
+                let current_pos = self.player.current_secs(self.document.sample_rate);
+                let time_str = if duration < 60.0 { format!("{:.1}s / {:.1}s", current_pos, duration) } else { format!("{} / {}", format_time_hms(current_pos), format_time_hms(duration)) };
+                ui.label(time_str);
+                if duration > 0.0 { let progress = (current_pos / duration) as f32; ui.add(egui::ProgressBar::new(progress).desired_width(ui.available_width())); }
+            });
+        });
+
+        // Audio view panel (above player)
         egui::TopBottomPanel::bottom("audio_view").default_height(200.0).resizable(true).show(ctx, |ui| {
             let (rect, response) = ui.allocate_exact_size(ui.available_size(), egui::Sense::click_and_drag());
             ui.painter().rect_filled(rect, 0.0, egui::Color32::from_rgb(25, 25, 30));
@@ -507,37 +731,6 @@ impl eframe::App for AudioScoutApp {
                     if scroll.y > 0.0 { if let Some(pos) = i.pointer.hover_pos() { let x_ratio = ((pos.x - rect.left()) / rect.width()).clamp(0.0, 1.0); self.audio_view.zoom_at_x(1.25, x_ratio as f64); } }
                     else if scroll.y < 0.0 { if let Some(pos) = i.pointer.hover_pos() { let x_ratio = ((pos.x - rect.left()) / rect.width()).clamp(0.0, 1.0); self.audio_view.zoom_at_x(1.0 / 1.25, x_ratio as f64); } }
                 } else if scroll.y != 0.0 { self.audio_view.scroll_horizontal(-scroll.y as f64 * 0.01); }
-            });
-        });
-
-        // Player panel
-        egui::TopBottomPanel::bottom("player").default_height(80.0).show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                if ui.button("|<").clicked() { self.navigate_file(-1); }
-                let play_text = match self.player.state() { TransportState::Playing => "⏸", _ => "▶" };
-                if ui.button(play_text).clicked() { let sel = self.audio_view.selection_range(); self.player.play_pause(&self.document, sel); }
-                if ui.button("⏹").clicked() { self.player.stop(); }
-                if ui.button(">|").clicked() { self.navigate_file(1); }
-                let loop_color = if self.player.is_looping() && self.player.state() == TransportState::Playing { egui::Color32::YELLOW } else if self.player.is_looping() { egui::Color32::GREEN } else { ui.visuals().text_color() };
-                if ui.colored_label(loop_color, "🔁").clicked() { self.player.toggle_loop(); }
-                ui.separator();
-                if ui.button("+").clicked() { self.audio_view.zoom_in(); }
-                if ui.button("−").clicked() { self.audio_view.zoom_out(); }
-                ui.separator();
-                ui.label("Vol:");
-                let mut vol = self.player.volume() * 100.0;
-                if ui.add(egui::Slider::new(&mut vol, 0.0..=100.0)).changed() { self.player.set_volume(vol / 100.0); }
-                ui.separator();
-                let save_color = if self.document.dirty { egui::Color32::YELLOW } else { ui.visuals().text_color() };
-                let save_label = if self.document.dirty { "Save*" } else { "Save" };
-                if ui.colored_label(save_color, save_label).clicked() { self.save_file(); }
-            });
-            ui.horizontal(|ui| {
-                let duration = self.document.duration_secs();
-                let current_pos = self.player.current_secs(self.document.sample_rate);
-                let time_str = if duration < 60.0 { format!("{:.1}s / {:.1}s", current_pos, duration) } else { format!("{} / {}", format_time_hms(current_pos), format_time_hms(duration)) };
-                ui.label(time_str);
-                if duration > 0.0 { let progress = (current_pos / duration) as f32; ui.add(egui::ProgressBar::new(progress).desired_width(ui.available_width())); }
             });
         });
 
