@@ -8,6 +8,7 @@ use audioscout_core::undo::Stack as UndoStack;
 use audioscout_core::db::Database;
 use audioscout_core::audio_io::PcmFile;
 use audioscout_core::disk::DiskProvider;
+use audioscout_core::preview_worker::{PreviewWorker, PreviewJob};
 use audioscout_core::{Document, EventChannel, Marker, UiEvent, is_editable_file};
 use crossbeam_channel::Receiver;
 use std::collections::HashMap;
@@ -21,6 +22,7 @@ pub struct AudioScoutApp {
     event_rx: Receiver<UiEvent>,
     event_tx: crossbeam_channel::Sender<UiEvent>,
     scanner: Scanner,
+    preview_worker: PreviewWorker,
     current_dir: Option<PathBuf>,
     file_rows: Vec<FileRow>,
     scan_generation: u64,
@@ -39,9 +41,49 @@ pub struct AudioScoutApp {
     normalize_dbfs: f32,
     expanded_dirs: HashMap<PathBuf, Vec<PathBuf>>,
     disks: Vec<audioscout_core::disk::DiskInfo>,
+    preview_cache: HashMap<String, egui::TextureHandle>,
 }
 
 impl AudioScoutApp {
+    /// Expand a directory and all its parent directories in the tree
+    fn expand_directory_tree(expanded_dirs: &mut HashMap<PathBuf, Vec<PathBuf>>, dir: &Path) {
+        // Collect all ancestors from dir up to root
+        let mut current = dir.to_path_buf();
+        let mut ancestors = Vec::new();
+
+        while current.parent().is_some() {
+            ancestors.push(current.clone());
+            if let Some(parent) = current.parent() {
+                current = parent.to_path_buf();
+            } else {
+                break;
+            }
+        }
+
+        // Reverse to process from root down to dir
+        ancestors.reverse();
+
+        // Expand each ancestor
+        for ancestor in ancestors {
+            if !expanded_dirs.contains_key(&ancestor) {
+                if let Ok(entries) = std::fs::read_dir(&ancestor) {
+                    let mut subdirs: Vec<PathBuf> = entries
+                        .filter_map(|e| e.ok())
+                        .filter(|e| e.path().is_dir())
+                        .map(|e| e.path())
+                        .collect();
+                    subdirs.sort_by(|a, b| {
+                        a.file_name()
+                            .and_then(|n| n.to_str())
+                            .map(|s| s.to_lowercase())
+                            .cmp(&b.file_name().and_then(|n| n.to_str()).map(|s| s.to_lowercase()))
+                    });
+                    expanded_dirs.insert(ancestor, subdirs);
+                }
+            }
+        }
+    }
+
     pub fn new(
         _cc: &eframe::CreationContext<'_>,
         config_dir: PathBuf,
@@ -56,13 +98,15 @@ impl AudioScoutApp {
         let player = Controller::new(Arc::new(PlayheadState::new()));
         let undo_dir = config_dir.join("undo");
         let undo_stack = UndoStack::new(undo_dir, config_store.config().undo_depth, config_store.config().undo_disk_limit_mb);
+        let preview_worker = PreviewWorker::new(event_tx.clone());
 
         let mut app = Self {
             config_store, db, event_rx, event_tx,
-            scanner: Scanner::new(), current_dir: None, file_rows: Vec::new(), scan_generation: 0,
+            scanner: Scanner::new(), preview_worker,
+            current_dir: None, file_rows: Vec::new(), scan_generation: 0,
             column_layout: ColumnLayout::new(), selected_row: None, filter_text: String::new(),
             document: Document::new(), active_file: None, player,
-            audio_view: AudioView::new(0), undo_stack,
+            audio_view: AudioView::new(0), undo_stack, preview_cache: HashMap::new(),
             table_preview_mode: PreviewMode::Wave,
             show_settings: false, show_columns_dialog: false, status_message: String::new(),
             normalize_dbfs: -1.0, expanded_dirs: HashMap::new(),
@@ -71,20 +115,21 @@ impl AudioScoutApp {
 
         if let Some(dir_str) = app.db.load_session("lastDir") {
             let dir = PathBuf::from(dir_str);
-            if dir.exists() { app.current_dir = Some(dir.clone()); app.scanner.scan(dir, app.event_tx.clone()); }
-        }
-        if let Some(dir) = start_dir { app.current_dir = Some(dir.clone()); app.scanner.scan(dir, app.event_tx.clone()); }
+            if dir.exists() {
+                app.current_dir = Some(dir.clone());
+                app.scanner.scan(dir.clone(), app.event_tx.clone());
 
-        // Auto-expand home directory on startup
-        if let Some(home) = dirs_next::home_dir() {
-            if let Ok(entries) = std::fs::read_dir(&home) {
-                let mut subdirs: Vec<PathBuf> = entries
-                    .filter_map(|e| e.ok())
-                    .filter(|e| e.path().is_dir())
-                    .map(|e| e.path())
-                    .collect();
-                subdirs.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
-                app.expanded_dirs.insert(home, subdirs);
+                // Auto-expand the last active directory and all its parents
+                Self::expand_directory_tree(&mut app.expanded_dirs, &dir);
+            }
+        } else if let Some(dir) = start_dir {
+            app.current_dir = Some(dir.clone());
+            app.scanner.scan(dir.clone(), app.event_tx.clone());
+            Self::expand_directory_tree(&mut app.expanded_dirs, &dir);
+        } else {
+            // Fallback: expand home directory if no lastDir
+            if let Some(home) = dirs_next::home_dir() {
+                Self::expand_directory_tree(&mut app.expanded_dirs, &home);
             }
         }
 
@@ -102,7 +147,36 @@ impl AudioScoutApp {
             }
         });
 
+        // Clean up orphaned preview files on startup
+        if let Ok(removed) = audioscout_core::preview_worker::cleanup_previews() {
+            if removed > 0 {
+                tracing::info!("Cleaned up {} orphaned preview files", removed);
+            }
+        }
+
         app
+    }
+
+    fn request_previews(&mut self) {
+        let mode = self.table_preview_mode;
+        let generation = self.scan_generation;
+
+        // Clear queue to cancel any pending previews from previous directory
+        self.preview_worker.clear_queue();
+
+        for row in &self.file_rows {
+            // Skip if preview already exists
+            if row.preview_uuid.is_some() {
+                continue;
+            }
+
+            // Submit preview job
+            self.preview_worker.submit(PreviewJob {
+                path: row.path.clone(),
+                mode,
+                generation,
+            });
+        }
     }
 
     fn process_events(&mut self) {
@@ -119,10 +193,18 @@ impl AudioScoutApp {
                                 self.selected_row = Some(idx);
                             }
                         }
+
+                        // Request previews for all files
+                        self.request_previews();
                     }
                 }
-                UiEvent::PreviewReady { path, uuid, .. } => {
-                    if let Some(row) = self.file_rows.iter_mut().find(|r| r.path == path) { row.preview_uuid = Some(uuid); }
+                UiEvent::PreviewReady { path, uuid, mode, generation } => {
+                    // Only update if this is the current generation and mode
+                    if generation == self.scan_generation && mode == self.table_preview_mode {
+                        if let Some(row) = self.file_rows.iter_mut().find(|r| r.path == path) {
+                            row.preview_uuid = Some(uuid);
+                        }
+                    }
                 }
                 UiEvent::PlayheadUpdate { position_secs } => {
                     let frame = (position_secs * self.document.sample_rate as f64) as u64;
@@ -439,7 +521,14 @@ impl eframe::App for AudioScoutApp {
                 ui.separator();
                 if ui.button("Columns").clicked() { self.show_columns_dialog = true; }
                 let mode_text = match self.table_preview_mode { PreviewMode::Wave => "Waveform", PreviewMode::Spectrogram => "Spectrogram" };
-                if ui.button(mode_text).clicked() { self.table_preview_mode = match self.table_preview_mode { PreviewMode::Wave => PreviewMode::Spectrogram, PreviewMode::Spectrogram => PreviewMode::Wave }; }
+                if ui.button(mode_text).clicked() {
+                    self.table_preview_mode = match self.table_preview_mode {
+                        PreviewMode::Wave => PreviewMode::Spectrogram,
+                        PreviewMode::Spectrogram => PreviewMode::Wave
+                    };
+                    // Clear preview cache when switching modes
+                    self.preview_cache.clear();
+                }
                 ui.separator();
                 if ui.button("Settings").clicked() { self.show_settings = true; }
             });
@@ -529,7 +618,12 @@ impl eframe::App for AudioScoutApp {
                     .filter(|e| e.path().is_dir())
                     .map(|e| e.path())
                     .collect();
-                subdirs.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
+                subdirs.sort_by(|a, b| {
+                    a.file_name()
+                        .and_then(|n| n.to_str())
+                        .map(|s| s.to_lowercase())
+                        .cmp(&b.file_name().and_then(|n| n.to_str()).map(|s| s.to_lowercase()))
+                });
                 self.expanded_dirs.insert(dir, subdirs);
             }
         }
@@ -598,36 +692,82 @@ impl eframe::App for AudioScoutApp {
                             let mut row_double_clicked = false;
 
                             for col in &visible_cols {
-                                let cell_response = ui.allocate_ui(
-                                    egui::vec2(self.column_layout.width(col), 20.0),
-                                    |ui| {
-                                        let text = match col {
-                                            Column::Name => row.name.clone(),
-                                            Column::Preview => String::new(),
-                                            Column::Duration => format_duration(row.duration_secs),
-                                            Column::SampleRate => format!("{} Hz", row.sample_rate),
-                                            Column::SampleType => format!("{}", row.sample_type),
-                                            Column::Channels => match row.channels {
-                                                1 => "Mono".to_string(),
-                                                2 => "Stereo".to_string(),
-                                                n => format!("{}ch", n),
-                                            },
-                                            Column::Size => format_size(row.size),
-                                            Column::Comment => row.comment.clone().unwrap_or_default(),
-                                            Column::DateCreated => format_timestamp(row.date_created),
-                                            Column::DateModified => format_timestamp(row.date_modified),
-                                        };
+                                // Preview column needs more height
+                                let cell_height = if *col == Column::Preview { 24.0 } else { 20.0 };
 
-                                        if is_unavailable && *col == Column::Name {
-                                            ui.colored_label(
-                                                egui::Color32::from_rgb(180, 180, 100),
-                                                format!("{} [unavailable]", text),
-                                            )
-                                        } else if *col == Column::Preview {
-                                            // Placeholder for preview
-                                            ui.label("🎵")
+                                let cell_response = ui.allocate_ui(
+                                    egui::vec2(self.column_layout.width(col), cell_height),
+                                    |ui| {
+                                        if *col == Column::Preview {
+                                            // Display preview image if available
+                                            if let Some(uuid) = &row.preview_uuid {
+                                                // Check cache first
+                                                if let Some(texture) = self.preview_cache.get(uuid) {
+                                                    let size = [340.0, 20.0];
+                                                    ui.add(egui::Image::new(texture).fit_to_exact_size(egui::vec2(size[0], size[1])))
+                                                } else {
+                                                    // Load from disk and cache
+                                                    let config_dir = audioscout_core::config::config_dir();
+                                                    let previews_dir = config_dir.join("previews");
+                                                    let png_path = previews_dir.join(format!("{}.png", uuid));
+
+                                                    if png_path.exists() {
+                                                        if let Ok(image_data) = std::fs::read(&png_path) {
+                                                            if let Ok(image) = image::load_from_memory(&image_data) {
+                                                                let size = [340.0, 20.0];
+                                                                let rgba = image.to_rgba8();
+                                                                let pixels = rgba.as_flat_samples();
+                                                                let color_image = egui::ColorImage::from_rgba_unmultiplied(
+                                                                    [size[0] as usize, size[1] as usize],
+                                                                    pixels.as_slice(),
+                                                                );
+                                                                let texture = ui.ctx().load_texture(
+                                                                    format!("preview_{}", uuid),
+                                                                    color_image,
+                                                                    egui::TextureOptions::LINEAR,
+                                                                );
+                                                                // Cache the texture
+                                                                self.preview_cache.insert(uuid.clone(), texture.clone());
+                                                                ui.add(egui::Image::new(&texture).fit_to_exact_size(egui::vec2(size[0], size[1])))
+                                                            } else {
+                                                                ui.label("⚠️")
+                                                            }
+                                                        } else {
+                                                            ui.label("⚠️")
+                                                        }
+                                                    } else {
+                                                        ui.label("⏳")
+                                                    }
+                                                }
+                                            } else {
+                                                ui.label("⏳")
+                                            }
                                         } else {
-                                            ui.colored_label(text_color, text)
+                                            let text = match col {
+                                                Column::Name => row.name.clone(),
+                                                Column::Duration => format_duration(row.duration_secs),
+                                                Column::SampleRate => format!("{} Hz", row.sample_rate),
+                                                Column::SampleType => format!("{}", row.sample_type),
+                                                Column::Channels => match row.channels {
+                                                    1 => "Mono".to_string(),
+                                                    2 => "Stereo".to_string(),
+                                                    n => format!("{}ch", n),
+                                                },
+                                                Column::Size => format_size(row.size),
+                                                Column::Comment => row.comment.clone().unwrap_or_default(),
+                                                Column::DateCreated => format_timestamp(row.date_created),
+                                                Column::DateModified => format_timestamp(row.date_modified),
+                                                _ => String::new(),
+                                            };
+
+                                            if is_unavailable && *col == Column::Name {
+                                                ui.colored_label(
+                                                    egui::Color32::from_rgb(180, 180, 100),
+                                                    format!("{} [unavailable]", text),
+                                                )
+                                            } else {
+                                                ui.colored_label(text_color, text)
+                                            }
                                         }
                                     }
                                 );
@@ -815,7 +955,24 @@ impl eframe::App for AudioScoutApp {
                 });
                 ui.separator();
                 if ui.button("Delete all markers").clicked() { let _ = self.db.delete_all_markers(); self.status_message = "All markers deleted".to_string(); }
-                if ui.button("Delete all previews").clicked() { let _ = self.db.delete_all_previews(); self.status_message = "All previews deleted".to_string(); }
+                if ui.button("Delete all previews").clicked() {
+                    let _ = self.db.delete_all_previews();
+                    // Also delete preview files from disk
+                    let config_dir = audioscout_core::config::config_dir();
+                    let previews_dir = config_dir.join("previews");
+                    if previews_dir.exists() {
+                        let _ = std::fs::remove_dir_all(&previews_dir);
+                    }
+                    // Clear in-memory cache
+                    self.preview_cache.clear();
+                    self.status_message = "All previews deleted".to_string();
+                }
+                if ui.button("Clean orphaned previews").clicked() {
+                    match audioscout_core::preview_worker::cleanup_previews() {
+                        Ok(count) => self.status_message = format!("Cleaned {} orphaned previews", count),
+                        Err(e) => self.status_message = format!("Cleanup failed: {}", e),
+                    }
+                }
             });
         }
 
@@ -830,6 +987,12 @@ impl eframe::App for AudioScoutApp {
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        // Shutdown preview worker to stop background thread
+        self.preview_worker.shutdown();
+
+        // Clear preview cache to free GPU memory
+        self.preview_cache.clear();
+
         if let Some(dir) = &self.current_dir { let _ = self.db.save_session("lastDir", &dir.to_string_lossy()); }
         if let Some(file) = &self.active_file {
             let _ = self.db.save_session("lastFile", &file.to_string_lossy());

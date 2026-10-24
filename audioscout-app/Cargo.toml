@@ -38,3 +38,6 @@ dirs-next = "2.0"
 
 # Date/time
 chrono = "0.4"
+
+# Image processing
+image = "0.25"

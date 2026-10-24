@@ -170,44 +170,21 @@ fn extract_comment(tagged_file: &lofty::file::TaggedFile) -> Option<String> {
     use lofty::file::TaggedFileExt;
     use lofty::tag::{Accessor, ItemKey, ItemValue};
 
-    // Debug: always log all tags and items in debug mode
-    #[cfg(debug_assertions)]
-    {
-        eprintln!("[DEBUG] === Extracting comment from file ===");
-        for tag in tagged_file.tags() {
-            eprintln!("[DEBUG] Tag type: {:?}", tag.tag_type());
-            for item in tag.items() {
-                eprintln!("[DEBUG]   Item key: {:?}", item.key());
-                match item.value() {
-                    ItemValue::Text(text) => eprintln!("[DEBUG]     Text: {}", text),
-                    ItemValue::Locator(text) => eprintln!("[DEBUG]     Locator: {}", text),
-                    ItemValue::Binary(data) => eprintln!("[DEBUG]     Binary: {} bytes", data.len()),
-                }
-            }
-        }
-    }
-
     // Try all tags (not just primary/first) to find comments
     for tag in tagged_file.tags() {
         // Try standard comment keys in order of preference
         // 1. ItemKey::Comment (WAV ICMT, ID3 COMM, etc.)
         if let Some(comment) = tag.get_string(&ItemKey::Comment) {
-            #[cfg(debug_assertions)]
-            eprintln!("[DEBUG] Found comment via ItemKey::Comment: {}", comment);
             return Some(comment.to_string());
         }
 
         // 2. ItemKey::Description (FLAC Vorbis DESCRIPTION)
         if let Some(desc) = tag.get_string(&ItemKey::Description) {
-            #[cfg(debug_assertions)]
-            eprintln!("[DEBUG] Found description via ItemKey::Description: {}", desc);
             return Some(desc.to_string());
         }
 
         // 3. Try Accessor trait method
         if let Some(comment) = tag.comment() {
-            #[cfg(debug_assertions)]
-            eprintln!("[DEBUG] Found comment via Accessor::comment(): {}", comment);
             return Some(comment.to_string());
         }
 
@@ -222,8 +199,6 @@ fn extract_comment(tagged_file: &lofty::file::TaggedFile) -> Option<String> {
                 match item.value() {
                     ItemValue::Text(text) | ItemValue::Locator(text) => {
                         if !text.is_empty() {
-                            #[cfg(debug_assertions)]
-                            eprintln!("[DEBUG] Found comment via key search ({}): {}", key_lower, text);
                             return Some(text.to_string());
                         }
                     }
@@ -241,27 +216,11 @@ fn extract_comment(tagged_file: &lofty::file::TaggedFile) -> Option<String> {
                     // If we found any text item with "COMM" or similar in key
                     if key_str.contains("COMM") || key_str.contains("Comment") {
                         if !text.is_empty() {
-                            #[cfg(debug_assertions)]
-                            eprintln!("[DEBUG] Found COMM frame ({}): {}", key_str, text);
                             return Some(text.to_string());
                         }
                     }
                 }
                 _ => {}
-            }
-        }
-    }
-
-    // Debug: log all tags and items if no comment found
-    #[cfg(debug_assertions)]
-    for tag in tagged_file.tags() {
-        eprintln!("[DEBUG] Tag type: {:?}", tag.tag_type());
-        for item in tag.items() {
-            eprintln!("[DEBUG]   Item key: {:?}", item.key());
-            match item.value() {
-                ItemValue::Text(text) => eprintln!("[DEBUG]     Text: {}", text),
-                ItemValue::Locator(text) => eprintln!("[DEBUG]     Locator: {}", text),
-                ItemValue::Binary(data) => eprintln!("[DEBUG]     Binary: {} bytes", data.len()),
             }
         }
     }

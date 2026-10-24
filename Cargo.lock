@@ -528,6 +528,7 @@ dependencies = [
  "dirs-next",
  "eframe",
  "egui",
+ "image",
  "rfd",
  "serde",
  "serde_json",
