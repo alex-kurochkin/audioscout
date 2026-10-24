@@ -1,33 +1,52 @@
 use audioscout_core::config::{ConfigStore, PreviewMode};
 use audioscout_core::player::controller::Controller;
 use audioscout_core::player::{PlayheadState, TransportState};
-use audioscout_core::audio_io::PcmFile;
 use audioscout_core::scanner::Scanner;
 use audioscout_core::table::{Column, ColumnLayout, FileRow};
 use audioscout_core::audio_view::AudioView;
 use audioscout_core::undo::Stack as UndoStack;
 use audioscout_core::db::Database;
+use audioscout_core::audio_io::PcmFile;
 use audioscout_core::{Document, EventChannel, Marker, UiEvent, is_editable_file};
 use crossbeam_channel::Receiver;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+/// Main application state
 pub struct AudioScoutApp {
-    config_store: ConfigStore, db: Database,
-    event_rx: Receiver<UiEvent>, event_tx: crossbeam_channel::Sender<UiEvent>,
-    scanner: Scanner, current_dir: Option<PathBuf>, file_rows: Vec<FileRow>, scan_generation: u64,
-    column_layout: ColumnLayout, selected_row: Option<usize>, filter_text: String,
-    document: Document, active_file: Option<PathBuf>,
-    player: Controller, playhead: Arc<PlayheadState>,
-    audio_view: AudioView, undo_stack: UndoStack,
-    table_preview_mode: PreviewMode, player_preview_mode: PreviewMode,
-    show_settings: bool, show_columns_dialog: bool, status_message: String, normalize_dbfs: f32,
+    config_store: ConfigStore,
+    db: Database,
+    event_rx: Receiver<UiEvent>,
+    event_tx: crossbeam_channel::Sender<UiEvent>,
+    scanner: Scanner,
+    current_dir: Option<PathBuf>,
+    file_rows: Vec<FileRow>,
+    scan_generation: u64,
+    column_layout: ColumnLayout,
+    selected_row: Option<usize>,
+    filter_text: String,
+    document: Document,
+    active_file: Option<PathBuf>,
+    player: Controller,
+    playhead: Arc<PlayheadState>,
+    audio_view: AudioView,
+    undo_stack: UndoStack,
+    table_preview_mode: PreviewMode,
+    player_preview_mode: PreviewMode,
+    show_settings: bool,
+    show_columns_dialog: bool,
+    status_message: String,
+    normalize_dbfs: f32,
     expanded_dirs: HashMap<PathBuf, Vec<PathBuf>>,
 }
 
 impl AudioScoutApp {
-    pub fn new(_cc: &eframe::CreationContext<'_>, config_dir: PathBuf, start_dir: Option<PathBuf>) -> Self {
+    pub fn new(
+        _cc: &eframe::CreationContext<'_>,
+        config_dir: PathBuf,
+        start_dir: Option<PathBuf>,
+    ) -> Self {
         let config_store = ConfigStore::new(&config_dir);
         let db_path = config_dir.join("app.db");
         let db = Database::open(&db_path).expect("Failed to open database");
@@ -38,9 +57,10 @@ impl AudioScoutApp {
         let player = Controller::new(playhead.clone());
         let undo_dir = config_dir.join("undo");
         let undo_stack = UndoStack::new(undo_dir, config_store.config().undo_depth, config_store.config().undo_disk_limit_mb);
+
         let mut app = Self {
-            config_store, db, event_rx, event_tx, scanner: Scanner::new(),
-            current_dir: None, file_rows: Vec::new(), scan_generation: 0,
+            config_store, db, event_rx, event_tx,
+            scanner: Scanner::new(), current_dir: None, file_rows: Vec::new(), scan_generation: 0,
             column_layout: ColumnLayout::new(), selected_row: None, filter_text: String::new(),
             document: Document::new(), active_file: None, player, playhead,
             audio_view: AudioView::new(0), undo_stack,
@@ -48,6 +68,7 @@ impl AudioScoutApp {
             show_settings: false, show_columns_dialog: false, status_message: String::new(),
             normalize_dbfs: -1.0, expanded_dirs: HashMap::new(),
         };
+
         if let Some(dir_str) = app.db.load_session("lastDir") {
             let dir = PathBuf::from(dir_str);
             if dir.exists() { app.current_dir = Some(dir.clone()); app.scanner.scan(dir, app.event_tx.clone()); }
@@ -61,11 +82,14 @@ impl AudioScoutApp {
             match event {
                 UiEvent::ScanDone { dir, rows, generation } => {
                     if Some(&dir) == self.current_dir.as_ref() && generation >= self.scan_generation {
-                        self.scan_generation = generation; self.file_rows = rows;
+                        self.scan_generation = generation;
+                        self.file_rows = rows;
                         self.column_layout.sort_rows(&mut self.file_rows);
                         if let Some(file_str) = self.db.load_session("lastFile") {
                             let file_path = PathBuf::from(file_str);
-                            if let Some(idx) = self.file_rows.iter().position(|r| r.path == file_path) { self.selected_row = Some(idx); }
+                            if let Some(idx) = self.file_rows.iter().position(|r| r.path == file_path) {
+                                self.selected_row = Some(idx);
+                            }
                         }
                     }
                 }
@@ -74,7 +98,8 @@ impl AudioScoutApp {
                 }
                 UiEvent::PlayheadUpdate { position_secs } => {
                     let frame = (position_secs * self.document.sample_rate as f64) as u64;
-                    self.audio_view.set_cursor(frame); self.audio_view.auto_scroll_to_cursor();
+                    self.audio_view.set_cursor(frame);
+                    self.audio_view.auto_scroll_to_cursor();
                 }
                 UiEvent::PlaybackFinished => { self.status_message = "Playback finished".to_string(); }
                 UiEvent::VolumeMeterUpdate { .. } => {}
@@ -84,17 +109,22 @@ impl AudioScoutApp {
 
     fn load_file(&mut self, path: &Path) {
         if !is_editable_file(path) { self.status_message = "File format not editable".to_string(); return; }
-        self.player.stop(); self.player.reset();
+        self.player.stop();
+        self.player.reset();
         match audioscout_core::audio_io::load_audio(path) {
             Ok((samples, sr, ch, st)) => {
-                self.document = Document { samples, sample_rate: sr, channels: ch, markers: Vec::new(), source_path: path.to_path_buf(), temp_path: None, dirty: false, sample_type: st };
+                self.document = Document {
+                    samples, sample_rate: sr, channels: ch, markers: Vec::new(),
+                    source_path: path.to_path_buf(), temp_path: None, dirty: false, sample_type: st,
+                };
                 if let Ok(meta) = std::fs::metadata(path) {
                     let size = meta.len();
                     let mtime = meta.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_secs()).unwrap_or(0);
                     if let Ok(markers) = self.db.load_markers(path, size, mtime) { self.document.markers = markers; }
                 }
                 self.audio_view = AudioView::new(self.document.total_frames());
-                self.active_file = Some(path.to_path_buf()); self.undo_stack.clear();
+                self.active_file = Some(path.to_path_buf());
+                self.undo_stack.clear();
                 let _ = self.db.save_session("lastFile", &path.to_string_lossy());
                 let _ = self.db.save_session("lastPos", "0");
             }
@@ -108,14 +138,12 @@ impl AudioScoutApp {
         if path.as_os_str().is_empty() { return; }
         match audioscout_core::audio_io::wav::WavFile::save(&path, &self.document.samples, self.document.sample_rate, self.document.channels, self.document.sample_type) {
             Ok(()) => {
-                self.document.dirty = false; self.status_message = "File saved".to_string();
+                self.document.dirty = false;
+                self.status_message = "File saved".to_string();
                 if let Ok(meta) = std::fs::metadata(&path) {
                     let size = meta.len();
                     let mtime = meta.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_secs()).unwrap_or(0);
                     let _ = self.db.save_markers(&path, size, mtime, &self.document.markers);
-                }
-                if let Some(row) = self.file_rows.iter_mut().find(|r| r.path == path) {
-                    if let Ok(meta) = std::fs::metadata(&path) { row.size = meta.len(); }
                 }
             }
             Err(e) => { self.status_message = format!("Save failed: {}", e); }
@@ -133,8 +161,12 @@ impl AudioScoutApp {
         let original: Vec<f32> = self.document.samples[start_idx..end_idx].to_vec();
         if self.undo_stack.save_dump(&dump_path, &original).is_err() { self.status_message = "Undo dump failed".to_string(); return; }
         for s in &mut self.document.samples[start_idx..end_idx] { *s = 0.0; }
-        self.undo_stack.push(audioscout_core::undo::UndoEntry { op: audioscout_core::undo::UndoOp::Mute { dump_path, start_frame: start, end_frame: end }, file_path: self.document.source_path.clone() });
-        self.document.dirty = true; self.status_message = format!("Muted frames {}..{}", start, end);
+        self.undo_stack.push(audioscout_core::undo::UndoEntry {
+            op: audioscout_core::undo::UndoOp::Mute { dump_path, start_frame: start, end_frame: end },
+            file_path: self.document.source_path.clone(),
+        });
+        self.document.dirty = true;
+        self.status_message = format!("Muted frames {}..{}", start, end);
     }
 
     fn normalize_selection(&mut self) {
@@ -151,14 +183,19 @@ impl AudioScoutApp {
         let original: Vec<f32> = self.document.samples[start_idx..end_idx].to_vec();
         if self.undo_stack.save_dump(&dump_path, &original).is_err() { return; }
         for s in &mut self.document.samples[start_idx..end_idx] { *s *= gain; }
-        self.undo_stack.push(audioscout_core::undo::UndoEntry { op: audioscout_core::undo::UndoOp::Normalize { dump_path, start_frame: start, end_frame: end, dbfs: self.normalize_dbfs as f64 }, file_path: self.document.source_path.clone() });
-        self.document.dirty = true; self.status_message = format!("Normalized to {} dBFS", self.normalize_dbfs);
+        self.undo_stack.push(audioscout_core::undo::UndoEntry {
+            op: audioscout_core::undo::UndoOp::Normalize { dump_path, start_frame: start, end_frame: end, dbfs: self.normalize_dbfs as f64 },
+            file_path: self.document.source_path.clone(),
+        });
+        self.document.dirty = true;
+        self.status_message = format!("Normalized to {} dBFS", self.normalize_dbfs);
     }
 
     fn undo(&mut self) {
         if let Some(entry) = self.undo_stack.pop_undo() {
             match &entry.op {
-                audioscout_core::undo::UndoOp::Mute { dump_path, start_frame, end_frame } | audioscout_core::undo::UndoOp::Normalize { dump_path, start_frame, end_frame, .. } => {
+                audioscout_core::undo::UndoOp::Mute { dump_path, start_frame, end_frame }
+                | audioscout_core::undo::UndoOp::Normalize { dump_path, start_frame, end_frame, .. } => {
                     if let Ok(original) = self.undo_stack.load_dump(dump_path) {
                         let ch = self.document.channels as usize;
                         let start_idx = *start_frame as usize * ch;
@@ -169,7 +206,8 @@ impl AudioScoutApp {
                 }
                 _ => {}
             }
-            self.document.dirty = true; self.status_message = "Undo".to_string();
+            self.document.dirty = true;
+            self.status_message = "Undo".to_string();
         }
     }
 
@@ -195,7 +233,8 @@ impl AudioScoutApp {
                 }
                 _ => {}
             }
-            self.document.dirty = true; self.status_message = "Redo".to_string();
+            self.document.dirty = true;
+            self.status_message = "Redo".to_string();
         }
     }
 
@@ -298,16 +337,26 @@ impl eframe::App for AudioScoutApp {
             });
         });
 
+        // Declare paths_to_load BEFORE CentralPanel to avoid borrow conflicts
+        let mut paths_to_load: Vec<PathBuf> = Vec::new();
+
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.horizontal(|ui| { ui.label(format!("{} files", self.file_rows.len())); if let Some(dir) = &self.current_dir { ui.label(dir.display().to_string()); } });
+            ui.horizontal(|ui| {
+                ui.label(format!("{} files", self.file_rows.len()));
+                if let Some(dir) = &self.current_dir { ui.label(dir.display().to_string()); }
+            });
             ui.separator();
-            
-                        egui::ScrollArea::vertical().show(ui, |ui| {
+
+            let visible_cols = self.column_layout.visible.clone();
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                // Header
                 ui.horizontal(|ui| {
-                    for col in &self.column_layout.visible.clone() {
+                    for col in &visible_cols {
                         let width = self.column_layout.width(col);
                         let label = col.title();
-                        let sort_indicator = if self.column_layout.sort_column == Some(*col) { if self.column_layout.sort_ascending { " ▲" } else { " ▼" } } else { "" };
+                        let sort_indicator = if self.column_layout.sort_column == Some(*col) {
+                            if self.column_layout.sort_ascending { " ▲" } else { " ▼" }
+                        } else { "" };
                         let response = ui.allocate_ui(egui::vec2(width, 20.0), |ui| {
                             if col.sortable() { ui.button(format!("{}{}", label, sort_indicator)) } else { ui.label(label) }
                         });
@@ -319,64 +368,149 @@ impl eframe::App for AudioScoutApp {
                     }
                 });
                 ui.separator();
-                let mut paths_to_load = Vec::new();
 
+                // File rows - collect paths to load
                 for (idx, row) in self.file_rows.iter().enumerate() {
                     if !self.filter_text.is_empty() && !row.name.to_lowercase().contains(&self.filter_text.to_lowercase()) { continue; }
                     let is_selected = self.selected_row == Some(idx);
                     let is_broken = row.status == audioscout_core::ProbeStatus::Broken;
+                    let is_unavailable = row.status == audioscout_core::ProbeStatus::Unavailable;
                     let text_color = if is_broken { egui::Color32::from_rgb(255, 100, 100) } else if is_selected { egui::Color32::WHITE } else { ui.visuals().text_color() };
+
                     let response = ui.horizontal(|ui| {
-                        for col in &self.column_layout.visible.clone() {
+                        for col in &visible_cols {
                             let width = self.column_layout.width(col);
                             ui.allocate_ui(egui::vec2(width, 20.0), |ui| {
                                 let text = match col {
-                                    Column::Name => row.name.clone(), Column::Preview => String::new(),
-                                    Column::Duration => format_duration(row.duration_secs), Column::SampleRate => format!("{} Hz", row.sample_rate),
+                                    Column::Name => row.name.clone(),
+                                    Column::Preview => String::new(),
+                                    Column::Duration => format_duration(row.duration_secs),
+                                    Column::SampleRate => format!("{} Hz", row.sample_rate),
                                     Column::SampleType => format!("{}", row.sample_type),
                                     Column::Channels => match row.channels { 1 => "Mono".to_string(), 2 => "Stereo".to_string(), n => format!("{}ch", n) },
-                                    Column::Size => format_size(row.size), Column::Comment => row.comment.clone().unwrap_or_default(),
-                                    Column::DateCreated => format_timestamp(row.date_created), Column::DateModified => format_timestamp(row.date_modified),
+                                    Column::Size => format_size(row.size),
+                                    Column::Comment => row.comment.clone().unwrap_or_default(),
+                                    Column::DateCreated => format_timestamp(row.date_created),
+                                    Column::DateModified => format_timestamp(row.date_modified),
                                 };
-                                ui.colored_label(text_color, text);
+                                if is_unavailable && *col == Column::Name {
+                                    ui.colored_label(egui::Color32::from_rgb(180, 180, 100), format!("{} [unavailable]", text));
+                                } else {
+                                    ui.colored_label(text_color, text);
+                                }
                             });
                         }
                     });
+
                     if response.response.clicked() { self.selected_row = Some(idx); }
-                    if response.response.double_clicked() && !is_broken {
-                        let path = row.path.clone();
-                        self.load_file(&path);
+
+                    // Double click - collect path, don't load yet (borrow checker)
+                    if response.response.double_clicked() && !is_broken && !is_unavailable {
+                        paths_to_load.push(row.path.clone());
                     }
                 }
             });
         });
 
-                // Load files after the loop to avoid borrow conflicts
-                for path in paths_to_load {
-                    self.load_file(&path);
+        // Load files AFTER the CentralPanel closure (no borrow conflict)
+        for path in paths_to_load {
+            self.load_file(&path);
+        }
+
+        // Status bar (bottom-most)
+        egui::TopBottomPanel::bottom("status").default_height(20.0).show(ctx, |ui| {
+            ui.label(&self.status_message);
+        });
+
+        // Audio view panel
+        egui::TopBottomPanel::bottom("audio_view").default_height(200.0).resizable(true).show(ctx, |ui| {
+            let (rect, response) = ui.allocate_exact_size(ui.available_size(), egui::Sense::click_and_drag());
+            ui.painter().rect_filled(rect, 0.0, egui::Color32::from_rgb(25, 25, 30));
+
+            if !self.document.samples.is_empty() {
+                let mid_y = rect.center().y;
+                ui.painter().line_segment([egui::pos2(rect.left(), mid_y), egui::pos2(rect.right(), mid_y)], egui::Stroke::new(1.0, egui::Color32::from_rgb(60, 60, 65)));
+
+                // Cursor
+                let cursor_x = self.audio_view.frame_to_x(self.audio_view.cursor_frame, rect.width() as u32);
+                let cursor_screen_x = rect.left() + cursor_x;
+                if cursor_screen_x >= rect.left() && cursor_screen_x <= rect.right() {
+                    ui.painter().line_segment([egui::pos2(cursor_screen_x, rect.top()), egui::pos2(cursor_screen_x, rect.bottom())], egui::Stroke::new(1.5, egui::Color32::RED));
                 }
 
-        egui::TopBottomPanel::bottom("actions").default_height(40.0).show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                if ui.button("Mute").clicked() { self.mute_selection(); }
-                ui.label("Normalize:");
-                ui.add(egui::DragValue::new(&mut self.normalize_dbfs).range(-60.0..=0.0).suffix(" dBFS"));
-                if ui.button("Apply").clicked() { self.normalize_selection(); }
-                ui.separator();
-                if ui.button("Delete all markers").clicked() { self.document.markers.clear(); }
-                if let Some(path) = &self.active_file {
-                    ui.separator();
-                    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                    ui.strong(name);
+                // Markers
+                for (idx, marker) in self.document.markers.iter().enumerate() {
+                    let mx = self.audio_view.frame_to_x(marker.time_samples, rect.width() as u32);
+                    let screen_x = rect.left() + mx;
+                    if screen_x >= rect.left() && screen_x <= rect.right() {
+                        let color = if self.audio_view.active_marker == Some(idx) { egui::Color32::YELLOW } else { egui::Color32::from_rgb(100, 180, 255) };
+                        let mut y = rect.top();
+                        while y < rect.bottom() {
+                            let seg_end = (y + 4.0).min(rect.bottom());
+                            ui.painter().line_segment([egui::pos2(screen_x, y), egui::pos2(screen_x, seg_end)], egui::Stroke::new(1.0, color));
+                            y += 8.0;
+                        }
+                        ui.painter().text(egui::pos2(screen_x + 2.0, rect.top() + 2.0), egui::Align2::LEFT_TOP, &marker.name, egui::FontId::proportional(10.0), color);
+                    }
                 }
+
+                // Selection
+                if let Some(sel) = self.audio_view.selection_range() {
+                    let x1 = rect.left() + self.audio_view.frame_to_x(sel.0, rect.width() as u32);
+                    let x2 = rect.left() + self.audio_view.frame_to_x(sel.1, rect.width() as u32);
+                    let sel_rect = egui::Rect::from_min_max(egui::pos2(x1.max(rect.left()), rect.top()), egui::pos2(x2.min(rect.right()), rect.bottom()));
+                    ui.painter().rect_filled(sel_rect, 0.0, egui::Color32::from_rgba_premultiplied(80, 120, 255, 60));
+                }
+
+                // Waveform
+                let ch = self.document.channels as usize;
+                let start_frame = self.audio_view.view_range.start_frame;
+                let end_frame = self.audio_view.view_range.end_frame;
+                let view_frames = end_frame.saturating_sub(start_frame);
+                if view_frames > 0 {
+                    let pixels = rect.width() as u32;
+                    let frames_per_pixel = (view_frames as f64 / pixels as f64).max(1.0);
+                    for px in 0..pixels {
+                        let frame = start_frame + (px as f64 * frames_per_pixel) as u64;
+                        let frame_end = (start_frame as f64 + (px as f64 + 1.0) * frames_per_pixel).min(end_frame as f64) as u64;
+                        let mut min_val: f32 = 0.0;
+                        let mut max_val: f32 = 0.0;
+                        for f in frame..frame_end {
+                            let idx = f as usize * ch;
+                            if idx < self.document.samples.len() {
+                                let v = self.document.samples[idx];
+                                min_val = min_val.min(v);
+                                max_val = max_val.max(v);
+                            }
+                        }
+                        let x = rect.left() + px as f32;
+                        let half_h = rect.height() / 2.0;
+                        let y_top = mid_y - max_val * half_h;
+                        let y_bot = mid_y - min_val * half_h;
+                        ui.painter().line_segment([egui::pos2(x, y_top), egui::pos2(x, y_bot)], egui::Stroke::new(1.0, egui::Color32::from_rgb(50, 200, 80)));
+                    }
+                }
+            }
+
+            if response.clicked() {
+                if let Some(pos) = response.interact_pointer_pos() {
+                    let x_ratio = (pos.x - rect.left()) / rect.width();
+                    let frame = self.audio_view.x_to_frame(x_ratio * rect.width(), rect.width() as u32);
+                    self.audio_view.set_cursor(frame);
+                    self.player.seek(frame, &self.document, audioscout_core::player::CursorSource::User);
+                }
+            }
+
+            ui.input(|i| {
+                let scroll = i.smooth_scroll_delta;
+                if i.modifiers.ctrl {
+                    if scroll.y > 0.0 { if let Some(pos) = i.pointer.hover_pos() { let x_ratio = ((pos.x - rect.left()) / rect.width()).clamp(0.0, 1.0); self.audio_view.zoom_at_x(1.25, x_ratio as f64); } }
+                    else if scroll.y < 0.0 { if let Some(pos) = i.pointer.hover_pos() { let x_ratio = ((pos.x - rect.left()) / rect.width()).clamp(0.0, 1.0); self.audio_view.zoom_at_x(1.0 / 1.25, x_ratio as f64); } }
+                } else if scroll.y != 0.0 { self.audio_view.scroll_horizontal(-scroll.y as f64 * 0.01); }
             });
         });
 
-                // Load files after the loop to avoid borrow conflicts
-                for path in paths_to_load {
-                    self.load_file(&path);
-                }
-
+        // Player panel
         egui::TopBottomPanel::bottom("player").default_height(80.0).show(ctx, |ui| {
             ui.horizontal(|ui| {
                 if ui.button("|<").clicked() { self.navigate_file(-1); }
@@ -407,81 +541,35 @@ impl eframe::App for AudioScoutApp {
             });
         });
 
-        egui::TopBottomPanel::bottom("audio_view").default_height(200.0).resizable(true).show(ctx, |ui| {
-            let available = ui.available_size();
-            let (rect, response) = ui.allocate_exact_size(egui::vec2(available.x, available.y - 20.0), egui::Sense::click_and_drag());
-            ui.painter().rect_filled(rect, 0.0, egui::Color32::from_rgb(25, 25, 30));
-            if !self.document.samples.is_empty() {
-                let mid_y = rect.center().y;
-                ui.painter().line_segment([egui::pos2(rect.left(), mid_y), egui::pos2(rect.right(), mid_y)], egui::Stroke::new(1.0, egui::Color32::from_rgb(60, 60, 65)));
-                let cursor_x = self.audio_view.frame_to_x(self.audio_view.cursor_frame, rect.width() as u32);
-                let cursor_screen_x = rect.left() + cursor_x;
-                if cursor_screen_x >= rect.left() && cursor_screen_x <= rect.right() {
-                    ui.painter().line_segment([egui::pos2(cursor_screen_x, rect.top()), egui::pos2(cursor_screen_x, rect.bottom())], egui::Stroke::new(1.5, egui::Color32::RED));
+        // Actions panel
+        egui::TopBottomPanel::bottom("actions").default_height(40.0).show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                if ui.button("Mute").clicked() { self.mute_selection(); }
+                ui.label("Normalize:");
+                ui.add(egui::DragValue::new(&mut self.normalize_dbfs).range(-60.0..=0.0).suffix(" dBFS"));
+                if ui.button("Apply").clicked() { self.normalize_selection(); }
+                ui.separator();
+                if ui.button("Delete all markers").clicked() { self.document.markers.clear(); }
+                if let Some(path) = &self.active_file {
+                    ui.separator();
+                    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                    ui.strong(name);
                 }
-                for (idx, marker) in self.document.markers.iter().enumerate() {
-                    let mx = self.audio_view.frame_to_x(marker.time_samples, rect.width() as u32);
-                    let screen_x = rect.left() + mx;
-                    if screen_x >= rect.left() && screen_x <= rect.right() {
-                        let color = if self.audio_view.active_marker == Some(idx) { egui::Color32::YELLOW } else { egui::Color32::from_rgb(100, 180, 255) };
-                        let mut y = rect.top();
-                        while y < rect.bottom() { let seg_end = (y + 4.0).min(rect.bottom()); ui.painter().line_segment([egui::pos2(screen_x, y), egui::pos2(screen_x, seg_end)], egui::Stroke::new(1.0, color)); y += 8.0; }
-                        ui.painter().text(egui::pos2(screen_x + 2.0, rect.top() + 2.0), egui::Align2::LEFT_TOP, &marker.name, egui::FontId::proportional(10.0), color);
-                    }
-                }
-                if let Some(sel) = self.audio_view.selection_range() {
-                    let x1 = rect.left() + self.audio_view.frame_to_x(sel.0, rect.width() as u32);
-                    let x2 = rect.left() + self.audio_view.frame_to_x(sel.1, rect.width() as u32);
-                    let sel_rect = egui::Rect::from_min_max(egui::pos2(x1.max(rect.left()), rect.top()), egui::pos2(x2.min(rect.right()), rect.bottom()));
-                    ui.painter().rect_filled(sel_rect, 0.0, egui::Color32::from_rgba_premultiplied(80, 120, 255, 60));
-                }
-                let ch = self.document.channels as usize;
-                let start_frame = self.audio_view.view_range.start_frame;
-                let end_frame = self.audio_view.view_range.end_frame;
-                let view_frames = end_frame.saturating_sub(start_frame);
-                if view_frames > 0 {
-                    let pixels = rect.width() as u32;
-                    let frames_per_pixel = (view_frames as f64 / pixels as f64).max(1.0);
-                    for px in 0..pixels {
-                        let frame = start_frame + (px as f64 * frames_per_pixel) as u64;
-                        let frame_end = (start_frame as f64 + (px as f64 + 1.0) * frames_per_pixel).min(end_frame as f64) as u64;
-                        let mut min_val: f32 = 0.0; let mut max_val: f32 = 0.0;
-                        for f in frame..frame_end {
-                            let idx = f as usize * ch;
-                            if idx < self.document.samples.len() { let v = self.document.samples[idx]; min_val = min_val.min(v); max_val = max_val.max(v); }
-                        }
-                        let x = rect.left() + px as f32;
-                        let half_h = rect.height() / 2.0;
-                        let y_top = mid_y - max_val * half_h;
-                        let y_bot = mid_y - min_val * half_h;
-                        ui.painter().line_segment([egui::pos2(x, y_top), egui::pos2(x, y_bot)], egui::Stroke::new(1.0, egui::Color32::from_rgb(50, 200, 80)));
-                    }
-                }
-            }
-            if response.clicked() {
-                if let Some(pos) = response.interact_pointer_pos() {
-                    let x_ratio = (pos.x - rect.left()) / rect.width();
-                    let frame = self.audio_view.x_to_frame(x_ratio * rect.width(), rect.width() as u32);
-                    self.audio_view.set_cursor(frame);
-                    self.player.seek(frame, &self.document, audioscout_core::player::CursorSource::User);
-                }
-            }
-            ui.input(|i| {
-                let scroll = i.smooth_scroll_delta;
-                if i.modifiers.ctrl {
-                    if scroll.y > 0.0 { if let Some(pos) = i.pointer.hover_pos() { let x_ratio = ((pos.x - rect.left()) / rect.width()).clamp(0.0, 1.0); self.audio_view.zoom_at_x(1.25, x_ratio as f64); } }
-                    else if scroll.y < 0.0 { if let Some(pos) = i.pointer.hover_pos() { let x_ratio = ((pos.x - rect.left()) / rect.width()).clamp(0.0, 1.0); self.audio_view.zoom_at_x(1.0 / 1.25, x_ratio as f64); } }
-                } else if scroll.y != 0.0 { self.audio_view.scroll_horizontal(-scroll.y as f64 * 0.01); }
             });
         });
 
+        // Settings dialog
         if self.show_settings {
             egui::Window::new("Settings").open(&mut self.show_settings).show(ctx, |ui| {
-                ui.label("AudioScout Settings"); ui.separator();
-                ui.horizontal(|ui| { ui.label("Skip seconds:"); let mut skip = self.config_store.config().skip_seconds; if ui.add(egui::DragValue::new(&mut skip).range(1..=60)).changed() { self.config_store.config_mut().skip_seconds = skip; self.player.set_skip_seconds(skip); let _ = self.config_store.save(); } });
+                ui.label("AudioScout Settings");
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.label("Skip seconds:");
+                    let mut skip = self.config_store.config().skip_seconds;
+                    if ui.add(egui::DragValue::new(&mut skip).range(1..=60)).changed() { self.config_store.config_mut().skip_seconds = skip; self.player.set_skip_seconds(skip); let _ = self.config_store.save(); }
+                });
                 ui.separator();
                 if ui.button("Delete all markers").clicked() { let _ = self.db.delete_all_markers(); self.status_message = "All markers deleted".to_string(); }
-                if ui.button("Scan markers (cleanup)").clicked() { match self.db.scan_markers() { Ok(n) => self.status_message = format!("{} stale markers removed", n), Err(e) => self.status_message = format!("Scan failed: {}", e) } }
                 if ui.button("Delete all previews").clicked() { let _ = self.db.delete_all_previews(); self.status_message = "All previews deleted".to_string(); }
             });
         }
@@ -493,7 +581,6 @@ impl eframe::App for AudioScoutApp {
             });
         }
 
-        egui::TopBottomPanel::bottom("status").default_height(20.0).show(ctx, |ui| { ui.label(&self.status_message); });
         if let Some(dir) = &self.current_dir { let _ = self.db.save_session("lastDir", &dir.to_string_lossy()); }
     }
 
