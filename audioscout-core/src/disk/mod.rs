@@ -28,7 +28,7 @@ pub struct SysinfoDiskProvider {
 impl SysinfoDiskProvider {
     pub fn new() -> Self {
         let mut disks = sysinfo::Disks::new();
-        disks.refresh();
+        disks.refresh(true);
         Self { disks }
     }
     
@@ -107,7 +107,7 @@ impl DiskProvider for SysinfoDiskProvider {
     }
     
     fn refresh(&mut self) {
-        self.disks.refresh();
+        self.disks.refresh(true);
     }
 }
 

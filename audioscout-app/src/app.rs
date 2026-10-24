@@ -7,6 +7,7 @@ use audioscout_core::audio_view::AudioView;
 use audioscout_core::undo::Stack as UndoStack;
 use audioscout_core::db::Database;
 use audioscout_core::audio_io::PcmFile;
+use audioscout_core::disk::DiskProvider;
 use audioscout_core::{Document, EventChannel, Marker, UiEvent, is_editable_file};
 use crossbeam_channel::Receiver;
 use std::collections::HashMap;
@@ -29,11 +30,9 @@ pub struct AudioScoutApp {
     document: Document,
     active_file: Option<PathBuf>,
     player: Controller,
-    playhead: Arc<PlayheadState>,
     audio_view: AudioView,
     undo_stack: UndoStack,
     table_preview_mode: PreviewMode,
-    player_preview_mode: PreviewMode,
     show_settings: bool,
     show_columns_dialog: bool,
     status_message: String,
@@ -54,8 +53,7 @@ impl AudioScoutApp {
         let channel = EventChannel::new();
         let event_tx = channel.sender.clone();
         let event_rx = channel.receiver;
-        let playhead = Arc::new(PlayheadState::new());
-        let player = Controller::new(playhead.clone());
+        let player = Controller::new(Arc::new(PlayheadState::new()));
         let undo_dir = config_dir.join("undo");
         let undo_stack = UndoStack::new(undo_dir, config_store.config().undo_depth, config_store.config().undo_disk_limit_mb);
 
@@ -63,9 +61,9 @@ impl AudioScoutApp {
             config_store, db, event_rx, event_tx,
             scanner: Scanner::new(), current_dir: None, file_rows: Vec::new(), scan_generation: 0,
             column_layout: ColumnLayout::new(), selected_row: None, filter_text: String::new(),
-            document: Document::new(), active_file: None, player, playhead,
+            document: Document::new(), active_file: None, player,
             audio_view: AudioView::new(0), undo_stack,
-            table_preview_mode: PreviewMode::Wave, player_preview_mode: PreviewMode::Wave,
+            table_preview_mode: PreviewMode::Wave,
             show_settings: false, show_columns_dialog: false, status_message: String::new(),
             normalize_dbfs: -1.0, expanded_dirs: HashMap::new(),
             disks: Vec::new(),
@@ -491,19 +489,25 @@ impl eframe::App for AudioScoutApp {
 
                     // Show connected disks (excluding Home and /)
                     let home = dirs_next::home_dir();
-                    for disk in &self.disks {
-                        // Skip if it's Home or root (already shown)
-                        if home.as_ref() == Some(&disk.mount_point) {
-                            continue;
-                        }
-                        if disk.mount_point == PathBuf::from("/") {
-                            continue;
-                        }
+                    let disks_to_render: Vec<(PathBuf, String)> = self.disks.iter()
+                        .filter(|disk| {
+                            // Skip if it's Home or root (already shown)
+                            if home.as_ref() == Some(&disk.mount_point) {
+                                return false;
+                            }
+                            if disk.mount_point == PathBuf::from("/") {
+                                return false;
+                            }
+                            true
+                        })
+                        .map(|disk| (disk.mount_point.clone(), disk.name.clone()))
+                        .collect();
 
+                    for (mount_point, name) in disks_to_render {
                         self.render_folder_node(
                             ui,
-                            &disk.mount_point,
-                            &disk.name,
+                            &mount_point,
+                            &name,
                             0,
                             &mut dir_to_select,
                             &mut dir_to_expand,
