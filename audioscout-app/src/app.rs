@@ -301,7 +301,8 @@ impl eframe::App for AudioScoutApp {
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.horizontal(|ui| { ui.label(format!("{} files", self.file_rows.len())); if let Some(dir) = &self.current_dir { ui.label(dir.display().to_string()); } });
             ui.separator();
-            egui::ScrollArea::vertical().show(ui, |ui| {
+            
+                        egui::ScrollArea::vertical().show(ui, |ui| {
                 ui.horizontal(|ui| {
                     for col in &self.column_layout.visible.clone() {
                         let width = self.column_layout.width(col);
@@ -318,6 +319,8 @@ impl eframe::App for AudioScoutApp {
                     }
                 });
                 ui.separator();
+                let mut paths_to_load = Vec::new();
+
                 for (idx, row) in self.file_rows.iter().enumerate() {
                     if !self.filter_text.is_empty() && !row.name.to_lowercase().contains(&self.filter_text.to_lowercase()) { continue; }
                     let is_selected = self.selected_row == Some(idx);
@@ -340,10 +343,18 @@ impl eframe::App for AudioScoutApp {
                         }
                     });
                     if response.response.clicked() { self.selected_row = Some(idx); }
-                    if response.response.double_clicked() && !is_broken { let path = row.path.clone(); self.load_file(&path); }
+                    if response.response.double_clicked() && !is_broken {
+                        let path = row.path.clone();
+                        self.load_file(&path);
+                    }
                 }
             });
         });
+
+                // Load files after the loop to avoid borrow conflicts
+                for path in paths_to_load {
+                    self.load_file(&path);
+                }
 
         egui::TopBottomPanel::bottom("actions").default_height(40.0).show(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -360,6 +371,11 @@ impl eframe::App for AudioScoutApp {
                 }
             });
         });
+
+                // Load files after the loop to avoid borrow conflicts
+                for path in paths_to_load {
+                    self.load_file(&path);
+                }
 
         egui::TopBottomPanel::bottom("player").default_height(80.0).show(ctx, |ui| {
             ui.horizontal(|ui| {

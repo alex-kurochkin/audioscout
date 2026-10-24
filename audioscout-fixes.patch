@@ -1,0 +1,81 @@
+diff --git a/audioscout-app/Cargo.toml b/audioscout-app/Cargo.toml
+index 1234567..abcdefg 100644
+--- a/audioscout-app/Cargo.toml
++++ b/audioscout-app/Cargo.toml
+@@ -17,6 +17,7 @@ rfd = "0.15"
+
+ # Logging
+ tracing = "0.1"
++tracing-appender = "0.2"
+ tracing-subscriber = "0.3"
+
+ # Concurrency
+diff --git a/audioscout-app/src/app.rs b/audioscout-app/src/app.rs
+index 2345678..bcdefgh 100644
+--- a/audioscout-app/src/app.rs
++++ b/audioscout-app/src/app.rs
+@@ -8,6 +8,7 @@ use audioscout_core::audio_view::AudioView;
+ use audioscout_core::undo::Stack as UndoStack;
+ use audioscout_core::db::Database;
++use audioscout_core::audio_io::PcmFile;
+ use audioscout_core::{Document, EventChannel, Marker, UiEvent, is_editable_file};
+ use crossbeam_channel::Receiver;
+ use std::collections::HashMap;
+@@ -717,6 +718,9 @@ impl eframe::App for AudioScoutApp {
+             }
+         });
+
++        // Collect paths to load after the central panel to avoid borrow conflicts
++        let mut paths_to_load: Vec<std::path::PathBuf> = Vec::new();
++
+         // Central panel - file table
+         egui::CentralPanel::default().show(ctx, |ui| {
+             // File table
+@@ -728,9 +732,6 @@ impl eframe::App for AudioScoutApp {
+
+             // Table header
+             let visible_cols = self.column_layout.visible.clone();
+-            // Collect paths to load after the scroll area to avoid borrow conflicts
+-            let mut paths_to_load: Vec<std::path::PathBuf> = Vec::new();
+-
+             egui::ScrollArea::vertical().show(ui, |ui| {
+                 // Header row
+                 ui.horizontal(|ui| {
+@@ -836,7 +837,7 @@ impl eframe::App for AudioScoutApp {
+             });
+         });
+
+-        // Load files after the scroll area to avoid borrow conflicts
++        // Load files after the central panel to avoid borrow conflicts
+         for path in paths_to_load {
+             self.load_file(&path);
+         }
+@@ -1106,7 +1107,7 @@ impl eframe::App for AudioScoutApp {
+                             ui.painter().text(
+                                 egui::pos2(screen_x + 2.0, rect.top() + 2.0),
+-                                egui::Align::LEFT,
++                                egui::Align2::LEFT_TOP,
+                                 &marker.name,
+                                 egui::FontId::proportional(10.0),
+                                 color,
+@@ -1198,7 +1199,7 @@ impl eframe::App for AudioScoutApp {
+
+                 // Handle scroll/zoom
+                 ui.input(|i| {
+-                    let scroll = i.scroll_delta;
++                    let scroll = i.smooth_scroll_delta;
+                     if i.modifiers.ctrl {
+                         // Zoom
+                         if scroll.y > 0.0 {
+diff --git a/audioscout-core/src/audio_io/mod.rs b/audioscout-core/src/audio_io/mod.rs
+index 3456789..cdefghi 100644
+--- a/audioscout-core/src/audio_io/mod.rs
++++ b/audioscout-core/src/audio_io/mod.rs
+@@ -115,7 +115,6 @@ fn probe_with_symphonia(path: &Path) -> Result<AudioMeta> {
+
+ fn probe_with_lofty(path: &Path) -> Result<AudioMeta> {
+     use lofty::file::{AudioFile, TaggedFileExt};
+-    use lofty::tag::Accessor;
+     let tagged_file = lofty::read_from_path(path)
+         .map_err(|e| AudioIoError::DecodeError(format!("Lofty: {}", e)))?;
+     let properties = tagged_file.properties();
