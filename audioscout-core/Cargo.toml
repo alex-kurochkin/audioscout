@@ -48,6 +48,9 @@ anyhow = "1.0"
 # Image rendering
 image = "0.25"
 
+# Date/time
+chrono = "0.4"
+
 # System info (disks)
 sysinfo = "0.33"
 

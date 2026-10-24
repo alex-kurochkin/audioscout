@@ -27,12 +27,17 @@ impl Scanner {
                 let meta = crate::audio_io::probe_file(path);
                 let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
                 let file_size = entry.metadata().map(|m| m.len()).unwrap_or(0);
-                let mtime = entry.metadata().ok().and_then(|m| m.modified().ok())
+                let metadata = entry.metadata().ok();
+                let mtime = metadata.as_ref().and_then(|m| m.modified().ok())
                     .map(|t| t.duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs()).unwrap_or(0);
+                // Try to get birth time (created time), fallback to mtime if not available
+                let ctime = metadata.as_ref().and_then(|m| m.created().ok())
+                    .map(|t| t.duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs())
+                    .unwrap_or(mtime);
                 rows.push(FileRow {
                     path: path.to_path_buf(), name: file_name, duration_secs: meta.duration_secs,
                     sample_rate: meta.sample_rate, sample_type: meta.sample_type, channels: meta.channels,
-                    size: file_size, comment: meta.comment, date_created: 0, date_modified: mtime,
+                    size: file_size, comment: meta.comment, date_created: ctime, date_modified: mtime,
                     status: meta.status, preview_uuid: None,
                 });
             }

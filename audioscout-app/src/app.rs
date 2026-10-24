@@ -546,66 +546,114 @@ impl eframe::App for AudioScoutApp {
 
             let visible_cols = self.column_layout.visible.clone();
             egui::ScrollArea::vertical().show(ui, |ui| {
-                // Header
-                ui.horizontal(|ui| {
-                    for col in &visible_cols {
-                        let width = self.column_layout.width(col);
-                        let label = col.title();
-                        let sort_indicator = if self.column_layout.sort_column == Some(*col) {
-                            if self.column_layout.sort_ascending { " ▲" } else { " ▼" }
-                        } else { "" };
-                        let response = ui.allocate_ui(egui::vec2(width, 20.0), |ui| {
-                            if col.sortable() { ui.button(format!("{}{}", label, sort_indicator)) } else { ui.label(label) }
-                        });
-                        if col.sortable() && response.inner.clicked() {
-                            if self.column_layout.sort_column == Some(*col) { self.column_layout.sort_ascending = !self.column_layout.sort_ascending; }
-                            else { self.column_layout.sort_column = Some(*col); self.column_layout.sort_ascending = true; }
-                            self.column_layout.sort_rows(&mut self.file_rows);
-                        }
-                    }
-                });
-                ui.separator();
-
-                // File rows - collect paths to load
-                for (idx, row) in self.file_rows.iter().enumerate() {
-                    if !self.filter_text.is_empty() && !row.name.to_lowercase().contains(&self.filter_text.to_lowercase()) { continue; }
-                    let is_selected = self.selected_row == Some(idx);
-                    let is_broken = row.status == audioscout_core::ProbeStatus::Broken;
-                    let is_unavailable = row.status == audioscout_core::ProbeStatus::Unavailable;
-                    let text_color = if is_broken { egui::Color32::from_rgb(255, 100, 100) } else if is_selected { egui::Color32::WHITE } else { ui.visuals().text_color() };
-
-                    let response = ui.horizontal(|ui| {
+                egui::Grid::new("file_table")
+                    .num_columns(visible_cols.len())
+                    .spacing([10.0, 4.0])
+                    .striped(true)
+                    .show(ui, |ui| {
+                        // Header row
                         for col in &visible_cols {
-                            let width = self.column_layout.width(col);
-                            ui.allocate_ui(egui::vec2(width, 20.0), |ui| {
-                                let text = match col {
-                                    Column::Name => row.name.clone(),
-                                    Column::Preview => String::new(),
-                                    Column::Duration => format_duration(row.duration_secs),
-                                    Column::SampleRate => format!("{} Hz", row.sample_rate),
-                                    Column::SampleType => format!("{}", row.sample_type),
-                                    Column::Channels => match row.channels { 1 => "Mono".to_string(), 2 => "Stereo".to_string(), n => format!("{}ch", n) },
-                                    Column::Size => format_size(row.size),
-                                    Column::Comment => row.comment.clone().unwrap_or_default(),
-                                    Column::DateCreated => format_timestamp(row.date_created),
-                                    Column::DateModified => format_timestamp(row.date_modified),
-                                };
-                                if is_unavailable && *col == Column::Name {
-                                    ui.colored_label(egui::Color32::from_rgb(180, 180, 100), format!("{} [unavailable]", text));
+                            let label = col.title();
+                            let sort_indicator = if self.column_layout.sort_column == Some(*col) {
+                                if self.column_layout.sort_ascending { " ▲" } else { " ▼" }
+                            } else { "" };
+
+                            let response = if col.sortable() {
+                                ui.button(format!("{}{}", label, sort_indicator))
+                            } else {
+                                ui.strong(label)
+                            };
+
+                            if col.sortable() && response.clicked() {
+                                if self.column_layout.sort_column == Some(*col) {
+                                    self.column_layout.sort_ascending = !self.column_layout.sort_ascending;
                                 } else {
-                                    ui.colored_label(text_color, text);
+                                    self.column_layout.sort_column = Some(*col);
+                                    self.column_layout.sort_ascending = true;
                                 }
-                            });
+                                self.column_layout.sort_rows(&mut self.file_rows);
+                            }
+                        }
+                        ui.end_row();
+
+                        // File rows
+                        for (idx, row) in self.file_rows.iter().enumerate() {
+                            if !self.filter_text.is_empty() && !row.name.to_lowercase().contains(&self.filter_text.to_lowercase()) {
+                                continue;
+                            }
+
+                            let is_selected = self.selected_row == Some(idx);
+                            let is_broken = row.status == audioscout_core::ProbeStatus::Broken;
+                            let is_unavailable = row.status == audioscout_core::ProbeStatus::Unavailable;
+                            let text_color = if is_broken {
+                                egui::Color32::from_rgb(255, 100, 100)
+                            } else if is_selected {
+                                egui::Color32::from_rgb(100, 200, 255)
+                            } else {
+                                ui.visuals().text_color()
+                            };
+
+                            // Track if this row was clicked
+                            let mut row_clicked = false;
+                            let mut row_double_clicked = false;
+
+                            for col in &visible_cols {
+                                let cell_response = ui.allocate_ui(
+                                    egui::vec2(self.column_layout.width(col), 20.0),
+                                    |ui| {
+                                        let text = match col {
+                                            Column::Name => row.name.clone(),
+                                            Column::Preview => String::new(),
+                                            Column::Duration => format_duration(row.duration_secs),
+                                            Column::SampleRate => format!("{} Hz", row.sample_rate),
+                                            Column::SampleType => format!("{}", row.sample_type),
+                                            Column::Channels => match row.channels {
+                                                1 => "Mono".to_string(),
+                                                2 => "Stereo".to_string(),
+                                                n => format!("{}ch", n),
+                                            },
+                                            Column::Size => format_size(row.size),
+                                            Column::Comment => row.comment.clone().unwrap_or_default(),
+                                            Column::DateCreated => format_timestamp(row.date_created),
+                                            Column::DateModified => format_timestamp(row.date_modified),
+                                        };
+
+                                        if is_unavailable && *col == Column::Name {
+                                            ui.colored_label(
+                                                egui::Color32::from_rgb(180, 180, 100),
+                                                format!("{} [unavailable]", text),
+                                            )
+                                        } else if *col == Column::Preview {
+                                            // Placeholder for preview
+                                            ui.label("🎵")
+                                        } else {
+                                            ui.colored_label(text_color, text)
+                                        }
+                                    }
+                                );
+
+                                // Check if any cell in this row was clicked
+                                if cell_response.response.clicked() {
+                                    row_clicked = true;
+                                }
+                                if cell_response.response.double_clicked() {
+                                    row_double_clicked = true;
+                                }
+                            }
+
+                            // Handle row selection
+                            if row_clicked {
+                                self.selected_row = Some(idx);
+                            }
+
+                            // Handle double-click to load file
+                            if row_double_clicked && !is_broken && !is_unavailable {
+                                paths_to_load.push(row.path.clone());
+                            }
+
+                            ui.end_row();
                         }
                     });
-
-                    if response.response.clicked() { self.selected_row = Some(idx); }
-
-                    // Double click - collect path, don't load yet (borrow checker)
-                    if response.response.double_clicked() && !is_broken && !is_unavailable {
-                        paths_to_load.push(row.path.clone());
-                    }
-                }
             });
         });
 
@@ -794,5 +842,13 @@ impl eframe::App for AudioScoutApp {
 
 fn format_duration(secs: f64) -> String { if secs < 60.0 { format!("{:.1}s", secs) } else { let mins = (secs / 60.0) as u32; let s = (secs % 60.0) as u32; format!("{}:{:02}", mins, s) } }
 fn format_size(bytes: u64) -> String { if bytes < 1024 { format!("{} B", bytes) } else if bytes < 1024 * 1024 { format!("{:.1} KB", bytes as f64 / 1024.0) } else { format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0)) } }
-fn format_timestamp(ts: u64) -> String { if ts == 0 { return String::new(); } let secs = ts % 60; let mins = (ts / 60) % 60; let hours = (ts / 3600) % 24; format!("{:02}:{:02}:{:02}", hours, mins, secs) }
+fn format_timestamp(ts: u64) -> String {
+    if ts == 0 { return String::new(); }
+    use chrono::{DateTime, Local};
+    let datetime = DateTime::from_timestamp(ts as i64, 0)
+        .map(|dt| dt.with_timezone(&Local))
+        .unwrap_or_else(|| Local::now());
+    // Format: DD-MM-YYYY HH:MM:SS (date with leading zeros, time with leading zeros)
+    datetime.format("%d-%m-%Y %H:%M:%S").to_string()
+}
 fn format_time_hms(secs: f64) -> String { let total_secs = secs as u64; let h = total_secs / 3600; let m = (total_secs % 3600) / 60; let s = total_secs % 60; if h > 0 { format!("{}:{:02}:{:02}", h, m, s) } else { format!("{}:{:02}", m, s) } }

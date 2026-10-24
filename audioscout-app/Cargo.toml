@@ -35,3 +35,6 @@ serde_json = { workspace = true }
 
 # Directories
 dirs-next = "2.0"
+
+# Date/time
+chrono = "0.4"
