@@ -166,8 +166,8 @@ pub fn render_envelope(env: &crate::audio_io::Envelope, width: u32, height: u32,
 
         // Map envelope frames onto pixel columns, merging min/max per column
         // exactly like Peaks::spans does for the raw-signal path.
-        let lo = &env.lo[ch_idx * n..(ch_idx + 1) * n];
-        let hi = &env.hi[ch_idx * n..(ch_idx + 1) * n];
+        let lo = &env.lo[ch_idx];
+        let hi = &env.hi[ch_idx];
 
         let margin = 2u32.min(track_h / 4);
         let draw_h = track_h.saturating_sub(margin * 2) as f32;

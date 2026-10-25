@@ -41,157 +41,159 @@ pub fn load_audio(path: &Path) -> Result<(Vec<f32>, u32, u16, SampleType)> {
     }
 }
 
-/// Streaming min/max decimator: accumulates per-channel `[min, max]` pairs for
-/// a fixed-size input block of frames and emits one envelope frame
-/// `(min, max)` per channel when the block is full.
+/// Per-channel min/max envelope reduced directly from the decoder output.
 ///
-/// This reproduces the peak-envelope semantics of the `waveform-preview`
-/// example (which builds its Peaks tree over the *full* signal) without ever
-/// holding the whole decoded file in memory: every emitted point carries the
-/// true min/max of the skipped region, so no peaks are lost regardless of how
-/// aggressively the signal is decimated.
-pub struct MinMaxDecimator {
-    channels: usize,
-    block_frames: usize,
-    mins: Vec<f32>,
-    maxs: Vec<f32>,
-    filled: usize,
-    // Emitted (min, max) values, stored channel-major: lo[c*n .. (c+1)*n].
-    out_lo: Vec<f32>,
-    out_hi: Vec<f32>,
+/// Mirrors the peak-envelope semantics of the `waveform-preview` example
+/// (`Block::of` + `Block::range`): every emitted point carries the true
+/// min/max of the samples it covers, so no peaks are lost even though the
+/// full signal is never materialised.
+pub struct Envelope {
+    pub channels: usize,
+    pub frames: usize,
+    /// Planar layout: `lo[c]` / `hi[c]` hold the per-channel minima/maxima.
+    pub lo: Vec<Vec<f32>>,
+    pub hi: Vec<Vec<f32>>,
 }
 
-impl MinMaxDecimator {
-    pub fn new(channels: usize, block_frames: usize) -> Self {
+/// Streaming min/max decimator feeding an [`Envelope`].
+///
+/// Deliberately minimal: all hot paths are branch-free folds over plain
+/// slices (`iter().fold`), because per-sample loops with branches were what
+/// made the previous implementation crawl on large files.
+struct EnvAccum {
+    channels: usize,
+    block_frames: usize,
+    /// Raw interleaved samples carried between decoder packets so that
+    /// envelope blocks never straddle a packet boundary incorrectly.
+    carry: Vec<f32>,
+    lo: Vec<Vec<f32>>,
+    hi: Vec<Vec<f32>>,
+}
+
+impl EnvAccum {
+    fn new(channels: usize, block_frames: usize) -> Self {
         let ch = channels.max(1);
         Self {
             channels: ch,
             block_frames: block_frames.max(1),
-            mins: vec![f32::INFINITY; ch],
-            maxs: vec![f32::NEG_INFINITY; ch],
-            filled: 0,
-            out_lo: Vec::new(),
-            out_hi: Vec::new(),
+            carry: Vec::new(),
+            lo: (0..ch).map(|_| Vec::new()).collect(),
+            hi: (0..ch).map(|_| Vec::new()).collect(),
         }
     }
 
-    /// Feeds interleaved samples (frame-major, `channels` values per frame).
-    /// A trailing partial frame is ignored — the caller should keep leftover
-    /// samples and feed them again after appending more data.
-    pub fn push(&mut self, samples: &[f32]) {
+    /// Reduces one frame-major interleaved block `[start, end)` to a single
+    /// `(min, max)` point per channel — the same fold as the example's
+    /// `Block::of(...).range()`, branch-free so it vectorises.
+    #[inline]
+    fn reduce_block(&mut self, data: &[f32], start: usize, end: usize) {
         let ch = self.channels;
-        let frames = samples.len() / ch;
-        if frames == 0 {
+        let mut mins = [f32::INFINITY; 8];
+        let mut maxs = [f32::NEG_INFINITY; 8];
+        let n = ch.min(8);
+        for frame in data[start..end].chunks(ch) {
+            for c in 0..n {
+                let s = frame[c];
+                mins[c] = mins[c].min(s);
+                maxs[c] = maxs[c].max(s);
+            }
+        }
+        for c in 0..ch {
+            let (mn, mx) = (mins[c % 8], maxs[c % 8]);
+            // NaN-poisoned or empty block → flat line at zero (mirrors Block::range()).
+            let (lo, hi) = if mn <= mx { (mn, mx) } else { (0.0, 0.0) };
+            self.lo[c].push(lo);
+            self.hi[c].push(hi);
+        }
+    }
+
+    /// Reduces whole blocks sitting at the front of `carry`.
+    /// (`mem::take` avoids borrowing `self.carry` while mutating `self.lo/hi`.)
+    fn drain_carry(&mut self) {
+        let stride = self.block_frames * self.channels;
+        let taken = std::mem::take(&mut self.carry);
+        let complete = taken.len() - taken.len() % self.channels;
+        let mut idx = 0usize;
+        while idx + stride <= complete {
+            self.reduce_block(&taken, idx, idx + stride);
+            idx += stride;
+        }
+        self.carry = taken[idx..].to_vec();
+    }
+
+    /// Feeds interleaved samples (frame-major). Partial blocks stay in
+    /// `carry` until enough data arrives.
+    fn push(&mut self, samples: &[f32]) {
+        if samples.is_empty() {
             return;
         }
-        // Process whole blocks directly from the input slice (branch-free
-        // inner loop), then carry any remainder in the accumulator.
-        let mut off = 0usize;
-        while self.filled + frames - off >= self.block_frames {
-            let take = self.block_frames - self.filled;
-            let end = off + take;
-            accumulate(&mut self.mins, &mut self.maxs, &samples[off * ch..end * ch], ch);
-            off = end;
-            self.filled = 0;
-            self.flush();
+        let ch = self.channels;
+        let stride = self.block_frames * ch;
+
+        if !self.carry.is_empty() {
+            self.carry.extend_from_slice(samples);
+            self.drain_carry();
+            return;
         }
-        if off < frames {
-            accumulate(&mut self.mins, &mut self.maxs, &samples[off * ch..frames * ch], ch);
-            self.filled += frames - off;
+
+        let complete = samples.len() / ch * ch;
+        let mut idx = 0usize;
+        while idx + stride <= complete {
+            self.reduce_block(samples, idx, idx + stride);
+            idx += stride;
+        }
+        if idx < samples.len() {
+            self.carry.extend_from_slice(&samples[idx..]);
         }
     }
 
-    fn flush(&mut self) {
-        for c in 0..self.channels {
-            // Empty/poisoned block → flat line at zero (mirrors Block::range()).
-            let (lo, hi) = if self.mins[c] <= self.maxs[c] {
-                (self.mins[c], self.maxs[c])
-            } else {
-                (0.0, 0.0)
-            };
-            self.out_lo.push(lo);
-            self.out_hi.push(hi);
-            self.mins[c] = f32::INFINITY;
-            self.maxs[c] = f32::NEG_INFINITY;
+    fn finish(&mut self) {
+        let ch = self.channels;
+        let complete = (self.carry.len() / ch) * ch;
+        if complete == 0 {
+            return;
         }
-        self.filled = 0;
-    }
-
-    /// Flushes the partially-filled block (call once at end of stream).
-    pub fn finish(&mut self) {
-        if self.filled > 0 {
-            self.flush();
+        self.drain_carry();
+        // Trailing partial block → one final envelope point per channel.
+        if !self.carry.is_empty() {
+            let tail = std::mem::take(&mut self.carry);
+            self.reduce_block(&tail, 0, tail.len());
         }
     }
 
-    pub fn frames_out(&self) -> usize {
-        self.out_lo.len() / self.channels
+    fn frames_out(&self) -> usize {
+        self.lo.first().map(|v| v.len()).unwrap_or(0)
     }
 
-    /// Consumes the decimator and returns the channel-major min/max envelope.
-    pub fn into_envelope(self) -> Envelope {
-        Envelope {
-            channels: self.channels,
-            frames: self.frames_out(),
-            lo: self.out_lo,
-            hi: self.out_hi,
-        }
+    fn into_envelope(self) -> Envelope {
+        Envelope { channels: self.channels, frames: self.frames_out(), lo: self.lo, hi: self.hi }
     }
 }
 
-#[inline]
-fn accumulate(mins: &mut [f32], maxs: &mut [f32], samples: &[f32], ch: usize) {
-    let frames = samples.len() / ch;
-    for f in 0..frames {
-        let base = f * ch;
-        for c in 0..ch {
-            let s = samples[base + c];
-            let s = if s.is_finite() { s } else { 0.0 };
-            if s < mins[c] { mins[c] = s; }
-            if s > maxs[c] { maxs[c] = s; }
-        }
-    }
-}
-
-/// Channel-major min/max envelope produced by [`MinMaxDecimator`].
-pub struct Envelope {
-    pub channels: usize,
-    pub frames: usize,
-    /// `lo[c * frames + i]` — minimum of channel `c` at envelope frame `i`.
-    pub lo: Vec<f32>,
-    pub hi: Vec<f32>,
-}
-
-/// Loads audio and reduces it to a min/max envelope with at most
-/// `max_frames_per_channel` envelope frames per channel, streaming through
-/// the decoder so the full waveform never has to be materialised.
+/// Decodes `path` and reduces it to a per-channel min/max envelope with
+/// roughly `target_frames` points per channel, streaming through the decoder.
 ///
-/// Used by the preview renderer: a small table thumbnail (~340 px wide) needs
-/// only a few hundred envelope points per track — decoding and buffering the
-/// entire multi-hundred-megabyte sample array is what made rendering crawl on
-/// large files.
-pub fn load_audio_envelope(
-    path: &Path,
-    max_frames_per_channel: usize,
-) -> Result<(Envelope, u32)> {
+/// Fast path modelled on the `waveform-preview` example: a ~340-px thumbnail
+/// needs only a few hundred envelope points per track, so we fold peaks while
+/// reading instead of buffering hundreds of megabytes of samples.
+pub fn load_audio_envelope(path: &Path, target_frames: usize) -> Result<(Envelope, u32)> {
     let ext = path.extension().and_then(|e| e.to_str()).map(|e| e.to_lowercase()).unwrap_or_default();
     match ext.as_str() {
-        "wav" => envelope_from_hound(path, max_frames_per_channel),
-        _ => envelope_with_symphonia(path, max_frames_per_channel),
+        "wav" => envelope_from_hound(path, target_frames.max(1)),
+        _ => envelope_with_symphonia(path, target_frames.max(1)),
     }
 }
 
-fn envelope_from_hound(path: &Path, max_frames: usize) -> Result<(Envelope, u32)> {
+fn envelope_from_hound(path: &Path, target_frames: usize) -> Result<(Envelope, u32)> {
     let reader = hound::WavReader::open(path)
         .map_err(|e| AudioIoError::DecodeError(format!("WAV open: {}", e)))?;
     let spec = reader.spec();
     let ch = spec.channels.max(1) as usize;
     let total_samples = reader.len() as usize;
-    let block = (total_samples / ch).div_ceil(max_frames.max(1)).max(1);
-    let mut dec = MinMaxDecimator::new(ch, block);
+    let block = (total_samples / ch).div_ceil(target_frames).max(1);
+    drop(reader);
 
-    // Buffered reader: hound's WavReader does one read() call per sample
-    // without buffering, which dominates decode time for PCM files.
+    // BufReader: hound's WavReader issues one read() per sample otherwise.
     let file = std::io::BufReader::with_capacity(
         1 << 20,
         std::fs::File::open(path)
@@ -200,55 +202,84 @@ fn envelope_from_hound(path: &Path, max_frames: usize) -> Result<(Envelope, u32)
     let mut reader = hound::WavReader::new(file)
         .map_err(|e| AudioIoError::DecodeError(format!("WAV open: {}", e)))?;
 
+    let mut acc = EnvAccum::new(ch, block);
+    const CHUNK: usize = 1 << 14; // samples per batch
+
     match spec.sample_format {
         hound::SampleFormat::Int => match spec.bits_per_sample {
-            8 => {
-                let scale = 1.0 / 128.0;
-                feed_iter(&mut reader.into_samples::<i16>().map(move |s| s.map(|v| v as f32 * scale)), &mut dec);
-            }
-            16 => {
-                let scale = 1.0 / 32768.0;
-                feed_iter(&mut reader.into_samples::<i16>().map(move |s| s.map(|v| v as f32 * scale)), &mut dec);
-            }
-            24 | 32 => {
-                let scale = if spec.bits_per_sample == 24 { 1.0 / 8388608.0 } else { 1.0 / 2147483648.0 };
-                feed_iter(&mut reader.into_samples::<i32>().map(move |s| s.map(|v| v as f32 * scale)), &mut dec);
-            }
+            8 | 16 => pump_scaled::<i16>(&mut reader, if spec.bits_per_sample == 8 { 1.0 / 128.0 } else { 1.0 / 32768.0 }, &mut acc),
+            24 | 32 => pump_scaled::<i32>(&mut reader, if spec.bits_per_sample == 24 { 1.0 / 8388608.0 } else { 1.0 / 2147483648.0 }, &mut acc),
             bits => return Err(AudioIoError::UnsupportedFormat(format!("Unsupported bits: {}", bits))),
         },
         hound::SampleFormat::Float => {
-            feed_iter(&mut reader.into_samples::<f32>(), &mut dec);
+            let mut it = reader.samples::<f32>();
+            let mut buf: Vec<f32> = Vec::with_capacity(CHUNK);
+            loop {
+                buf.clear();
+                while buf.len() < CHUNK {
+                    match it.next() {
+                        Some(Ok(v)) => buf.push(v),
+                        _ => break,
+                    }
+                }
+                if buf.is_empty() {
+                    break;
+                }
+                acc.push(&buf);
+                if buf.len() < CHUNK {
+                    break;
+                }
+            }
         }
     }
 
-    dec.finish();
-    Ok((dec.into_envelope(), spec.sample_rate))
+    acc.finish();
+    Ok((acc.into_envelope(), spec.sample_rate))
 }
 
-/// Drives a fallible sample iterator through the decimator in chunks,
-/// buffering only a small window of samples at a time.
-fn feed_iter<I>(mut iter: I, dec: &mut MinMaxDecimator)
+/// Reads PCM samples in chunks, scales them to f32 and feeds the envelope
+/// accumulator — no full-file buffering anywhere.
+fn pump_scaled<T>(reader: &mut hound::WavReader<std::io::BufReader<std::fs::File>>, scale: f32, acc: &mut EnvAccum)
 where
-    I: Iterator<Item = std::result::Result<f32, hound::Error>>,
+    T: hound::Sample + Copy + HoundToFloat,
 {
-    const CHUNK: usize = 1 << 15;
-    let ch = dec.channels;
-    let mut buf: Vec<f32> = Vec::with_capacity(CHUNK + ch);
-    while let Some(v) = iter.next() {
-        if let Ok(s) = v {
-            buf.push(s);
+    let mut it = reader.samples::<T>();
+    let mut raw: Vec<T> = Vec::with_capacity(1 << 14);
+    let mut buf: Vec<f32> = Vec::with_capacity(1 << 14);
+    loop {
+        raw.clear();
+        buf.clear();
+        while raw.len() < (1 << 14) {
+            match it.next() {
+                Some(Ok(v)) => raw.push(v),
+                _ => break,
+            }
         }
-        if buf.len() >= CHUNK + ch {
-            let usable = (buf.len() / ch) * ch;
-            dec.push(&buf[..usable]);
-            buf.clear();
+        if raw.is_empty() {
+            break;
+        }
+        buf.extend(raw.iter().map(|&v| v.to_f32(scale)));
+        acc.push(&buf);
+        if raw.len() < (1 << 14) {
+            break;
         }
     }
-    let usable = (buf.len() / ch) * ch;
-    dec.push(&buf[..usable]);
 }
 
-fn envelope_with_symphonia(path: &Path, max_frames: usize) -> Result<(Envelope, u32)> {
+/// Minimal scaling trait bridging hound sample types to f32.
+trait HoundToFloat: Sized {
+    fn to_f32(self, scale: f32) -> f32;
+}
+impl HoundToFloat for i16 {
+    #[inline]
+    fn to_f32(self, scale: f32) -> f32 { self as f32 * scale }
+}
+impl HoundToFloat for i32 {
+    #[inline]
+    fn to_f32(self, scale: f32) -> f32 { self as f32 * scale }
+}
+
+fn envelope_with_symphonia(path: &Path, target_frames: usize) -> Result<(Envelope, u32)> {
     use symphonia::core::audio::SampleBuffer;
     use symphonia::core::codecs::DecoderOptions;
     use symphonia::core::errors::Error;
@@ -275,23 +306,22 @@ fn envelope_with_symphonia(path: &Path, max_frames: usize) -> Result<(Envelope, 
     let ch = track.codec_params.channels.map(|c| c.count()).unwrap_or(1).max(1);
     let total_frames_hint = track.codec_params.n_frames.unwrap_or(0) as usize;
     let block = if total_frames_hint > 0 {
-        (total_frames_hint / max_frames.max(1)).max(1)
+        (total_frames_hint / target_frames).max(1)
     } else {
-        // Unknown length: pick a block that keeps the envelope dense enough.
-        1024
+        // Unknown length: keep the envelope dense but bounded.
+        2048
     };
 
     let mut decoder = symphonia::default::get_codecs()
         .make(&track.codec_params, &DecoderOptions::default())
         .map_err(|e| AudioIoError::DecodeError(format!("Codec init failed: {}", e)))?;
 
-    let mut dec = MinMaxDecimator::new(ch, block);
+    let mut acc = EnvAccum::new(ch, block);
     let mut sample_buf: Option<SampleBuffer<f32>> = None;
 
     loop {
         let packet = match format.next_packet() {
             Ok(p) => p,
-            Err(Error::IoError(_)) => break,
             Err(_) => break,
         };
         if packet.track_id() != track_id { continue; }
@@ -305,7 +335,7 @@ fn envelope_with_symphonia(path: &Path, max_frames: usize) -> Result<(Envelope, 
                 }
                 if let Some(buf) = &mut sample_buf {
                     buf.copy_interleaved_ref(audio_buf);
-                    dec.push(buf.samples());
+                    acc.push(buf.samples());
                 }
             }
             Err(Error::DecodeError(m)) => {
@@ -315,11 +345,11 @@ fn envelope_with_symphonia(path: &Path, max_frames: usize) -> Result<(Envelope, 
         }
     }
 
-    dec.finish();
-    if dec.frames_out() == 0 {
+    acc.finish();
+    if acc.frames_out() == 0 {
         return Err(AudioIoError::DecodeError("File contains no audio data".to_string()));
     }
-    Ok((dec.into_envelope(), sample_rate))
+    Ok((acc.into_envelope(), sample_rate))
 }
 
 fn load_with_symphonia(path: &Path) -> Result<(Vec<f32>, u32, u16, SampleType)> {
