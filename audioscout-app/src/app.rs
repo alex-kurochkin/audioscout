@@ -688,8 +688,12 @@ impl eframe::App for AudioScoutApp {
             ui.separator();
 
             let visible_cols = self.column_layout.visible.clone();
+
+            // Calculate available height for scroll area (subtract header and separator)
+            let available_height = ui.available_height() - 30.0; // 30px for header + separator
+
             egui::ScrollArea::vertical()
-                .auto_shrink([false; 2])
+                .max_height(available_height)
                 .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
                 .show(ui, |ui| {
                 egui::Grid::new("file_table")
