@@ -1,0 +1,9 @@
+[package]
+name = "waveform-preview"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+symphonia = { version = "0.5", features = ["all"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
+clap = { version = "4", features = ["derive"] }
