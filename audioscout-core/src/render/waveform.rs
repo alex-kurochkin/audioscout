@@ -117,14 +117,90 @@ pub fn render_waveform_preview(samples: &[f32], channels: u16) -> RgbaImage {
     )
 }
 
-/// Core renderer following the `waveform-preview` example: draws one track
-/// per channel slice, each with its own center line and peak/RMS columns.
-fn render_tracks(channels: &[&[f32]], peaks_list: &[Peaks], opts: &RenderOptions) -> RgbaImage {
-    let w = opts.width;
-    let h = opts.height;
-    let mut img = RgbaImage::new(w, h);
+/// Renders a waveform preview image directly from a precomputed min/max
+/// envelope (see `crate::audio_io::Envelope`).
+///
+/// Same visual output as `render_waveform` in `Mode::Peak`, but without
+/// materialising or re-reducing the full sample signal — this is the fast
+/// path used by the file-list preview worker for large files.
+pub fn render_envelope(env: &crate::audio_io::Envelope, width: u32, height: u32, style: Style) -> RgbaImage {
+    // Which channel tracks to display: mono → 1, stereo/multichannel → first 2.
+    let selected = select_channels(env.channels);
+    let n = env.frames;
 
-    let (bg, fg, grid, separator) = match opts.style {
+    let mut img = RgbaImage::new(width, height);
+    let (bg, fg, grid, separator) = palette(style);
+
+    for pixel in img.pixels_mut() {
+        *pixel = bg;
+    }
+    if selected.is_empty() || width == 0 || height == 0 || n == 0 {
+        return img;
+    }
+
+    let num_tracks = selected.len();
+    let track_height = height / num_tracks as u32;
+    if track_height == 0 {
+        return img;
+    }
+
+    for (track_idx, &ch_idx) in selected.iter().enumerate() {
+        let y_start = track_idx as u32 * track_height;
+        let y_end = if track_idx == num_tracks - 1 {
+            height
+        } else {
+            (track_idx as u32 + 1) * track_height
+        };
+        let track_h = y_end - y_start;
+
+        if track_idx > 0 {
+            for x in 0..width {
+                *img.get_pixel_mut(x, y_start) = separator;
+            }
+        }
+
+        let cy = y_start + track_h / 2;
+        for x in 0..width {
+            *img.get_pixel_mut(x, cy) = grid;
+        }
+
+        // Map envelope frames onto pixel columns, merging min/max per column
+        // exactly like Peaks::spans does for the raw-signal path.
+        let lo = &env.lo[ch_idx * n..(ch_idx + 1) * n];
+        let hi = &env.hi[ch_idx * n..(ch_idx + 1) * n];
+
+        let margin = 2u32.min(track_h / 4);
+        let draw_h = track_h.saturating_sub(margin * 2) as f32;
+
+        for x in 0..width {
+            let a = (x as usize * n) / width as usize;
+            let b = (((x + 1) as usize * n) / width as usize).max(a + 1).min(n);
+            let mut col_lo = f32::INFINITY;
+            let mut col_hi = f32::NEG_INFINITY;
+            for i in a..b {
+                if lo[i] < col_lo { col_lo = lo[i]; }
+                if hi[i] > col_hi { col_hi = hi[i]; }
+            }
+            if col_lo > col_hi {
+                continue; // empty column: leave the grid line visible
+            }
+            let y_top = cy as f32 - col_hi.clamp(-1.0, 1.0) * (draw_h / 2.0);
+            let y_bot = cy as f32 - col_lo.clamp(-1.0, 1.0) * (draw_h / 2.0);
+            let y_top = y_top.max((y_start + margin) as f32) as u32;
+            let y_bot = (y_bot as u32).min(y_end.saturating_sub(1));
+            for y in y_top..=y_bot {
+                *img.get_pixel_mut(x, y) = fg;
+            }
+        }
+    }
+
+    img
+}
+
+/// Color palette shared by both renderers (mirrors the Dark/Light styles of
+/// the `waveform-preview` example).
+fn palette(style: Style) -> (Rgba<u8>, Rgba<u8>, Rgba<u8>, Rgba<u8>) {
+    match style {
         Style::Dark => (
             Rgba([13, 18, 32, 255]),
             Rgba([16, 185, 129, 255]),
@@ -137,7 +213,17 @@ fn render_tracks(channels: &[&[f32]], peaks_list: &[Peaks], opts: &RenderOptions
             Rgba([229, 231, 235, 255]),
             Rgba([209, 213, 219, 255]),
         ),
-    };
+    }
+}
+
+/// Core renderer following the `waveform-preview` example: draws one track
+/// per channel slice, each with its own center line and peak/RMS columns.
+fn render_tracks(channels: &[&[f32]], peaks_list: &[Peaks], opts: &RenderOptions) -> RgbaImage {
+    let w = opts.width;
+    let h = opts.height;
+    let mut img = RgbaImage::new(w, h);
+
+    let (bg, fg, grid, separator) = palette(opts.style);
 
     // Background
     for pixel in img.pixels_mut() {

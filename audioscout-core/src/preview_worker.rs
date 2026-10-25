@@ -227,14 +227,23 @@ fn generate_preview_uuid(path: &PathBuf, channels: u16) -> Result<String, String
 
 /// Render a waveform preview image for the file list.
 ///
-/// Implementation follows the `waveform-preview` example: audio is decoded,
-/// split into planar channels, a Peaks tree is built per track and the image
-/// is rendered by `crate::render::waveform`.
+/// Fast path modelled on the `waveform-preview` example (per-track min/max
+/// peak envelope, one column per pixel), but the envelope is produced while
+/// *streaming* through the decoder (`audio_io::load_audio_envelope`) instead
+/// of loading the entire file into memory first — decoding + buffering the
+/// full multi-hundred-megabyte sample array was what made previews crawl on
+/// large files. The visual result matches the example's Peak mode because
+/// every envelope point carries the true min/max of its region.
 /// Returns existing UUID if preview already exists.
 fn render_preview(path: &PathBuf) -> Result<String, String> {
-    // Load audio data FIRST to get channel count
-    let (samples, _sample_rate, channels, _) = crate::audio_io::load_audio(path)
-        .map_err(|e| format!("Load failed: {}", e))?;
+    const PREVIEW_WIDTH: u32 = 340;
+    // Envelope resolution: ~4 points per horizontal pixel is plenty for a
+    // 340-px thumbnail and keeps decode cost linear in file size only.
+    const ENVELOPE_FRAMES: usize = (PREVIEW_WIDTH as usize) * 4;
+
+    // Probe channel count from metadata (cheap) to pick the layout & UUID.
+    let meta = crate::audio_io::probe_file(path);
+    let channels = if meta.channels > 0 { meta.channels } else { 1 };
 
     // Generate deterministic UUID including channels
     let uuid = generate_preview_uuid(path, channels)?;
@@ -250,17 +259,18 @@ fn render_preview(path: &PathBuf) -> Result<String, String> {
         return Ok(uuid);
     }
 
-    let width = 340u32;
-    // Use taller preview for stereo/multichannel (2 tracks need more space)
-    let height = if channels == 1 { 20u32 } else { 40u32 };
+    let (env, _sample_rate) =
+        crate::audio_io::load_audio_envelope(path, ENVELOPE_FRAMES)
+            .map_err(|e| format!("Load failed: {}", e))?;
 
-    let img = crate::render::waveform::render_waveform(
-        &samples,
-        channels,
-        width,
+    // Use taller preview for stereo/multichannel (2 tracks need more space)
+    let height = if env.channels == 1 { 20u32 } else { 40u32 };
+
+    let img = crate::render::waveform::render_envelope(
+        &env,
+        PREVIEW_WIDTH,
         height,
         crate::render::waveform::Style::Dark,
-        crate::render::waveform::Mode::Peak,
     );
 
     // Save as PNG
