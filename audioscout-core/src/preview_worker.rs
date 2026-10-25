@@ -1,4 +1,3 @@
-use crate::config::PreviewMode;
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::{Arc, Condvar, Mutex};
@@ -9,7 +8,6 @@ use crate::UiEvent;
 #[derive(Debug, Clone)]
 pub struct PreviewJob {
     pub path: PathBuf,
-    pub mode: PreviewMode,
     pub generation: u64,
 }
 
@@ -74,11 +72,7 @@ impl PreviewWorker {
                                 .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                                 .map(|d| d.as_secs())
                                 .unwrap_or(0);
-                            let mode_str = match job.mode {
-                                PreviewMode::Wave => "wave",
-                                PreviewMode::Spectrogram => "spectrogram",
-                            };
-                            db.load_preview(&job.path, size, mtime, mode_str)
+                            db.load_preview(&job.path, size, mtime, "wave")
                         } else {
                             None
                         }
@@ -94,7 +88,7 @@ impl PreviewWorker {
                             existing
                         } else {
                             // File missing, regenerate
-                            match render_preview(&job.path, job.mode) {
+                            match render_preview(&job.path) {
                                 Ok(new_uuid) => new_uuid,
                                 Err(_) => {
                                     let (lock, _) = &*queue_clone;
@@ -107,7 +101,7 @@ impl PreviewWorker {
                         }
                     } else {
                         // Generate new preview
-                        match render_preview(&job.path, job.mode) {
+                        match render_preview(&job.path) {
                             Ok(new_uuid) => new_uuid,
                             Err(_) => {
                                 let (lock, _) = &*queue_clone;
@@ -128,11 +122,7 @@ impl PreviewWorker {
                                 .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                                 .map(|d| d.as_secs())
                                 .unwrap_or(0);
-                            let mode_str = match job.mode {
-                                PreviewMode::Wave => "wave",
-                                PreviewMode::Spectrogram => "spectrogram",
-                            };
-                            let _ = db.save_preview(&job.path, size, mtime, mode_str, &uuid);
+                            let _ = db.save_preview(&job.path, size, mtime, "wave", &uuid);
                         }
                     }
 
@@ -140,7 +130,6 @@ impl PreviewWorker {
                     let _ = sender_clone.send(UiEvent::PreviewReady {
                         path: job.path.clone(),
                         uuid,
-                        mode: job.mode,
                         generation: job.generation,
                     });
 
@@ -201,8 +190,8 @@ impl Drop for PreviewWorker {
     }
 }
 
-/// Generate deterministic UUID based on file path, mtime, size, mode, and channels
-fn generate_preview_uuid(path: &PathBuf, mode: PreviewMode, channels: u16) -> Result<String, String> {
+/// Generate deterministic UUID based on file path, mtime, size, and channels
+fn generate_preview_uuid(path: &PathBuf, channels: u16) -> Result<String, String> {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
 
@@ -216,20 +205,15 @@ fn generate_preview_uuid(path: &PathBuf, mode: PreviewMode, channels: u16) -> Re
         .as_secs();
 
     let size = metadata.len();
-    let mode_str = match mode {
-        PreviewMode::Wave => "wave",
-        PreviewMode::Spectrogram => "spectrogram",
-    };
 
     let mut hasher = DefaultHasher::new();
     path.hash(&mut hasher);
     mtime.hash(&mut hasher);
     size.hash(&mut hasher);
-    mode_str.hash(&mut hasher);
     channels.hash(&mut hasher); // Include channels in hash
     let hash = hasher.finish();
 
-    // Use first 16 bytes of hash as UUID
+    // Use first 8 bytes of hash to build a stable UUID string
     let uuid_bytes = hash.to_le_bytes();
     let uuid = uuid::Uuid::from_bytes([
         uuid_bytes[0], uuid_bytes[1], uuid_bytes[2], uuid_bytes[3],
@@ -241,16 +225,19 @@ fn generate_preview_uuid(path: &PathBuf, mode: PreviewMode, channels: u16) -> Re
     Ok(uuid.to_string())
 }
 
-/// Render a preview image (waveform or spectrogram)
-/// Uses Peaks tree for fast rendering of entire file
-/// Returns existing UUID if preview already exists
-fn render_preview(path: &PathBuf, mode: PreviewMode) -> Result<String, String> {
+/// Render a waveform preview image for the file list.
+///
+/// Implementation follows the `waveform-preview` example: audio is decoded,
+/// split into planar channels, a Peaks tree is built per track and the image
+/// is rendered by `crate::render::waveform`.
+/// Returns existing UUID if preview already exists.
+fn render_preview(path: &PathBuf) -> Result<String, String> {
     // Load audio data FIRST to get channel count
-    let (samples, sample_rate, channels, _) = crate::audio_io::load_audio(path)
+    let (samples, _sample_rate, channels, _) = crate::audio_io::load_audio(path)
         .map_err(|e| format!("Load failed: {}", e))?;
 
     // Generate deterministic UUID including channels
-    let uuid = generate_preview_uuid(path, mode, channels)?;
+    let uuid = generate_preview_uuid(path, channels)?;
 
     // Check if preview already exists
     let config_dir = crate::config::config_dir();
@@ -267,16 +254,14 @@ fn render_preview(path: &PathBuf, mode: PreviewMode) -> Result<String, String> {
     // Use taller preview for stereo/multichannel (2 tracks need more space)
     let height = if channels == 1 { 20u32 } else { 40u32 };
 
-    let img = match mode {
-        PreviewMode::Wave => {
-            // Render using Peaks tree for fast min/max queries
-            crate::render::waveform::render_waveform(&samples, sample_rate, channels, width, height)
-        }
-        PreviewMode::Spectrogram => {
-            // Render spectrogram
-            crate::render::spectrogram::render_spectrogram(&samples, sample_rate, channels, width, height)
-        }
-    };
+    let img = crate::render::waveform::render_waveform(
+        &samples,
+        channels,
+        width,
+        height,
+        crate::render::waveform::Style::Dark,
+        crate::render::waveform::Mode::Peak,
+    );
 
     // Save as PNG
     img.save(&png_path).map_err(|e| format!("Save failed: {}", e))?;

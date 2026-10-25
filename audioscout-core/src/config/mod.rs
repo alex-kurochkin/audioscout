@@ -2,20 +2,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum PreviewMode { Wave, Spectrogram }
-
-impl std::fmt::Display for PreviewMode {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self { PreviewMode::Wave => write!(f, "Waveform"), PreviewMode::Spectrogram => write!(f, "Spectrogram") }
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
-    pub volume: f32, pub table_preview_mode: PreviewMode, pub player_mode: PreviewMode,
-    pub space_behavior_stop: bool, pub undo_depth: usize, pub undo_disk_limit_mb: usize,
+    pub volume: f32, pub space_behavior_stop: bool, pub undo_depth: usize, pub undo_disk_limit_mb: usize,
     pub undo_dir: Option<String>, pub preview_prefetch: usize, pub skip_seconds: u32,
     pub meter_hold_enabled: bool, pub meter_hold_seconds: f64, pub columns: ColumnConfig,
     pub hotkeys: HashMap<String, HotkeyBinding>, #[serde(skip)] pub version: u64,
@@ -45,7 +34,7 @@ impl Default for AppConfig {
         hotkeys.insert("deleteMarker".into(), HotkeyBinding { key: "Delete".into(), ctrl: false, shift: false, alt: false });
         hotkeys.insert("clearSelection".into(), HotkeyBinding { key: "Escape".into(), ctrl: false, shift: false, alt: false });
         Self {
-            volume: 0.8, table_preview_mode: PreviewMode::Wave, player_mode: PreviewMode::Wave,
+            volume: 0.8,
             space_behavior_stop: true, undo_depth: 20, undo_disk_limit_mb: 2048, undo_dir: None,
             preview_prefetch: 30, skip_seconds: 5, meter_hold_enabled: false, meter_hold_seconds: 1.0,
             columns: ColumnConfig {

@@ -1,65 +1,273 @@
-use image::{ImageBuffer, Rgba, RgbaImage};
+//! Waveform preview rendering.
+//!
+//! Новая реализация генерации превью для окна списка файлов,
+//! написанная по образцу CLI-примера из каталога `waveform-preview`:
+//! - декомпозиция interleaved-сэмплов на planar-каналы;
+//! - выбор отображаемых дорожек (моно → 1, стерео/мульти → первые 2);
+//! - построение дерева Peaks для каждой дорожки;
+//! - построчный рендер min/max (peak) или RMS-столбцов вокруг центральной
+//!   линии дорожки с разделителями между дорожками (тёмная/светлая темы).
 
-pub fn render_waveform(samples: &[f32], _sample_rate: u32, channels: u16, width: u32, height: u32) -> RgbaImage {
-    let ch = channels.max(1) as usize;
-    let total_frames = if ch == 0 { 0 } else { samples.len() / ch };
-    let mut img = ImageBuffer::new(width, height);
-    for pixel in img.pixels_mut() { *pixel = Rgba([20, 20, 25, 255]); }
-    if total_frames == 0 || width == 0 || height == 0 { return img; }
-    let frames_per_pixel = (total_frames as f64 / width as f64).max(1.0);
-    let mid_y = height as f32 / 2.0;
-    let wave_color = Rgba([50, 200, 80, 255]);
-    for x in 0..width {
-        let frame_start = (x as f64 * frames_per_pixel) as usize;
-        let frame_end = ((x as f64 + 1.0) * frames_per_pixel).min(total_frames as f64) as usize;
-        if frame_start >= total_frames { break; }
-        let mut min_val: f32 = 0.0; let mut max_val: f32 = 0.0;
-        for frame in frame_start..frame_end {
-            let sample_idx = frame * ch;
-            if sample_idx < samples.len() {
-                let val = samples[sample_idx];
-                if val < min_val { min_val = val; }
-                if val > max_val { max_val = val; }
+use image::{Rgba, RgbaImage};
+
+use crate::peaks_tree::Peaks;
+
+/// Rendering color palette (mirrors the Dark/Light styles of the
+/// `waveform-preview` example).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Style {
+    Dark,
+    Light,
+}
+
+/// Amplitude reduction mode per pixel column.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    /// Min/max envelope per column.
+    Peak,
+    /// Symmetric RMS bar per column.
+    Rms,
+}
+
+/// Options controlling how a preview waveform image is rendered.
+pub struct RenderOptions {
+    pub width: u32,
+    pub height: u32,
+    pub style: Style,
+    pub mode: Mode,
+}
+
+impl Default for RenderOptions {
+    fn default() -> Self {
+        // Table preview cell size from the spec: 340x20 px, dark theme, peaks.
+        Self {
+            width: 340,
+            height: 20,
+            style: Style::Dark,
+            mode: Mode::Peak,
+        }
+    }
+}
+
+/// Picks the channel indexes to render as tracks:
+/// - 1 channel (mono)  → [0]
+/// - 2 channels        → [0, 1]
+/// - >2 channels       → [0, 1] (first two), same rule as the example
+pub fn select_channels(total_channels: usize) -> Vec<usize> {
+    match total_channels {
+        0 => vec![],
+        1 => vec![0],
+        _ => vec![0, 1],
+    }
+}
+
+/// Splits interleaved samples into per-channel planar vectors.
+pub fn deinterleave(samples: &[f32], channels: usize) -> Vec<Vec<f32>> {
+    let ch = channels.max(1);
+    let frames = samples.len() / ch;
+    let mut planar: Vec<Vec<f32>> = (0..ch).map(|_| Vec::with_capacity(frames)).collect();
+    for frame in 0..frames {
+        for ch_idx in 0..ch {
+            let s = samples[frame * ch + ch_idx];
+            planar[ch_idx].push(if s.is_finite() { s } else { 0.0 });
+        }
+    }
+    planar
+}
+
+/// Renders a waveform preview image from interleaved audio samples.
+///
+/// This is the entry point used by the file-list preview worker:
+/// mono files produce a single track, stereo/multichannel files produce
+/// two stacked tracks with a separator line between them.
+pub fn render_waveform(
+    samples: &[f32],
+    channels: u16,
+    width: u32,
+    height: u32,
+    style: Style,
+    mode: Mode,
+) -> RgbaImage {
+    let planar = deinterleave(samples, channels as usize);
+    let selected = select_channels(planar.len());
+    let channel_slices: Vec<&[f32]> =
+        selected.iter().map(|&ch_idx| planar[ch_idx].as_slice()).collect();
+    let peaks_list: Vec<Peaks> =
+        selected.iter().map(|&ch_idx| Peaks::build(&planar[ch_idx])).collect();
+
+    let opts = RenderOptions {
+        width,
+        height,
+        style,
+        mode,
+    };
+    render_tracks(&channel_slices, &peaks_list, &opts)
+}
+
+/// Convenience wrapper matching the default table-preview options.
+pub fn render_waveform_preview(samples: &[f32], channels: u16) -> RgbaImage {
+    let opts = RenderOptions::default();
+    render_waveform(
+        samples,
+        channels,
+        opts.width,
+        opts.height,
+        opts.style,
+        opts.mode,
+    )
+}
+
+/// Core renderer following the `waveform-preview` example: draws one track
+/// per channel slice, each with its own center line and peak/RMS columns.
+fn render_tracks(channels: &[&[f32]], peaks_list: &[Peaks], opts: &RenderOptions) -> RgbaImage {
+    let w = opts.width;
+    let h = opts.height;
+    let mut img = RgbaImage::new(w, h);
+
+    let (bg, fg, grid, separator) = match opts.style {
+        Style::Dark => (
+            Rgba([13, 18, 32, 255]),
+            Rgba([16, 185, 129, 255]),
+            Rgba([31, 41, 55, 255]),
+            Rgba([55, 65, 81, 255]),
+        ),
+        Style::Light => (
+            Rgba([255, 255, 255, 255]),
+            Rgba([5, 150, 105, 255]),
+            Rgba([229, 231, 235, 255]),
+            Rgba([209, 213, 219, 255]),
+        ),
+    };
+
+    // Background
+    for pixel in img.pixels_mut() {
+        *pixel = bg;
+    }
+
+    if channels.is_empty() || w == 0 || h == 0 {
+        return img;
+    }
+
+    let num_tracks = channels.len();
+    let track_height = h / num_tracks as u32;
+    if track_height == 0 {
+        return img;
+    }
+
+    for (track_idx, (samples, peaks)) in channels.iter().zip(peaks_list.iter()).enumerate() {
+        let y_start = track_idx as u32 * track_height;
+        let y_end = if track_idx == num_tracks - 1 {
+            h
+        } else {
+            (track_idx as u32 + 1) * track_height
+        };
+        let track_h = y_end - y_start;
+
+        // Separator between tracks (except before the first one)
+        if track_idx > 0 {
+            for x in 0..w {
+                *img.get_pixel_mut(x, y_start) = separator;
             }
         }
-        let y_min = (mid_y - max_val * mid_y).clamp(0.0, height as f32 - 1.0) as u32;
-        let y_max = (mid_y - min_val * mid_y).clamp(0.0, height as f32 - 1.0) as u32;
-        for y in y_min..=y_max { if y < height { img.put_pixel(x, y, wave_color); } }
+
+        // Track center line
+        let cy = y_start + track_h / 2;
+        for x in 0..w {
+            *img.get_pixel_mut(x, cy) = grid;
+        }
+
+        if samples.is_empty() {
+            continue;
+        }
+
+        // One min/max (or RMS) column per horizontal pixel
+        let step = samples.len() as f64 / w as f64;
+        let columns: Vec<(f32, f32)> = match opts.mode {
+            Mode::Peak => peaks.spans(samples, 0.0, step, w as usize),
+            Mode::Rms => peaks
+                .rms_spans(samples, 0.0, step, w as usize)
+                .into_iter()
+                .map(|r| (-r, r))
+                .collect(),
+        };
+
+        let margin = 2u32.min(track_h / 4);
+        let draw_h = track_h.saturating_sub(margin * 2) as f32;
+        for (x, &(lo, hi)) in columns.iter().enumerate() {
+            let x = x as u32;
+            if x >= w {
+                break;
+            }
+            let y_top = cy as f32 - hi.clamp(-1.0, 1.0) * (draw_h / 2.0);
+            let y_bot = cy as f32 - lo.clamp(-1.0, 1.0) * (draw_h / 2.0);
+            let y_top = y_top.max((y_start + margin) as f32) as u32;
+            let y_bot = (y_bot as u32).min(y_end.saturating_sub(1));
+            for y in y_top..=y_bot {
+                *img.get_pixel_mut(x, y) = fg;
+            }
+        }
     }
+
     img
 }
 
-pub fn render_waveform_view(samples: &[f32], _sample_rate: u32, channels: u16, start_frame: u64, end_frame: u64, width: u32, height: u32, stereo: bool) -> RgbaImage {
-    let ch = channels.max(1) as usize;
-    let view_frames = (end_frame - start_frame) as usize;
-    let row_height = if stereo { height / 2 } else { height };
-    let mut img = ImageBuffer::new(width, height);
-    for pixel in img.pixels_mut() { *pixel = Rgba([30, 30, 35, 255]); }
-    if view_frames == 0 || width == 0 { return img; }
-    let frames_per_pixel = (view_frames as f64 / width as f64).max(1.0);
-    let wave_color = Rgba([50, 220, 80, 255]);
-    for row in 0..if stereo { 2 } else { 1 } {
-        let row_offset = row * row_height as usize;
-        let channel = row;
-        let mid_y = row_offset as f32 + row_height as f32 / 2.0;
-        for x in 0..width {
-            let frame_start = start_frame as usize + (x as f64 * frames_per_pixel) as usize;
-            let frame_end = (start_frame as f64 + (x as f64 + 1.0) * frames_per_pixel).min(end_frame as f64) as usize;
-            let mut min_val: f32 = 0.0; let mut max_val: f32 = 0.0;
-            for frame in frame_start..frame_end {
-                let sample_idx = frame * ch + channel.min(ch - 1);
-                if sample_idx < samples.len() {
-                    let val = samples[sample_idx];
-                    if val < min_val { min_val = val; }
-                    if val > max_val { max_val = val; }
-                }
-            }
-            let y_min = (mid_y - max_val * (row_height as f32 / 2.0)).clamp(row_offset as f32, (row_offset + row_height as usize - 1) as f32) as u32;
-            let y_max = (mid_y - min_val * (row_height as f32 / 2.0)).clamp(row_offset as f32, (row_offset + row_height as usize - 1) as f32) as u32;
-            for y in y_min..=y_max { if y < height { img.put_pixel(x, y, wave_color); } }
-        }
-        let center = mid_y as u32;
-        if center < height { for x in 0..width { img.put_pixel(x, center, Rgba([60, 60, 65, 255])); } }
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_render_empty() {
+        let img = render_waveform(&[], 1, 340, 20, Style::Dark, Mode::Peak);
+        assert_eq!(img.width(), 340);
+        assert_eq!(img.height(), 20);
     }
-    img
+
+    #[test]
+    fn test_render_sine_mono() {
+        let samples: Vec<f32> = (0..44100)
+            .map(|i| (i as f32 * 440.0 * 2.0 * std::f32::consts::PI / 44100.0).sin() * 0.5)
+            .collect();
+        let img = render_waveform(&samples, 1, 340, 20, Style::Dark, Mode::Peak);
+        assert_eq!(img.dimensions(), (340, 20));
+        // Some pixels must be painted with the foreground color
+        assert!(img.pixels().any(|p| p == &Rgba([16, 185, 129, 255])));
+    }
+
+    #[test]
+    fn test_render_stereo_two_tracks() {
+        // Interleaved stereo: L = +0.5, R = -0.5
+        let samples: Vec<f32> = (0..44100)
+            .flat_map(|_| [0.5f32, -0.5])
+            .collect();
+        let img = render_waveform(&samples, 2, 340, 40, Style::Dark, Mode::Peak);
+        assert_eq!(img.dimensions(), (340, 40));
+        // Separator row between the two tracks at y = 20
+        assert_eq!(img.get_pixel(10, 20), &Rgba([55, 65, 81, 255]));
+    }
+
+    #[test]
+    fn test_rms_mode() {
+        let samples: Vec<f32> = (0..44100)
+            .map(|i| (i as f32 * 440.0 * 2.0 * std::f32::consts::PI / 44100.0).sin() * 0.5)
+            .collect();
+        let img = render_waveform(&samples, 1, 340, 20, Style::Light, Mode::Rms);
+        assert_eq!(img.dimensions(), (340, 20));
+    }
+
+    #[test]
+    fn test_deinterleave() {
+        let interleaved = vec![0.1, 0.2, 0.3, 0.4];
+        let planar = deinterleave(&interleaved, 2);
+        assert_eq!(planar.len(), 2);
+        assert_eq!(planar[0], vec![0.1, 0.3]);
+        assert_eq!(planar[1], vec![0.2, 0.4]);
+    }
+
+    #[test]
+    fn test_select_channels() {
+        assert_eq!(select_channels(1), vec![0]);
+        assert_eq!(select_channels(2), vec![0, 1]);
+        assert_eq!(select_channels(6), vec![0, 1]);
+        assert!(select_channels(0).is_empty());
+    }
 }

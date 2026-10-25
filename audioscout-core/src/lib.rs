@@ -25,7 +25,6 @@ pub enum UiEvent {
     PreviewReady {
         path: PathBuf,
         uuid: String,
-        mode: config::PreviewMode,
         generation: u64,
     },
     PlayheadUpdate {

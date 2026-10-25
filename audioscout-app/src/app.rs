@@ -1,4 +1,4 @@
-use audioscout_core::config::{ConfigStore, PreviewMode};
+use audioscout_core::config::ConfigStore;
 use audioscout_core::player::controller::Controller;
 use audioscout_core::player::{PlayheadState, TransportState};
 use audioscout_core::scanner::Scanner;
@@ -35,7 +35,6 @@ pub struct AudioScoutApp {
     player: Controller,
     audio_view: AudioView,
     undo_stack: UndoStack,
-    table_preview_mode: PreviewMode,
     show_settings: bool,
     show_columns_dialog: bool,
     status_message: String,
@@ -111,7 +110,6 @@ impl AudioScoutApp {
             column_layout: ColumnLayout::new(), selected_row: None, filter_text: String::new(),
             document: Document::new(), active_file: None, player,
             audio_view: AudioView::new(0), undo_stack, preview_cache: HashMap::new(),
-            table_preview_mode: PreviewMode::Wave,
             show_settings: false, show_columns_dialog: false, status_message: String::new(),
             normalize_dbfs: -1.0, expanded_dirs: HashMap::new(),
             disks: Vec::new(),
@@ -163,7 +161,6 @@ impl AudioScoutApp {
     }
 
     fn request_previews(&mut self) {
-        let mode = self.table_preview_mode;
         let generation = self.scan_generation;
 
         // Clear queue to cancel any pending previews from previous directory
@@ -178,7 +175,6 @@ impl AudioScoutApp {
             // Submit preview job
             self.preview_worker.submit(PreviewJob {
                 path: row.path.clone(),
-                mode,
                 generation,
             });
         }
@@ -203,9 +199,9 @@ impl AudioScoutApp {
                         self.request_previews();
                     }
                 }
-                UiEvent::PreviewReady { path, uuid, mode, generation } => {
-                    // Only update if this is the current generation and mode
-                    if generation == self.scan_generation && mode == self.table_preview_mode {
+                UiEvent::PreviewReady { path, uuid, generation } => {
+                    // Only update if this is the current generation
+                    if generation == self.scan_generation {
                         if let Some(row) = self.file_rows.iter_mut().find(|r| r.path == path) {
                             row.preview_uuid = Some(uuid);
                         }
@@ -569,15 +565,6 @@ impl eframe::App for AudioScoutApp {
                 if ui.button("✕").clicked() { self.filter_text.clear(); }
                 ui.separator();
                 if ui.button("Columns").clicked() { self.show_columns_dialog = true; }
-                let mode_text = match self.table_preview_mode { PreviewMode::Wave => "Waveform", PreviewMode::Spectrogram => "Spectrogram" };
-                if ui.button(mode_text).clicked() {
-                    self.table_preview_mode = match self.table_preview_mode {
-                        PreviewMode::Wave => PreviewMode::Spectrogram,
-                        PreviewMode::Spectrogram => PreviewMode::Wave
-                    };
-                    // Clear preview cache when switching modes
-                    self.preview_cache.clear();
-                }
                 ui.separator();
                 if ui.button("Settings").clicked() { self.show_settings = true; }
             });
