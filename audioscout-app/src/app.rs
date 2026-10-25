@@ -14,6 +14,7 @@ use crossbeam_channel::Receiver;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use image::GenericImageView;
 
 /// Main application state
 pub struct AudioScoutApp {
@@ -42,6 +43,9 @@ pub struct AudioScoutApp {
     expanded_dirs: HashMap<PathBuf, Vec<PathBuf>>,
     disks: Vec<audioscout_core::disk::DiskInfo>,
     preview_cache: HashMap<String, egui::TextureHandle>,
+    // Cached peaks tree for fast waveform rendering
+    // cached_channels: Vec of (channel_data, peaks_tree) for each visible channel (1 for mono, 2 for stereo/multichannel)
+    cached_channels: Vec<(Vec<f32>, audioscout_core::peaks_tree::Peaks)>,
 }
 
 impl AudioScoutApp {
@@ -111,6 +115,7 @@ impl AudioScoutApp {
             show_settings: false, show_columns_dialog: false, status_message: String::new(),
             normalize_dbfs: -1.0, expanded_dirs: HashMap::new(),
             disks: Vec::new(),
+            cached_channels: Vec::new(),
         };
 
         if let Some(dir_str) = app.db.load_session("lastDir") {
@@ -240,8 +245,40 @@ impl AudioScoutApp {
                 self.undo_stack.clear();
                 let _ = self.db.save_session("lastFile", &path.to_string_lossy());
                 let _ = self.db.save_session("lastPos", "0");
+
+                // Build peaks tree cache for fast waveform rendering
+                self.rebuild_peaks_cache();
             }
             Err(e) => { self.status_message = format!("Load failed: {}", e); }
+        }
+    }
+
+    /// Rebuild peaks tree cache after loading a new file or after edits
+    fn rebuild_peaks_cache(&mut self) {
+        let ch = self.document.channels as usize;
+        let total_frames = self.document.total_frames() as usize;
+
+        // Determine number of visible channels: 1 for mono, 2 for stereo/multichannel
+        let visible_channels = if ch == 1 { 1 } else { 2 };
+
+        self.cached_channels.clear();
+
+        for channel_idx in 0..visible_channels {
+            // Extract channel data from interleaved samples
+            let channel_data: Vec<f32> = (0..total_frames)
+                .map(|frame| {
+                    let sample_idx = frame * ch + channel_idx;
+                    if sample_idx < self.document.samples.len() {
+                        self.document.samples[sample_idx]
+                    } else {
+                        0.0
+                    }
+                })
+                .collect();
+
+            // Build peaks tree for this channel
+            let peaks = audioscout_core::peaks_tree::Peaks::build(&channel_data);
+            self.cached_channels.push((channel_data, peaks));
         }
     }
 
@@ -280,6 +317,9 @@ impl AudioScoutApp {
         });
         self.document.dirty = true;
         self.status_message = format!("Muted frames {}..{}", start, end);
+
+        // Rebuild peaks cache after edit
+        self.rebuild_peaks_cache();
     }
 
     fn normalize_selection(&mut self) {
@@ -302,6 +342,9 @@ impl AudioScoutApp {
         });
         self.document.dirty = true;
         self.status_message = format!("Normalized to {} dBFS", self.normalize_dbfs);
+
+        // Rebuild peaks cache after edit
+        self.rebuild_peaks_cache();
     }
 
     fn undo(&mut self) {
@@ -321,6 +364,9 @@ impl AudioScoutApp {
             }
             self.document.dirty = true;
             self.status_message = "Undo".to_string();
+
+            // Rebuild peaks cache after undo
+            self.rebuild_peaks_cache();
         }
     }
 
@@ -348,6 +394,9 @@ impl AudioScoutApp {
             }
             self.document.dirty = true;
             self.status_message = "Redo".to_string();
+
+            // Rebuild peaks cache after redo
+            self.rebuild_peaks_cache();
         }
     }
 
@@ -639,7 +688,10 @@ impl eframe::App for AudioScoutApp {
             ui.separator();
 
             let visible_cols = self.column_layout.visible.clone();
-            egui::ScrollArea::vertical().show(ui, |ui| {
+            egui::ScrollArea::vertical()
+                .auto_shrink([false; 2])
+                .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
+                .show(ui, |ui| {
                 egui::Grid::new("file_table")
                     .num_columns(visible_cols.len())
                     .spacing([10.0, 4.0])
@@ -692,8 +744,8 @@ impl eframe::App for AudioScoutApp {
                             let mut row_double_clicked = false;
 
                             for col in &visible_cols {
-                                // Preview column needs more height
-                                let cell_height = if *col == Column::Preview { 24.0 } else { 20.0 };
+                                // Preview column needs more height for stereo (40px) + margins
+                                let cell_height = if *col == Column::Preview { 44.0 } else { 20.0 };
 
                                 let cell_response = ui.allocate_ui(
                                     egui::vec2(self.column_layout.width(col), cell_height),
@@ -703,8 +755,9 @@ impl eframe::App for AudioScoutApp {
                                             if let Some(uuid) = &row.preview_uuid {
                                                 // Check cache first
                                                 if let Some(texture) = self.preview_cache.get(uuid) {
-                                                    let size = [340.0, 20.0];
-                                                    ui.add(egui::Image::new(texture).fit_to_exact_size(egui::vec2(size[0], size[1])))
+                                                    // Use actual texture size
+                                                    let size = texture.size();
+                                                    ui.add(egui::Image::new(texture).fit_to_exact_size(egui::vec2(size[0] as f32, size[1] as f32)))
                                                 } else {
                                                     // Load from disk and cache
                                                     let config_dir = audioscout_core::config::config_dir();
@@ -714,11 +767,12 @@ impl eframe::App for AudioScoutApp {
                                                     if png_path.exists() {
                                                         if let Ok(image_data) = std::fs::read(&png_path) {
                                                             if let Ok(image) = image::load_from_memory(&image_data) {
-                                                                let size = [340.0, 20.0];
+                                                                // Get actual image dimensions
+                                                                let (img_width, img_height) = image.dimensions();
                                                                 let rgba = image.to_rgba8();
                                                                 let pixels = rgba.as_flat_samples();
                                                                 let color_image = egui::ColorImage::from_rgba_unmultiplied(
-                                                                    [size[0] as usize, size[1] as usize],
+                                                                    [img_width as usize, img_height as usize],
                                                                     pixels.as_slice(),
                                                                 );
                                                                 let texture = ui.ctx().load_texture(
@@ -728,7 +782,7 @@ impl eframe::App for AudioScoutApp {
                                                                 );
                                                                 // Cache the texture
                                                                 self.preview_cache.insert(uuid.clone(), texture.clone());
-                                                                ui.add(egui::Image::new(&texture).fit_to_exact_size(egui::vec2(size[0], size[1])))
+                                                                ui.add(egui::Image::new(&texture).fit_to_exact_size(egui::vec2(img_width as f32, img_height as f32)))
                                                             } else {
                                                                 ui.label("⚠️")
                                                             }
@@ -844,8 +898,13 @@ impl eframe::App for AudioScoutApp {
             ui.painter().rect_filled(rect, 0.0, egui::Color32::from_rgb(25, 25, 30));
 
             if !self.document.samples.is_empty() {
-                let mid_y = rect.center().y;
-                ui.painter().line_segment([egui::pos2(rect.left(), mid_y), egui::pos2(rect.right(), mid_y)], egui::Stroke::new(1.0, egui::Color32::from_rgb(60, 60, 65)));
+                let num_tracks = self.cached_channels.len();
+                // Draw center line only for mono (1 track)
+                // For stereo/multichannel, separator lines are drawn in the waveform rendering loop
+                if num_tracks == 1 {
+                    let mid_y = rect.center().y;
+                    ui.painter().line_segment([egui::pos2(rect.left(), mid_y), egui::pos2(rect.right(), mid_y)], egui::Stroke::new(1.0, egui::Color32::from_rgb(60, 60, 65)));
+                }
 
                 // Cursor
                 let cursor_x = self.audio_view.frame_to_x(self.audio_view.cursor_frame, rect.width() as u32);
@@ -878,32 +937,44 @@ impl eframe::App for AudioScoutApp {
                     ui.painter().rect_filled(sel_rect, 0.0, egui::Color32::from_rgba_premultiplied(80, 120, 255, 60));
                 }
 
-                // Waveform
-                let ch = self.document.channels as usize;
+                // Waveform - using cached Peaks tree for fast rendering
+                // Render 1 track for mono, 2 tracks for stereo/multichannel
                 let start_frame = self.audio_view.view_range.start_frame;
                 let end_frame = self.audio_view.view_range.end_frame;
                 let view_frames = end_frame.saturating_sub(start_frame);
-                if view_frames > 0 {
+                let num_tracks = self.cached_channels.len();
+
+                if view_frames > 0 && num_tracks > 0 {
+                    let track_height = rect.height() / num_tracks as f32;
                     let pixels = rect.width() as u32;
-                    let frames_per_pixel = (view_frames as f64 / pixels as f64).max(1.0);
-                    for px in 0..pixels {
-                        let frame = start_frame + (px as f64 * frames_per_pixel) as u64;
-                        let frame_end = (start_frame as f64 + (px as f64 + 1.0) * frames_per_pixel).min(end_frame as f64) as u64;
-                        let mut min_val: f32 = 0.0;
-                        let mut max_val: f32 = 0.0;
-                        for f in frame..frame_end {
-                            let idx = f as usize * ch;
-                            if idx < self.document.samples.len() {
-                                let v = self.document.samples[idx];
-                                min_val = min_val.min(v);
-                                max_val = max_val.max(v);
-                            }
+                    let step = view_frames as f64 / pixels as f64;
+                    let start = start_frame as f64;
+
+                    for (track_idx, (channel_data, peaks)) in self.cached_channels.iter().enumerate() {
+                        let track_top = rect.top() + track_idx as f32 * track_height;
+                        let track_mid_y = track_top + track_height / 2.0;
+
+                        // Draw separator line between tracks (except before first)
+                        if track_idx > 0 {
+                            ui.painter().line_segment(
+                                [egui::pos2(rect.left(), track_top), egui::pos2(rect.right(), track_top)],
+                                egui::Stroke::new(1.0, egui::Color32::from_rgb(60, 60, 65))
+                            );
                         }
-                        let x = rect.left() + px as f32;
-                        let half_h = rect.height() / 2.0;
-                        let y_top = mid_y - max_val * half_h;
-                        let y_bot = mid_y - min_val * half_h;
-                        ui.painter().line_segment([egui::pos2(x, y_top), egui::pos2(x, y_bot)], egui::Stroke::new(1.0, egui::Color32::from_rgb(50, 200, 80)));
+
+                        // Get min/max for each pixel column using cached peaks tree
+                        let columns = peaks.spans(channel_data, start, step, pixels as usize);
+
+                        let half_h = track_height / 2.0;
+                        for (px, &(min_val, max_val)) in columns.iter().enumerate() {
+                            let x = rect.left() + px as f32;
+                            let y_top = track_mid_y - max_val * half_h;
+                            let y_bot = track_mid_y - min_val * half_h;
+                            ui.painter().line_segment(
+                                [egui::pos2(x, y_top), egui::pos2(x, y_bot)],
+                                egui::Stroke::new(1.0, egui::Color32::from_rgb(50, 200, 80))
+                            );
+                        }
                     }
                 }
             }

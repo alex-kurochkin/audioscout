@@ -129,9 +129,9 @@ impl Peaks {
     }
 }
 
-// ─── Audio decode ──────────────────────────────────────────────────────────
+// ─── Audio decode (planar) ─────────────────────────────────────────────────
 
-fn decode_audio(path: &PathBuf) -> Result<(u32, Vec<f32>, usize), String> {
+fn decode_audio(path: &PathBuf) -> Result<(u32, Vec<Vec<f32>>), String> {
     let file = fs::File::open(path)
         .map_err(|e| format!("не удалось открыть файл: {e}"))?;
     let mss = MediaSourceStream::new(Box::new(file), Default::default());
@@ -153,16 +153,14 @@ fn decode_audio(path: &PathBuf) -> Result<(u32, Vec<f32>, usize), String> {
     let track_id = track.id;
     let sample_rate = track.codec_params.sample_rate
         .ok_or_else(|| "sample rate неизвестен".to_string())?;
-    let channels = track.codec_params.channels
-        .map(|c| c.count()).unwrap_or(1);
 
     let mut decoder = symphonia::default::get_codecs()
         .make(&track.codec_params, &DecoderOptions::default())
         .map_err(|e| format!("кодек не поддерживается: {e}"))?;
 
-    // SampleBuffer создаётся ОДИН раз при первом декодированном пакете
+    // Planar: один Vec на канал
+    let mut planar: Vec<Vec<f32>> = Vec::new();
     let mut sample_buf: Option<SampleBuffer<f32>> = None;
-    let mut all_samples: Vec<f32> = Vec::new();
 
     loop {
         let packet = match reader.next_packet() {
@@ -174,17 +172,31 @@ fn decode_audio(path: &PathBuf) -> Result<(u32, Vec<f32>, usize), String> {
 
         match decoder.decode(&packet) {
             Ok(audio_buf) => {
+                let spec = *audio_buf.spec();
+                let ch = spec.channels.count();
+                let frames = audio_buf.frames() as usize;
+
+                if planar.is_empty() {
+                    planar = (0..ch).map(|_| Vec::new()).collect();
+                }
+
                 // Создаём sample buffer при первом пакете
                 if sample_buf.is_none() {
-                    let spec = *audio_buf.spec();
                     let duration = audio_buf.capacity() as u64;
                     sample_buf = Some(SampleBuffer::<f32>::new(duration, spec));
                 }
 
-                // Копируем в interleaved f32
+                // Копируем interleaved
                 if let Some(buf) = &mut sample_buf {
                     buf.copy_interleaved_ref(audio_buf);
-                    all_samples.extend_from_slice(buf.samples());
+                    let samples = buf.samples();
+                    // Разделяем interleaved → planar
+                    for frame_idx in 0..frames {
+                        for ch_idx in 0..ch {
+                            let s = samples[frame_idx * ch + ch_idx];
+                            planar[ch_idx].push(if s.is_finite() { s } else { 0.0 });
+                        }
+                    }
                 }
             }
             Err(Error::DecodeError(m)) => {
@@ -194,25 +206,23 @@ fn decode_audio(path: &PathBuf) -> Result<(u32, Vec<f32>, usize), String> {
         }
     }
 
-    if all_samples.is_empty() {
+    if planar.is_empty() || planar[0].is_empty() {
         return Err("файл не содержит аудио-данных".to_string());
     }
 
-    Ok((sample_rate, all_samples, channels))
+    Ok((sample_rate, planar))
 }
 
-/// Mixdown interleaved → mono f32
-fn mixdown_to_mono(interleaved: &[f32], channels: usize) -> Vec<f32> {
-    if channels <= 1 { return interleaved.to_vec(); }
-    let frames = interleaved.len() / channels;
-    let inv = 1.0 / channels as f32;
-    (0..frames).map(|f| {
-        let mut sum = 0.0f32;
-        for ch in 0..channels {
-            sum += interleaved[f * channels + ch];
-        }
-        sum * inv
-    }).collect()
+/// Выбирает каналы для рендера:
+/// - 1 канал (моно) → [0]
+/// - 2 канала (стерео) → [0, 1]
+/// - >2 каналов (мультиканальные) → [0, 1] (первые два)
+fn select_channels(planar: &[Vec<f32>]) -> Vec<usize> {
+    match planar.len() {
+        0 => vec![],
+        1 => vec![0],
+        _ => vec![0, 1], // стерео или мультиканальные → первые 2
+    }
 }
 
 // ─── Render ────────────────────────────────────────────────────────────────
@@ -227,51 +237,73 @@ struct RenderOptions {
     mode: Mode,
 }
 
-fn render_waveform(samples: &[f32], peaks: &Peaks, opts: &RenderOptions) -> RgbaImage {
+fn render_waveform(channels: &[&[f32]], peaks_list: &[Peaks], opts: &RenderOptions) -> RgbaImage {
     let w = opts.width;
     let h = opts.height;
     let mut img = RgbaImage::new(w, h);
 
-    let (bg, fg, grid) = match opts.style {
+    let (bg, fg, grid, separator) = match opts.style {
         Style::Dark => (
             Rgba([13, 18, 32, 255]),
             Rgba([16, 185, 129, 255]),
             Rgba([31, 41, 55, 255]),
+            Rgba([55, 65, 81, 255]),
         ),
         Style::Light => (
             Rgba([255, 255, 255, 255]),
             Rgba([5, 150, 105, 255]),
             Rgba([229, 231, 235, 255]),
+            Rgba([209, 213, 219, 255]),
         ),
     };
 
+    // Фон
     for pixel in img.pixels_mut() { *pixel = bg; }
 
-    let cy = h / 2;
-    for x in 0..w {
-        *img.get_pixel_mut(x, cy) = grid;
-    }
+    let num_tracks = channels.len();
+    let track_height = h / num_tracks as u32;
 
-    let step = samples.len() as f64 / w as f64;
+    // Рисуем каждую дорожку
+    for (track_idx, (samples, peaks)) in channels.iter().zip(peaks_list.iter()).enumerate() {
+        let y_start = track_idx as u32 * track_height;
+        let y_end = if track_idx == num_tracks - 1 { h } else { (track_idx as u32 + 1) * track_height };
+        let track_h = y_end - y_start;
 
-    let columns: Vec<(f32, f32)> = match opts.mode {
-        Mode::Peak => peaks.spans(samples, 0.0, step, w as usize),
-        Mode::Rms => peaks.rms_spans(samples, 0.0, step, w as usize)
-            .into_iter().map(|r| (-r, r)).collect(),
-    };
+        // Разделитель между дорожками (кроме последней)
+        if track_idx > 0 {
+            for x in 0..w {
+                *img.get_pixel_mut(x, y_start) = separator;
+            }
+        }
 
-    let margin = 4u32;
-    let draw_h = h.saturating_sub(margin * 2) as f32;
-    for (x, &(lo, hi)) in columns.iter().enumerate() {
-        let x = x as u32;
-        let y_top = cy as f32 - hi.clamp(-1.0, 1.0) * (draw_h / 2.0);
-        let y_bot = cy as f32 - lo.clamp(-1.0, 1.0) * (draw_h / 2.0);
-        let y_top = y_top.max(margin as f32) as u32;
-        let y_bot = (y_bot as u32).min(h.saturating_sub(1));
-        for y in y_top..=y_bot {
-            *img.get_pixel_mut(x, y) = fg;
+        // Центральная линия дорожки
+        let cy = y_start + track_h / 2;
+        for x in 0..w {
+            *img.get_pixel_mut(x, cy) = grid;
+        }
+
+        // Waveform
+        let step = samples.len() as f64 / w as f64;
+        let columns: Vec<(f32, f32)> = match opts.mode {
+            Mode::Peak => peaks.spans(samples, 0.0, step, w as usize),
+            Mode::Rms => peaks.rms_spans(samples, 0.0, step, w as usize)
+                .into_iter().map(|r| (-r, r)).collect(),
+        };
+
+        let margin = 4u32;
+        let draw_h = track_h.saturating_sub(margin * 2) as f32;
+        for (x, &(lo, hi)) in columns.iter().enumerate() {
+            let x = x as u32;
+            let y_top = cy as f32 - hi.clamp(-1.0, 1.0) * (draw_h / 2.0);
+            let y_bot = cy as f32 - lo.clamp(-1.0, 1.0) * (draw_h / 2.0);
+            let y_top = y_top.max((y_start + margin) as f32) as u32;
+            let y_bot = (y_bot as u32).min(y_end.saturating_sub(1));
+            for y in y_top..=y_bot {
+                *img.get_pixel_mut(x, y) = fg;
+            }
         }
     }
+
     img
 }
 
@@ -302,28 +334,38 @@ fn main() {
 
     println!("⏳ Декодирование аудио...");
     let t0 = std::time::Instant::now();
-    let (sample_rate, interleaved, channels) = match decode_audio(&cli.input) {
+    let (sample_rate, planar) = match decode_audio(&cli.input) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("❌ Ошибка: {e}");
             std::process::exit(1);
         }
     };
-    let mixdown = mixdown_to_mono(&interleaved, channels);
+
+    let total_channels = planar.len();
+    let selected = select_channels(&planar);
+    let num_tracks = selected.len();
+
     println!("   ✓ {} семплов, {} Hz, {} канал(ов), {:.2}s ({}ms)",
-        mixdown.len(), sample_rate, channels,
-        mixdown.len() as f64 / sample_rate as f64,
+        planar[0].len(), sample_rate, total_channels,
+        planar[0].len() as f64 / sample_rate as f64,
         t0.elapsed().as_millis());
 
-    println!("⏳ Построение дерева Peaks...");
+    if total_channels > 2 {
+        println!("   ℹ️  Мультиканальный файл: рендерим первые 2 канала из {}", total_channels);
+    }
+
+    println!("⏳ Построение дерева Peaks для {} дорожек...", num_tracks);
     let t1 = std::time::Instant::now();
-    let peaks = Peaks::build(&mixdown);
-    println!("   ✓ {} уровней, {} блоков Level 0 ({}ms)",
-        peaks.levels.len(),
-        peaks.levels.first().map(|l| l.len()).unwrap_or(0),
+    let peaks_list: Vec<Peaks> = selected.iter()
+        .map(|&ch_idx| Peaks::build(&planar[ch_idx]))
+        .collect();
+    println!("   ✓ {} уровней, {} блоков Level 0 на дорожку ({}ms)",
+        peaks_list[0].levels.len(),
+        peaks_list[0].levels.first().map(|l| l.len()).unwrap_or(0),
         t1.elapsed().as_millis());
 
-    println!("⏳ Рендеринг waveform ({}x{})...", cli.width, cli.height);
+    println!("⏳ Рендеринг waveform ({}x{}, {} дорожек)...", cli.width, cli.height, num_tracks);
     let t2 = std::time::Instant::now();
     let style = match cli.style.as_str() {
         "light" => Style::Light,
@@ -334,7 +376,12 @@ fn main() {
         _ => Mode::Peak,
     };
     let opts = RenderOptions { width: cli.width, height: cli.height, style, mode };
-    let img = render_waveform(&mixdown, &peaks, &opts);
+
+    let channel_slices: Vec<&[f32]> = selected.iter()
+        .map(|&ch_idx| planar[ch_idx].as_slice())
+        .collect();
+
+    let img = render_waveform(&channel_slices, &peaks_list, &opts);
     println!("   ✓ Рендеринг ({}ms)", t2.elapsed().as_millis());
 
     match img.save(&cli.output) {

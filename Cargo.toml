@@ -1,7 +1,8 @@
 [workspace]
 members = [
     "audioscout-core",
-    "audioscout-app", "create-audio-preview-demo/waveform-preview",
+    "audioscout-app",
+    # "waveform-preview",
 ]
 resolver = "2"
 

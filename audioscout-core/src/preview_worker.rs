@@ -46,6 +46,7 @@ impl PreviewWorker {
                     let (lock, cvar) = &*queue_clone;
                     let mut inner = lock.lock().unwrap();
 
+                    // Wait for job or quit signal
                     while inner.jobs.is_empty() {
                         if *quit_clone.lock().unwrap() {
                             return;
@@ -159,10 +160,12 @@ impl PreviewWorker {
         }
     }
 
+    /// Submit a preview job
     pub fn submit(&self, job: PreviewJob) {
         let (lock, cvar) = &*self.queue;
         let mut inner = lock.lock().unwrap();
 
+        // Dedup: skip if already pending for this path
         if inner.pending_paths.contains(&job.path) {
             return;
         }
@@ -172,6 +175,7 @@ impl PreviewWorker {
         cvar.notify_one();
     }
 
+    /// Clear all pending jobs
     pub fn clear_queue(&self) {
         let (lock, _) = &*self.queue;
         let mut inner = lock.lock().unwrap();
@@ -179,6 +183,7 @@ impl PreviewWorker {
         inner.pending_paths.clear();
     }
 
+    /// Shutdown the worker
     pub fn shutdown(&mut self) {
         *self.quit.lock().unwrap() = true;
         let (_, cvar) = &*self.queue;
@@ -196,13 +201,13 @@ impl Drop for PreviewWorker {
     }
 }
 
-/// Generate deterministic UUID based on file path, mtime, size, and mode
-fn generate_preview_uuid(path: &PathBuf, mode: PreviewMode) -> Result<String, String> {
+/// Generate deterministic UUID based on file path, mtime, size, mode, and channels
+fn generate_preview_uuid(path: &PathBuf, mode: PreviewMode, channels: u16) -> Result<String, String> {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
 
     let metadata = std::fs::metadata(path)
-        .map_err(|e| format!("Failed to get metadata: {}", e))?;
+        .map_err(|e| format!("Failed to get meta {}", e))?;
 
     let mtime = metadata.modified()
         .map_err(|e| format!("Failed to get mtime: {}", e))?
@@ -221,6 +226,7 @@ fn generate_preview_uuid(path: &PathBuf, mode: PreviewMode) -> Result<String, St
     mtime.hash(&mut hasher);
     size.hash(&mut hasher);
     mode_str.hash(&mut hasher);
+    channels.hash(&mut hasher); // Include channels in hash
     let hash = hasher.finish();
 
     // Use first 16 bytes of hash as UUID
@@ -236,11 +242,15 @@ fn generate_preview_uuid(path: &PathBuf, mode: PreviewMode) -> Result<String, St
 }
 
 /// Render a preview image (waveform or spectrogram)
-/// Uses downsampling to show the entire file content
+/// Uses Peaks tree for fast rendering of entire file
 /// Returns existing UUID if preview already exists
 fn render_preview(path: &PathBuf, mode: PreviewMode) -> Result<String, String> {
-    // Generate deterministic UUID
-    let uuid = generate_preview_uuid(path, mode)?;
+    // Load audio data FIRST to get channel count
+    let (samples, sample_rate, channels, _) = crate::audio_io::load_audio(path)
+        .map_err(|e| format!("Load failed: {}", e))?;
+
+    // Generate deterministic UUID including channels
+    let uuid = generate_preview_uuid(path, mode, channels)?;
 
     // Check if preview already exists
     let config_dir = crate::config::config_dir();
@@ -253,18 +263,17 @@ fn render_preview(path: &PathBuf, mode: PreviewMode) -> Result<String, String> {
         return Ok(uuid);
     }
 
-    // Load audio data
-    let (samples, sample_rate, channels, _) = crate::audio_io::load_audio(path)
-        .map_err(|e| format!("Load failed: {}", e))?;
-
     let width = 340u32;
-    let height = 20u32;
+    // Use taller preview for stereo/multichannel (2 tracks need more space)
+    let height = if channels == 1 { 20u32 } else { 40u32 };
 
     let img = match mode {
         PreviewMode::Wave => {
+            // Render using Peaks tree for fast min/max queries
             crate::render::waveform::render_waveform(&samples, sample_rate, channels, width, height)
         }
         PreviewMode::Spectrogram => {
+            // Render spectrogram
             crate::render::spectrogram::render_spectrogram(&samples, sample_rate, channels, width, height)
         }
     };

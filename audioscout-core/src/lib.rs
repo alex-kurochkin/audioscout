@@ -3,6 +3,7 @@ pub mod audio_view;
 pub mod config;
 pub mod db;
 pub mod disk;
+pub mod peaks_tree;
 pub mod player;
 pub mod preview_worker;
 pub mod render;

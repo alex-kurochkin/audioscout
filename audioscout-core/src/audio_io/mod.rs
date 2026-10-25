@@ -44,6 +44,7 @@ pub fn load_audio(path: &Path) -> Result<(Vec<f32>, u32, u16, SampleType)> {
 fn load_with_symphonia(path: &Path) -> Result<(Vec<f32>, u32, u16, SampleType)> {
     use symphonia::core::audio::SampleBuffer;
     use symphonia::core::codecs::DecoderOptions;
+    use symphonia::core::errors::Error;
     use symphonia::core::formats::FormatOptions;
     use symphonia::core::io::MediaSourceStream;
     use symphonia::core::meta::MetadataOptions;
@@ -59,32 +60,58 @@ fn load_with_symphonia(path: &Path) -> Result<(Vec<f32>, u32, u16, SampleType)> 
         .map_err(|e| AudioIoError::DecodeError(format!("Probe failed: {}", e)))?;
 
     let mut format = probed.format;
-    let track = format.tracks().iter()
-        .find(|t| t.codec_params.codec != symphonia::core::codecs::CODEC_TYPE_NULL)
+    let track = format.default_track()
         .ok_or_else(|| AudioIoError::DecodeError("No audio track found".to_string()))?;
+
+    let track_id = track.id;
+    let sample_rate = track.codec_params.sample_rate.unwrap_or(44100);
+    let channels = track.codec_params.channels.map(|c| c.count()).unwrap_or(1);
 
     let mut decoder = symphonia::default::get_codecs()
         .make(&track.codec_params, &DecoderOptions::default())
         .map_err(|e| AudioIoError::DecodeError(format!("Codec init failed: {}", e)))?;
 
-    let sample_rate = track.codec_params.sample_rate.unwrap_or(44100);
-    let channels = track.codec_params.channels.map(|c| c.count() as u16).unwrap_or(1);
+    // SampleBuffer создаётся ОДИН раз при первом декодированном пакете
+    let mut sample_buf: Option<SampleBuffer<f32>> = None;
     let mut all_samples: Vec<f32> = Vec::new();
 
     loop {
         let packet = match format.next_packet() {
             Ok(p) => p,
+            Err(Error::IoError(_)) => break,
             Err(_) => break,
         };
-        let decoded = match decoder.decode(&packet) { Ok(d) => d, Err(_) => continue };
-        let spec = *decoded.spec();
-        let duration = decoded.capacity();
-        let mut sample_buf = SampleBuffer::<f32>::new(duration as u64, spec);
-        sample_buf.copy_interleaved_ref(decoded);
-        all_samples.extend_from_slice(sample_buf.samples());
+
+        // Skip packets from other tracks
+        if packet.track_id() != track_id { continue; }
+
+        match decoder.decode(&packet) {
+            Ok(audio_buf) => {
+                // Создаём sample buffer при первом пакете
+                if sample_buf.is_none() {
+                    let spec = *audio_buf.spec();
+                    let duration = audio_buf.capacity() as u64;
+                    sample_buf = Some(SampleBuffer::<f32>::new(duration, spec));
+                }
+
+                // Копируем в interleaved f32
+                if let Some(buf) = &mut sample_buf {
+                    buf.copy_interleaved_ref(audio_buf);
+                    all_samples.extend_from_slice(buf.samples());
+                }
+            }
+            Err(Error::DecodeError(m)) => {
+                tracing::warn!("Skipping corrupted packet: {}", m);
+            }
+            Err(_) => continue,
+        }
     }
 
-    Ok((all_samples, sample_rate, channels, SampleType::Float32))
+    if all_samples.is_empty() {
+        return Err(AudioIoError::DecodeError("File contains no audio data".to_string()));
+    }
+
+    Ok((all_samples, sample_rate, channels as u16, SampleType::Float32))
 }
 
 pub fn probe_file(path: &Path) -> AudioMeta {
