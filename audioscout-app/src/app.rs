@@ -1073,17 +1073,55 @@ impl eframe::App for AudioScoutApp {
 
         // Settings dialog
         if self.show_settings {
+            // Collect button actions locally first: `Window::open(&mut
+            // self.show_settings)` borrows `*self` for the whole call, so the
+            // closure cannot also hold `&mut self` (E0500). Copying the plain
+            // fields out beforehand keeps the closure on disjoint fields only.
+            #[derive(PartialEq)]
+            enum SettingsAction {
+                None,
+                DeleteMarkers,
+                DeletePreviews,
+                CleanOrphans,
+            }
+
+            let mut skip_seconds_changed: Option<u32> = None;
+            let mut action = SettingsAction::None;
+
+            // Read-only copies of the settings values (plain `Copy` fields).
+            // Reading them through `&self.*` inside the closure would conflict
+            // with the `&mut self.show_settings` borrow passed to `open()`.
+            let current_skip_seconds = self.config_store.config().skip_seconds;
+
             egui::Window::new("Settings").open(&mut self.show_settings).show(ctx, |ui| {
                 ui.label("AudioScout Settings");
                 ui.separator();
                 ui.horizontal(|ui| {
                     ui.label("Skip seconds:");
-                    let mut skip = self.config_store.config().skip_seconds;
-                    if ui.add(egui::DragValue::new(&mut skip).range(1..=60)).changed() { self.config_store.config_mut().skip_seconds = skip; self.player.set_skip_seconds(skip); let _ = self.config_store.save(); }
+                    let mut skip = current_skip_seconds;
+                    if ui.add(egui::DragValue::new(&mut skip).range(1..=60)).changed() {
+                        skip_seconds_changed = Some(skip);
+                    }
                 });
                 ui.separator();
-                if ui.button("Delete all markers").clicked() { let _ = self.db.delete_all_markers(); self.status_message = "All markers deleted".to_string(); }
-                if ui.button("Delete all previews").clicked() {
+                if ui.button("Delete all markers").clicked() { action = SettingsAction::DeleteMarkers; }
+                if ui.button("Delete all previews").clicked() { action = SettingsAction::DeletePreviews; }
+                if ui.button("Clean orphaned previews").clicked() { action = SettingsAction::CleanOrphans; }
+            });
+
+            if let Some(skip) = skip_seconds_changed {
+                self.config_store.config_mut().skip_seconds = skip;
+                self.player.set_skip_seconds(skip);
+                let _ = self.config_store.save();
+            }
+
+            match action {
+                SettingsAction::None => {}
+                SettingsAction::DeleteMarkers => {
+                    let _ = self.db.delete_all_markers();
+                    self.status_message = "All markers deleted".to_string();
+                }
+                SettingsAction::DeletePreviews => {
                     let _ = self.db.delete_all_previews();
                     // Also delete preview files from disk
                     let config_dir = audioscout_core::config::config_dir();
@@ -1112,13 +1150,13 @@ impl eframe::App for AudioScoutApp {
                     ctx.request_repaint();
                     self.status_message = "All previews deleted, regenerating…".to_string();
                 }
-                if ui.button("Clean orphaned previews").clicked() {
+                SettingsAction::CleanOrphans => {
                     match audioscout_core::preview_worker::cleanup_previews() {
                         Ok(count) => self.status_message = format!("Cleaned {} orphaned previews", count),
                         Err(e) => self.status_message = format!("Cleanup failed: {}", e),
                     }
                 }
-            });
+            }
         }
 
         if self.show_columns_dialog {

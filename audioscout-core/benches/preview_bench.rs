@@ -4,7 +4,7 @@ fn main() {
     if !path.exists() { eprintln!("no test file"); return; }
     for _ in 0..3 {
         let t = Instant::now();
-        let (env, sr) = audioscout_core::audio_io::load_audio_envelope(path, 340*4).unwrap();
+        let (env, sr) = audioscout_core::audio_io::load_audio_envelope(path, 340*4, audioscout_core::preview_worker::PREVIEW_DECODE_BUDGET).unwrap();
         let e1 = t.elapsed();
         let t2 = Instant::now();
         let img = audioscout_core::render::waveform::render_envelope(&env, 340, 40, audioscout_core::render::waveform::Style::Dark);
