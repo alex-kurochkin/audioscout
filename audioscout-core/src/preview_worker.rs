@@ -30,12 +30,13 @@ const MAX_QUEUE_LEN: usize = 256;
 
 /// Byte budget for decoding a single preview thumbnail.
 ///
-/// A preview must cost roughly the same for every file regardless of size:
-/// we decode at most this many bytes of audio input and pad the rest of the
-/// envelope with silence. ~8 MB covers a full CD-length WAV and hours of
-/// MP3/AIFF; larger files render a truncated-but-instant waveform instead of
-/// freezing the pipeline.
-pub const PREVIEW_DECODE_BUDGET: u64 = 8 << 20;
+/// Previews must cover the **whole file**, so this is intentionally an
+/// effectively-unlimited budget: no truncation, no silent padding of the tail.
+/// The waveform path reaches full coverage cheaply anyway — compressed files
+/// are seek-sampled (O(target × window) bytes regardless of duration) and PCM
+/// files are streamed in a single pass — while the safety caps inside
+/// `audio_io::envelope` still stop endless/corrupt streams.
+pub const PREVIEW_DECODE_BUDGET: u64 = crate::audio_io::envelope::UNLIMITED_BUDGET;
 
 /// Background worker for rendering preview images.
 ///
@@ -350,12 +351,14 @@ pub fn cached_preview_png(path: &Path, channels: u16, mode: PreviewMode) -> Opti
 /// min/max peak envelope, one column per pixel, mono → 1 track,
 /// stereo/multichannel → first 2 tracks). Unlike the example — which loads the
 /// *entire* signal into memory before building its peaks tree — the envelope
-/// here is folded while streaming through the decoder and decoding stops at
-/// [`PREVIEW_DECODE_BUDGET`] bytes, so one thumbnail costs O(budget), not
-/// O(file size).
+/// here is folded while streaming through the decoder and covers the **whole
+/// file**: compressed formats are seek-sampled across the full timeline
+/// (O(target × window) work regardless of duration) and PCM is streamed in a
+/// single pass. [`PREVIEW_DECODE_BUDGET`] is unlimited by design so no tail is
+/// ever truncated to silence.
 ///
-/// Spectrogram mode decodes up to the same byte budget and runs a windowed
-/// FFT over the samples (`render::spectrogram`).
+/// Spectrogram mode decodes the full file and runs a windowed FFT over the
+/// samples, averaging them into one column per pixel (`render::spectrogram`).
 ///
 /// Returns the existing UUID when the preview PNG is already cached.
 pub fn render_preview(path: &Path, mode: PreviewMode) -> Result<String, String> {
@@ -400,10 +403,13 @@ pub fn render_preview(path: &Path, mode: PreviewMode) -> Result<String, String> 
         }
         PreviewMode::Spectrogram => {
             // The FFT analysis needs real samples, not a min/max envelope.
-            // Decode within the same byte budget used for waveforms; long
-            // files simply get a truncated-but-instant spectrogram.
+            // Decode the *whole* file so the picture spans the full track;
+            // `render_spectrogram_preview` then averages the signal into one
+            // column per pixel (a fixed hop would only ever show the first
+            // `width × hop` frames — i.e. just the beginning).
+            let max_frames = usize::MAX / 8;
             let (samples, _sr, ch) =
-                load_audio_bounded(path, PREVIEW_DECODE_BUDGET as usize * 8)
+                load_audio_bounded(path, max_frames)
                     .map_err(|e| format!("Load failed: {}", e))?;
             crate::render::spectrogram::render_spectrogram_preview(
                 &samples,

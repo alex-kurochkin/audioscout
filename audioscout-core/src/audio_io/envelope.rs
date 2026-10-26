@@ -10,9 +10,19 @@ use std::path::Path;
 
 /// Absolute ceiling on the number of decoded frames a single preview may
 /// consume. It exists purely as a safety net against endless/corrupt streams;
-/// normal files are bounded by the seek plan / byte budget long before this
-/// kicks in.
-const ENVELOPE_MAX_FRAMES: usize = 200_000_000;
+/// it must never clip a normal file, otherwise the thumbnail would show only
+/// the beginning of the audio instead of the whole track.
+const ENVELOPE_MAX_FRAMES: usize = 500_000_000;
+
+/// Byte budget that effectively disables the early-stop protection.
+///
+/// Previews must cover the *entire* file: the seek-sampled path touches only
+/// O(target × window) bytes regardless of duration and the streaming paths
+/// stop at end-of-stream, so no realistic file needs a truncation cap. Callers
+/// pass [`crate::preview_worker::PREVIEW_DECODE_BUDGET`] to opt into the
+/// "cheap first slice + silent padding" behaviour; passing `usize::MAX` here
+/// (via that constant) means "always render the full file".
+pub const UNLIMITED_BUDGET: u64 = u64::MAX;
 
 /// Decodes `path` and reduces it to a per-channel min/max envelope for a
 /// file-list preview thumbnail.
@@ -26,14 +36,19 @@ const ENVELOPE_MAX_FRAMES: usize = 200_000_000;
 ///   decoding every packet from start to finish (which makes MP3 previews
 ///   scale linearly with file size — a 5-minute 320 kbps MP3 means ~7 MB and
 ///   tens of thousands of decoded frames just to draw 1360 points), we jump to
-///   evenly spaced positions across the file and decode only short windows
-///   around each jump. Cost becomes O(target × window), independent of
-///   duration. Symphonia's MP3 demuxer seeks by bisection over the raw stream
-///   without decoding, so each jump is nearly free.
+///   evenly spaced positions across the *whole* file and decode only short
+///   windows around each jump. Every envelope slot receives real audio from
+///   its own slice of the timeline, so the thumbnail covers the full track.
+///   Cost is O(target × window), independent of duration. Symphonia's MP3
+///   demuxer seeks by bisection over the raw stream without decoding, so each
+///   jump is nearly free.
 ///
-/// Both paths are additionally bounded by `budget_bytes` of consumed input and
-/// by [`ENVELOPE_MAX_FRAMES`] decoded frames, so a pathological file can never
-/// spin the preview worker forever.
+/// `budget_bytes` bounds how much input a single call may consume; pass
+/// [`UNLIMITED_BUDGET`] to guarantee full-file coverage for every format
+/// (streaming passes simply run to end-of-stream). The
+/// [`ENVELOPE_MAX_FRAMES`] cap remains as a safety net against endless or
+/// corrupt streams only — it is set far above any realistic file length so it
+/// never truncates a healthy one.
 pub fn load_audio_envelope(
     path: &Path,
     target_frames: usize,
@@ -48,6 +63,10 @@ pub fn load_audio_envelope(
         .unwrap_or_default();
     let (mut env, sr) = match ext.as_str() {
         "wav" => envelope_from_hound(path, target, budget)?,
+        // MP4/M4A: symphonia's seek targets land outside the mdat payload,
+        // so the seek-sampled plan decodes nothing. A full sequential pass is
+        // the only way to cover the whole file here.
+        "mp4" | "m4a" | "m4b" | "aac" => envelope_sequential_full(path, target, 2)?,
         _ => envelope_seek_sampled(path, target, budget)?,
     };
     pad_envelope_to(&mut env, target);
@@ -56,10 +75,10 @@ pub fn load_audio_envelope(
 
 /// Pads the envelope with flat (silent) points up to exactly `target` frames.
 ///
-/// When decoding stopped early because of the byte budget, the waveform is
-/// drawn across the *full* file duration, so the truncated part reads as
-/// silence rather than compressing the visible audio into a fraction of the
-/// width. This also guarantees uniform per-channel lengths.
+/// With a full-file budget this only ever triggers for genuinely short or
+/// corrupt inputs (fewer real blocks than slots); it guarantees uniform
+/// per-channel lengths so the renderer always receives `target` points and
+/// the waveform spans the whole thumbnail width.
 fn pad_envelope_to(env: &mut super::Envelope, target: usize) {
     for c in 0..env.channels {
         let cur = env.lo[c].len();
@@ -84,16 +103,20 @@ impl Budget {
     fn new(limit: u64) -> Self {
         Self { limit, seen: 0, last_pos: 0 }
     }
+    #[inline]
     fn exhausted(&self) -> bool {
-        self.seen >= self.limit
+        // Saturating add so an "unlimited" budget (`u64::MAX`) can never be
+        // pushed over the edge by accumulated accounting — otherwise the very
+        // first chunk would trip the cap and truncate the preview.
+        self.seen.saturating_add(1) >= self.limit
     }
     fn add(&mut self, delta: u64) {
-        self.seen += delta;
+        self.seen = self.seen.saturating_add(delta);
     }
     /// Accounts for an absolute stream position (monotonic).
     fn add_until(&mut self, pos: u64) {
         if pos > self.last_pos {
-            self.seen += pos - self.last_pos;
+            self.seen = self.seen.saturating_add(pos - self.last_pos);
             self.last_pos = pos;
         }
     }
@@ -233,7 +256,9 @@ impl HoundToFloat for i32 {
 }
 
 /// Seekable media-source wrapper used to measure how many *input* bytes the
-/// demuxer actually consumed, so the preview can stop after a fixed budget.
+/// demuxer actually consumed, so a caller-supplied budget can stop the
+/// preview early. With [`UNLIMITED_BUDGET`] the metering is pure bookkeeping
+/// and never truncates anything.
 ///
 /// The position is updated by the `Read`/`Seek` implementations below and read
 /// back through the shared `Arc<AtomicU64>` because symphonia takes ownership
@@ -277,6 +302,143 @@ impl symphonia::core::io::MediaSource for MeteredFile {
     fn byte_len(&self) -> Option<u64> {
         Some(self.len)
     }
+}
+
+/// Plain (unmetered) seekable source for the full-file sequential loader.
+struct PlainFile {
+    file: std::fs::File,
+    len: u64,
+}
+
+impl std::io::Read for PlainFile {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.file.read(buf)
+    }
+}
+
+impl std::io::Seek for PlainFile {
+    fn seek(&mut self, from: std::io::SeekFrom) -> std::io::Result<u64> {
+        self.file.seek(from)
+    }
+}
+
+impl symphonia::core::io::MediaSource for PlainFile {
+    fn is_seekable(&self) -> bool {
+        true
+    }
+
+    fn byte_len(&self) -> Option<u64> {
+        Some(self.len)
+    }
+}
+
+/// Full-file envelope extraction via a single sequential decode pass.
+///
+/// Used for containers whose seek behaviour cannot be trusted to land inside
+/// the audio payload — most importantly MP4/M4A, where symphonia's coarse
+/// seek estimates a byte offset that lies *after* the mdat atom, so every
+/// `next_packet()` fails immediately and the seek-sampled plan would produce
+/// an all-silence thumbnail. AAC/ALAC are fast enough to decode end-to-end,
+/// and unlike streaming *playback*, a preview has no real-time constraint.
+///
+/// The result covers 100% of the file: `EnvAccum` reduces consecutive blocks
+/// of `block` frames into one point each, and the final block count is
+/// resampled/padded to exactly `target_frames` by the caller.
+fn envelope_sequential_full(
+    path: &Path,
+    target_frames: usize,
+    ch_hint: usize,
+) -> Result<(super::Envelope, u32)> {
+    use symphonia::core::audio::SampleBuffer;
+    use symphonia::core::codecs::DecoderOptions;
+    use symphonia::core::errors::Error;
+    use symphonia::core::formats::FormatOptions;
+    use symphonia::core::io::MediaSourceStream;
+    use symphonia::core::meta::MetadataOptions;
+    use symphonia::core::probe::Hint;
+
+    let file = std::fs::File::open(path)?;
+    let len = file.metadata()?.len();
+    let mss = MediaSourceStream::new(Box::new(PlainFile { file, len }), Default::default());
+    let mut hint = Hint::new();
+    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+        hint.with_extension(ext);
+    }
+
+    let probed = symphonia::default::get_probe()
+        .format(&hint, mss, &FormatOptions::default(), &MetadataOptions::default())
+        .map_err(|e| AudioIoError::DecodeError(format!("Probe failed: {}", e)))?;
+
+    let mut format = probed.format;
+    let track = format
+        .default_track()
+        .ok_or_else(|| AudioIoError::DecodeError("No audio track found".to_string()))?;
+
+    let track_id = track.id;
+    let params = track.codec_params.clone();
+    let sample_rate = params.sample_rate.unwrap_or(44100).max(1);
+    let ch = params.channels.map(|c| c.count()).unwrap_or(ch_hint).max(1);
+    let total_frames = params.n_frames.unwrap_or(0) as usize;
+
+    // One envelope point per equal slice of the whole file.
+    let block = if total_frames > 0 {
+        (total_frames / target_frames).max(1)
+    } else {
+        512
+    };
+
+    let mut decoder = symphonia::default::get_codecs()
+        .make(&params, &DecoderOptions::default())
+        .map_err(|e| AudioIoError::DecodeError(format!("Codec init failed: {}", e)))?;
+
+    let mut acc = EnvAccum::new(ch, block);
+    let mut sample_buf: Option<SampleBuffer<f32>> = None;
+
+    loop {
+        let packet = match format.next_packet() {
+            Ok(p) => p,
+            // Clean end of stream or IO error: stop, we have everything we
+            // can get from this file.
+            Err(_) => break,
+        };
+        if packet.track_id() != track_id {
+            continue;
+        }
+        match decoder.decode(&packet) {
+            Ok(audio_buf) => {
+                if sample_buf.is_none() {
+                    let spec = *audio_buf.spec();
+                    let cap = audio_buf.capacity() as u64;
+                    sample_buf = Some(SampleBuffer::<f32>::new(cap, spec));
+                }
+                if let Some(buf) = &mut sample_buf {
+                    buf.copy_interleaved_ref(audio_buf);
+                    acc.push(buf.samples());
+                }
+            }
+            Err(Error::DecodeError(m)) => {
+                tracing::warn!("Skipping corrupted packet: {}", m);
+            }
+            Err(_) => break,
+        }
+        // Safety net against corrupt/endless streams only — set far above any
+        // realistic file length, so healthy files always run to EOF.
+        if acc.frames_in() >= ENVELOPE_MAX_FRAMES {
+            break;
+        }
+    }
+
+    acc.finish();
+    if acc.frames_out() == 0 {
+        return Err(AudioIoError::DecodeError(
+            "File contains no audio data".to_string(),
+        ));
+    }
+    let mut env = acc.into_envelope();
+    if total_frames == 0 && env.frames != target_frames {
+        resample_envelope(&mut env, target_frames);
+    }
+    Ok((env, sample_rate))
 }
 
 /// Frames decoded per envelope point when seek-sampling a compressed file.
@@ -518,11 +680,15 @@ fn envelope_sequential_symphonia(
     use symphonia::core::errors::Error;
 
     let total_frames_hint = params.n_frames.unwrap_or(0) as usize;
+    // Block size so the whole file maps onto exactly `target_frames` slots.
+    // With an unknown length we don't know the duration up front, so pick a
+    // dense block and *resample* the finished envelope to `target_frames`
+    // below — otherwise (fixed 2048-block) long streams would fill only the
+    // first slots and the tail of the thumbnail would be silence.
     let block = if total_frames_hint > 0 {
         (total_frames_hint / target_frames).max(1)
     } else {
-        // Unknown length: keep the envelope dense but bounded.
-        2048
+        512
     };
 
     let mut decoder = symphonia::default::get_codecs()
@@ -573,5 +739,42 @@ fn envelope_sequential_symphonia(
     if acc.frames_out() == 0 {
         return Err(AudioIoError::DecodeError("File contains no audio data".to_string()));
     }
-    Ok((acc.into_envelope(), sample_rate))
+    let mut env = acc.into_envelope();
+    // When the length was unknown up front, the block size was a guess:
+    // resample whatever we collected so it spans *all* `target_frames` slots
+    // (full-file coverage) instead of only the first `frames` ones.
+    if total_frames_hint == 0 && env.frames > 0 && env.frames != target_frames {
+        resample_envelope(&mut env, target_frames);
+    }
+    Ok((env, sample_rate))
+}
+
+/// Rescale an envelope to exactly `out_frames` points per channel by taking
+/// the min/max of each source slice — i.e. re-reducing, never interpolating,
+/// so peaks survive and full-file coverage is preserved.
+fn resample_envelope(env: &mut super::Envelope, out_frames: usize) {
+    if out_frames == 0 || env.frames == 0 {
+        return;
+    }
+    let src = env.frames;
+    for c in 0..env.channels {
+        let lo_in = std::mem::take(&mut env.lo[c]);
+        let hi_in = std::mem::take(&mut env.hi[c]);
+        let mut lo = Vec::with_capacity(out_frames);
+        let mut hi = Vec::with_capacity(out_frames);
+        for i in 0..out_frames {
+            let s = i * src / out_frames;
+            let e = ((i + 1) * src / out_frames).max(s + 1).min(src);
+            let (mut mn, mut mx) = (f32::INFINITY, f32::NEG_INFINITY);
+            for j in s..e {
+                mn = mn.min(lo_in[j]);
+                mx = mx.max(hi_in[j]);
+            }
+            lo.push(if mn.is_finite() { mn } else { 0.0 });
+            hi.push(if mx.is_finite() { mx } else { 0.0 });
+        }
+        env.lo[c] = lo;
+        env.hi[c] = hi;
+    }
+    env.frames = out_frames;
 }
