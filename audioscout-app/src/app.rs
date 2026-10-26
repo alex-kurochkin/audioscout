@@ -9,11 +9,13 @@ use audioscout_core::db::Database;
 use audioscout_core::audio_io::PcmFile;
 use audioscout_core::disk::DiskProvider;
 use audioscout_core::preview_worker::{PreviewWorker, PreviewJob};
-use audioscout_core::{Document, EventChannel, Marker, UiEvent, is_editable_file};
+use audioscout_core::{Document, EventChannel, Marker, PreviewMode, UiEvent, is_editable_file};
 use crossbeam_channel::Receiver;
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 use image::GenericImageView;
 
 /// Main application state
@@ -41,7 +43,6 @@ pub struct AudioScoutApp {
     normalize_dbfs: f32,
     expanded_dirs: HashMap<PathBuf, Vec<PathBuf>>,
     disks: Vec<audioscout_core::disk::DiskInfo>,
-    preview_cache: HashMap<String, egui::TextureHandle>,
     /// Paths with a preview job currently accepted by the worker (waiting for
     /// `UiEvent::PreviewReady`). Cleared when the result arrives or the scan
     /// generation changes.
@@ -49,6 +50,15 @@ pub struct AudioScoutApp {
     /// Paths whose submit was rejected (duplicate / queue full); retried by
     /// `retry_missing_previews` while previews are pending.
     preview_retry: HashSet<PathBuf>,
+    /// Active thumbnail style for the file list (Waveform / Spectrogram).
+    /// Shared with the scanner (`Scanner::preview_mode_handle`) so cached
+    /// lookups during a scan use the same mode as the submitted jobs.
+    preview_mode: Rc<Mutex<PreviewMode>>,
+    /// Per-mode texture caches. Keyed by UUID (which already embeds a
+    /// mode-specific suffix), kept separate per mode so switching back and
+    /// forth does not force re-uploading textures.
+    preview_cache_wave: HashMap<String, egui::TextureHandle>,
+    preview_cache_spectro: HashMap<String, egui::TextureHandle>,
     // Cached peaks tree for fast waveform rendering
     // cached_channels: Vec of (channel_data, peaks_tree) for each visible channel (1 for mono, 2 for stereo/multichannel)
     cached_channels: Vec<(Vec<f32>, audioscout_core::peaks_tree::Peaks)>,

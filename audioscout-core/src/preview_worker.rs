@@ -402,7 +402,7 @@ pub fn render_preview(path: &Path, mode: PreviewMode) -> Result<String, String> 
             // The FFT analysis needs real samples, not a min/max envelope.
             // Decode within the same byte budget used for waveforms; long
             // files simply get a truncated-but-instant spectrogram.
-            let (samples, _sr, ch, _st) =
+            let (samples, _sr, ch) =
                 load_audio_bounded(path, PREVIEW_DECODE_BUDGET as usize * 8)
                     .map_err(|e| format!("Load failed: {}", e))?;
             crate::render::spectrogram::render_spectrogram_preview(

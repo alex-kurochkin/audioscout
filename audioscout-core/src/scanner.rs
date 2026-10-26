@@ -6,10 +6,30 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use walkdir::WalkDir;
 
-pub struct Scanner { cancel: Arc<AtomicBool>, generation: Arc<AtomicU64> }
+pub struct Scanner {
+    cancel: Arc<AtomicBool>,
+    generation: Arc<AtomicU64>,
+    /// Preview style used for the synchronous cache lookup during a scan.
+    /// Shared with the UI so a mode switch reflects on the next scan; an
+    /// `Arc` keeps `Scanner` cheap to clone/move.
+    preview_mode: Arc<std::sync::Mutex<PreviewMode>>,
+}
 
 impl Scanner {
-    pub fn new() -> Self { Self { cancel: Arc::new(AtomicBool::new(false)), generation: Arc::new(AtomicU64::new(0)) } }
+    pub fn new() -> Self {
+        Self {
+            cancel: Arc::new(AtomicBool::new(false)),
+            generation: Arc::new(AtomicU64::new(0)),
+            preview_mode: Arc::new(std::sync::Mutex::new(PreviewMode::Waveform)),
+        }
+    }
+
+    /// Handle to the shared preview mode; pass it to `set_preview_mode` so
+    /// the scanner's cached-preview lookups follow the active UI toggle.
+    pub fn preview_mode_handle(&self) -> Arc<std::sync::Mutex<PreviewMode>> {
+        self.preview_mode.clone()
+    }
+
     pub fn scan(&self, dir: PathBuf, sender: Sender<UiEvent>) {
         self.cancel.store(true, Ordering::SeqCst);
         let cancel = Arc::new(AtomicBool::new(false));
@@ -18,6 +38,7 @@ impl Scanner {
         let gen = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
         let sender_clone = sender.clone();
         let dir_clone = dir.clone();
+        let mode = *self.preview_mode.lock().unwrap();
         std::thread::spawn(move || {
             let mut rows = Vec::new();
             for entry in WalkDir::new(&dir_clone).max_depth(1).min_depth(1).into_iter().filter_map(|e| e.ok()) {
@@ -47,7 +68,7 @@ impl Scanner {
                 // are written by the render threads themselves and back-filled
                 // lazily.
                 let preview_uuid = if meta.status == crate::ProbeStatus::Ok {
-                    crate::preview_worker::cached_preview_png(path, meta.channels)
+                    crate::preview_worker::cached_preview_png(path, meta.channels, mode)
                 } else {
                     None
                 };
