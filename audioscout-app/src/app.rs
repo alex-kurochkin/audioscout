@@ -13,7 +13,6 @@ use audioscout_core::{Document, EventChannel, Marker, PreviewMode, UiEvent, is_e
 use crossbeam_channel::Receiver;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use image::GenericImageView;
 
@@ -119,6 +118,10 @@ impl AudioScoutApp {
         let undo_stack = UndoStack::new(undo_dir, config_store.config().undo_depth, config_store.config().undo_disk_limit_mb);
         let preview_worker = PreviewWorker::new(event_tx.clone());
         let scanner = Scanner::new();
+        // Grab the shared preview-mode handle *before* `scanner` is moved
+        // into the struct below (Rust evaluates struct fields in order, so
+        // borrowing `scanner` after it has been moved would fail to compile).
+        let preview_mode = scanner.preview_mode_handle();
 
         let mut app = Self {
             config_store, db, event_rx, event_tx,
@@ -127,7 +130,7 @@ impl AudioScoutApp {
             column_layout: ColumnLayout::new(), selected_row: None, filter_text: String::new(),
             document: Document::new(), active_file: None, player,
             audio_view: AudioView::new(0), undo_stack,
-            preview_mode: scanner.preview_mode_handle(),
+            preview_mode,
             preview_cache_wave: HashMap::new(),
             preview_cache_spectro: HashMap::new(),
             preview_inflight: HashSet::new(), preview_retry: HashSet::new(),
