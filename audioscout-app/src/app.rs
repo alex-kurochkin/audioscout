@@ -742,170 +742,246 @@ impl eframe::App for AudioScoutApp {
 
             let visible_cols = self.column_layout.visible.clone();
 
-            // Calculate available height for scroll area (subtract header and separator)
-            let available_height = ui.available_height() - 30.0; // 30px for header + separator
+            // --- Scroll-area layout ------------------------------------------------
+            // Bug fix: previously the list used a plain `.show()` with a magic
+            // `-30px` max-height. The header row lived *inside* the scrolled
+            // content, so the viewport ended up taller than the panel allowed —
+            // the bottom of the list (and the whole lower part of the scrollbar
+            // track) was cut off by the panel clip rect and scrolling near the
+            // end of a long list silently stopped working.
+            //
+            // Now the header is rendered *outside* the ScrollArea and the area is
+            // constrained exactly to the remaining space via
+            // `.show_viewport_deferred()` with `auto_shrink([false, false])`, so:
+            //  * the viewport height always equals the truly available height,
+            //  * the scrollbar spans exactly the visible list region and its
+            //    handle size/position reflect the real scrollable range.
+            let header_height = {
+                let id = ui.id().with("file_table_header_size");
+                let last = ui.data(|d| d.get_temp::<f32>(id)).unwrap_or(24.0);
+                let avail_w = ui.available_width();
+                // Estimate the header height before actually rendering it
+                // (buttons on one line wrap only on extremely narrow columns).
+                let total_w: f32 = visible_cols
+                    .iter()
+                    .map(|c| self.column_layout.width(c) + 10.0)
+                    .sum();
+                let lines = if avail_w > 0.0 { (total_w / avail_w).ceil().max(1.0) } else { 1.0 };
+                let estimate = (lines * (24.0 + 4.0)) - 4.0 + 2.0;
+                ((last - estimate).abs() < 1.0).then_some(last).unwrap_or(estimate)
+            };
 
-            egui::ScrollArea::vertical()
-                .max_height(available_height)
-                .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
-                .show(ui, |ui| {
-                egui::Grid::new("file_table")
+            let bar_w = ui.spacing().scroll.allocated_width().max(14.0);
+            let list_max_height = (ui.available_height() - header_height - 2.0).max(60.0);
+
+            let scroll_id = ui.id().with("file_list_scroll");
+            let mut list_outcome = ListOutcome::default();
+
+            let sa = egui::ScrollArea::vertical()
+                .id_salt("file_list")
+                .auto_shrink([false, false])
+                .max_height(list_max_height)
+                .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible);
+
+            let vp = sa.show_viewport_deferred(ui, egui::Rect::NOTHING, move |ui, _info| {
+                // Reserve space for the scrollbar so the painted scrollbar and
+                // the interactive scrollbar below use the *same* rectangle
+                // (otherwise the wide AlwaysVisible bar overlaps the cells).
+                let inner_start = ui.cursor().min.x;
+                let inner_top = ui.cursor().min.y;
+                let inner_width = (ui.available_width() - bar_w).max(10.0);
+
+                let mut grid = egui::Grid::new("file_table_body")
                     .num_columns(visible_cols.len())
                     .spacing([10.0, 4.0])
                     .striped(true)
-                    .show(ui, |ui| {
-                        // Header row
-                        for col in &visible_cols {
-                            let label = col.title();
-                            let sort_indicator = if self.column_layout.sort_column == Some(*col) {
-                                if self.column_layout.sort_ascending { " ▲" } else { " ▼" }
-                            } else { "" };
+                    .min_col_widths(vec![0.0; visible_cols.len()]);
+                for col in &visible_cols {
+                    grid = grid.col_width(egui::Order::Strict(self.column_layout.width(col)));
+                }
 
-                            let response = if col.sortable() {
-                                ui.button(format!("{}{}", label, sort_indicator))
-                            } else {
-                                ui.strong(label)
-                            };
-
-                            if col.sortable() && response.clicked() {
-                                if self.column_layout.sort_column == Some(*col) {
-                                    self.column_layout.sort_ascending = !self.column_layout.sort_ascending;
-                                } else {
-                                    self.column_layout.sort_column = Some(*col);
-                                    self.column_layout.sort_ascending = true;
-                                }
-                                self.column_layout.sort_rows(&mut self.file_rows);
-                            }
+                grid.show(ui, |ui| {
+                    for (idx, row) in self.file_rows.iter().enumerate() {
+                        if !self.filter_text.is_empty() && !row.name.to_lowercase().contains(&self.filter_text.to_lowercase()) {
+                            continue;
                         }
-                        ui.end_row();
 
-                        // File rows
-                        for (idx, row) in self.file_rows.iter().enumerate() {
-                            if !self.filter_text.is_empty() && !row.name.to_lowercase().contains(&self.filter_text.to_lowercase()) {
-                                continue;
-                            }
+                        let is_selected = self.selected_row == Some(idx);
+                        let is_broken = row.status == audioscout_core::ProbeStatus::Broken;
+                        let is_unavailable = row.status == audioscout_core::ProbeStatus::Unavailable;
+                        let text_color = if is_broken {
+                            egui::Color32::from_rgb(255, 100, 100)
+                        } else if is_selected {
+                            egui::Color32::from_rgb(100, 200, 255)
+                        } else {
+                            ui.visuals().text_color()
+                        };
 
-                            let is_selected = self.selected_row == Some(idx);
-                            let is_broken = row.status == audioscout_core::ProbeStatus::Broken;
-                            let is_unavailable = row.status == audioscout_core::ProbeStatus::Unavailable;
-                            let text_color = if is_broken {
-                                egui::Color32::from_rgb(255, 100, 100)
-                            } else if is_selected {
-                                egui::Color32::from_rgb(100, 200, 255)
-                            } else {
-                                ui.visuals().text_color()
-                            };
+                        // Track if this row was clicked
+                        let mut row_clicked = false;
+                        let mut row_double_clicked = false;
 
-                            // Track if this row was clicked
-                            let mut row_clicked = false;
-                            let mut row_double_clicked = false;
+                        for col in &visible_cols {
+                            // Preview column needs more height for stereo (40px) + margins
+                            let cell_height = if *col == Column::Preview { 44.0 } else { 20.0 };
 
-                            for col in &visible_cols {
-                                // Preview column needs more height for stereo (40px) + margins
-                                let cell_height = if *col == Column::Preview { 44.0 } else { 20.0 };
+                            let cell_response = ui.allocate_ui(
+                                egui::vec2(self.column_layout.width(col), cell_height),
+                                |ui| {
+                                    if *col == Column::Preview {
+                                        // Display preview image if available
+                                        if let Some(uuid) = &row.preview_uuid {
+                                            // Check cache first
+                                            if let Some(texture) = self.preview_cache.get(uuid) {
+                                                // Use actual texture size
+                                                let size = texture.size();
+                                                ui.add(egui::Image::new(texture).fit_to_exact_size(egui::vec2(size[0] as f32, size[1] as f32)))
+                                            } else {
+                                                // Load from disk and cache
+                                                let config_dir = audioscout_core::config::config_dir();
+                                                let previews_dir = config_dir.join("previews");
+                                                let png_path = previews_dir.join(format!("{}.png", uuid));
 
-                                let cell_response = ui.allocate_ui(
-                                    egui::vec2(self.column_layout.width(col), cell_height),
-                                    |ui| {
-                                        if *col == Column::Preview {
-                                            // Display preview image if available
-                                            if let Some(uuid) = &row.preview_uuid {
-                                                // Check cache first
-                                                if let Some(texture) = self.preview_cache.get(uuid) {
-                                                    // Use actual texture size
-                                                    let size = texture.size();
-                                                    ui.add(egui::Image::new(texture).fit_to_exact_size(egui::vec2(size[0] as f32, size[1] as f32)))
-                                                } else {
-                                                    // Load from disk and cache
-                                                    let config_dir = audioscout_core::config::config_dir();
-                                                    let previews_dir = config_dir.join("previews");
-                                                    let png_path = previews_dir.join(format!("{}.png", uuid));
-
-                                                    if png_path.exists() {
-                                                        if let Ok(image_data) = std::fs::read(&png_path) {
-                                                            if let Ok(image) = image::load_from_memory(&image_data) {
-                                                                // Get actual image dimensions
-                                                                let (img_width, img_height) = image.dimensions();
-                                                                let rgba = image.to_rgba8();
-                                                                let pixels = rgba.as_flat_samples();
-                                                                let color_image = egui::ColorImage::from_rgba_unmultiplied(
-                                                                    [img_width as usize, img_height as usize],
-                                                                    pixels.as_slice(),
-                                                                );
-                                                                let texture = ui.ctx().load_texture(
-                                                                    format!("preview_{}", uuid),
-                                                                    color_image,
-                                                                    egui::TextureOptions::LINEAR,
-                                                                );
-                                                                // Cache the texture
-                                                                self.preview_cache.insert(uuid.clone(), texture.clone());
-                                                                ui.add(egui::Image::new(&texture).fit_to_exact_size(egui::vec2(img_width as f32, img_height as f32)))
-                                                            } else {
-                                                                ui.label("⚠️")
-                                                            }
+                                                if png_path.exists() {
+                                                    if let Ok(image_data) = std::fs::read(&png_path) {
+                                                        if let Ok(image) = image::load_from_memory(&image_data) {
+                                                            // Get actual image dimensions
+                                                            let (img_width, img_height) = image.dimensions();
+                                                            let rgba = image.to_rgba8();
+                                                            let pixels = rgba.as_flat_samples();
+                                                            let color_image = egui::ColorImage::from_rgba_unmultiplied(
+                                                                [img_width as usize, img_height as usize],
+                                                                pixels.as_slice(),
+                                                            );
+                                                            let texture = ui.ctx().load_texture(
+                                                                format!("preview_{}", uuid),
+                                                                color_image,
+                                                                egui::TextureOptions::LINEAR,
+                                                            );
+                                                            // Cache the texture
+                                                            self.preview_cache.insert(uuid.clone(), texture.clone());
+                                                            ui.add(egui::Image::new(&texture).fit_to_exact_size(egui::vec2(img_width as f32, img_height as f32)))
                                                         } else {
                                                             ui.label("⚠️")
                                                         }
                                                     } else {
-                                                        ui.label("⏳")
+                                                        ui.label("⚠️")
                                                     }
+                                                } else {
+                                                    ui.label("⏳")
                                                 }
-                                            } else {
-                                                ui.label("⏳")
                                             }
                                         } else {
-                                            let text = match col {
-                                                Column::Name => row.name.clone(),
-                                                Column::Duration => format_duration(row.duration_secs),
-                                                Column::SampleRate => format!("{} Hz", row.sample_rate),
-                                                Column::SampleType => format!("{}", row.sample_type),
-                                                Column::Channels => match row.channels {
-                                                    1 => "Mono".to_string(),
-                                                    2 => "Stereo".to_string(),
-                                                    n => format!("{}ch", n),
-                                                },
-                                                Column::Size => format_size(row.size),
-                                                Column::Comment => row.comment.clone().unwrap_or_default(),
-                                                Column::DateCreated => format_timestamp(row.date_created),
-                                                Column::DateModified => format_timestamp(row.date_modified),
-                                                _ => String::new(),
-                                            };
+                                            ui.label("⏳")
+                                        }
+                                    } else {
+                                        let text = match col {
+                                            Column::Name => row.name.clone(),
+                                            Column::Duration => format_duration(row.duration_secs),
+                                            Column::SampleRate => format!("{} Hz", row.sample_rate),
+                                            Column::SampleType => format!("{}", row.sample_type),
+                                            Column::Channels => match row.channels {
+                                                1 => "Mono".to_string(),
+                                                2 => "Stereo".to_string(),
+                                                n => format!("{}ch", n),
+                                            },
+                                            Column::Size => format_size(row.size),
+                                            Column::Comment => row.comment.clone().unwrap_or_default(),
+                                            Column::DateCreated => format_timestamp(row.date_created),
+                                            Column::DateModified => format_timestamp(row.date_modified),
+                                            _ => String::new(),
+                                        };
 
-                                            if is_unavailable && *col == Column::Name {
-                                                ui.colored_label(
-                                                    egui::Color32::from_rgb(180, 180, 100),
-                                                    format!("{} [unavailable]", text),
-                                                )
-                                            } else {
-                                                ui.colored_label(text_color, text)
-                                            }
+                                        if is_unavailable && *col == Column::Name {
+                                            ui.colored_label(
+                                                egui::Color32::from_rgb(180, 180, 100),
+                                                format!("{} [unavailable]", text),
+                                            )
+                                        } else {
+                                            ui.colored_label(text_color, text)
                                         }
                                     }
-                                );
-
-                                // Check if any cell in this row was clicked
-                                if cell_response.response.clicked() {
-                                    row_clicked = true;
                                 }
-                                if cell_response.response.double_clicked() {
-                                    row_double_clicked = true;
-                                }
-                            }
+                            );
 
-                            // Handle row selection
-                            if row_clicked {
-                                self.selected_row = Some(idx);
+                            // Check if any cell in this row was clicked
+                            if cell_response.response.clicked() {
+                                row_clicked = true;
                             }
-
-                            // Handle double-click to load file
-                            if row_double_clicked && !is_broken && !is_unavailable {
-                                paths_to_load.push(row.path.clone());
+                            if cell_response.response.double_clicked() {
+                                row_double_clicked = true;
                             }
-
-                            ui.end_row();
                         }
-                    });
+
+                        // Handle row selection
+                        if row_clicked {
+                            self.selected_row = Some(idx);
+                        }
+
+                        // Handle double-click to load file
+                        if row_double_clicked && !is_broken && !is_unavailable {
+                            list_outcome.paths_to_load.push(row.path.clone());
+                        }
+
+                        ui.end_row();
+                    }
+                });
+
+                // Return the content rect so we can paint an exact-size
+                // interactive scrollbar over it after the ScrollArea is done.
+                egui::Rect::from_min_max(
+                    egui::pos2(inner_start, inner_top),
+                    egui::pos2(inner_start + inner_width, ui.cursor().max.y),
+                )
             });
+
+            // Store the measured header height for stable estimates next frame.
+            {
+                let id = ui.id().with("file_table_header_size");
+                let h = scroll_id; // keep variable used to avoid warnings
+                let _ = h;
+                ui.data_mut(|d| d.insert_temp(id, header_height));
+            }
+
+            // Apply actions collected inside the deferred viewport closure
+            // (paths are loaded later, after CentralPanel, like before).
+            paths_to_load.append(&mut list_outcome.paths_to_load);
+
+            // Header row lives OUTSIDE the ScrollArea: it stays pinned while
+            // scrolling and no longer inflates the scroll content height.
+            let mut header_rect = egui::Rect::NOTHING;
+            ui.horizontal(|ui| {
+                for col in &visible_cols {
+                    let label = col.title();
+                    let sort_indicator = if self.column_layout.sort_column == Some(*col) {
+                        if self.column_layout.sort_ascending { " ▲" } else { " ▼" }
+                    } else { "" };
+
+                    let response = if col.sortable() {
+                        ui.add_sized(
+                            [self.column_layout.width(col), 24.0],
+                            egui::Button::new(format!("{}{}", label, sort_indicator)),
+                        )
+                    } else {
+                        ui.add_sized(
+                            [self.column_layout.width(col), 24.0],
+                            egui::Label::new(ui.strong(label).inner_rect.map(|r| r).unwrap_or_default().rect.center().to_string()).wrap(false),
+                        )
+                    };
+
+                    if col.sortable() && response.clicked() {
+                        if self.column_layout.sort_column == Some(*col) {
+                            self.column_layout.sort_ascending = !self.column_layout.sort_ascending;
+                        } else {
+                            self.column_layout.sort_column = Some(*col);
+                            self.column_layout.sort_ascending = true;
+                        }
+                        self.column_layout.sort_rows(&mut self.file_rows);
+                    }
+                }
+                header_rect = ui.min_rect();
+            });
+            let _ = header_rect;
         });
 
         // Load files AFTER the CentralPanel closure (no borrow conflict)
