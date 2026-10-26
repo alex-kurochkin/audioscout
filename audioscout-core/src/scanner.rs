@@ -34,11 +34,28 @@ impl Scanner {
                 let ctime = metadata.as_ref().and_then(|m| m.created().ok())
                     .map(|t| t.duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs())
                     .unwrap_or(mtime);
+                // Resolve the preview *synchronously* during the scan: if the
+                // PNG is already cached on disk (deterministic filename from
+                // path/mtime/size/channels) the row ships with its UUID and
+                // shows up instantly in the table. Only genuinely missing
+                // previews fall through to the background worker. This removes
+                // the multi-second "⏳ delay" after re-opening a directory
+                // whose thumbnails are already generated. We deliberately do
+                // NOT touch SQLite here: the scanner thread must never block
+                // behind writes made by concurrent preview render threads
+                // (that used to stall the whole ScanDone event). The DB rows
+                // are written by the render threads themselves and back-filled
+                // lazily.
+                let preview_uuid = if meta.status == crate::ProbeStatus::Ok {
+                    crate::preview_worker::cached_preview_png(path, meta.channels)
+                } else {
+                    None
+                };
                 rows.push(FileRow {
                     path: path.to_path_buf(), name: file_name, duration_secs: meta.duration_secs,
                     sample_rate: meta.sample_rate, sample_type: meta.sample_type, channels: meta.channels,
                     size: file_size, comment: meta.comment, date_created: ctime, date_modified: mtime,
-                    status: meta.status, preview_uuid: None,
+                    status: meta.status, preview_uuid,
                 });
             }
             rows.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));

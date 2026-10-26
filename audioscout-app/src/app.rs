@@ -11,7 +11,7 @@ use audioscout_core::disk::DiskProvider;
 use audioscout_core::preview_worker::{PreviewWorker, PreviewJob};
 use audioscout_core::{Document, EventChannel, Marker, UiEvent, is_editable_file};
 use crossbeam_channel::Receiver;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use image::GenericImageView;
@@ -42,6 +42,13 @@ pub struct AudioScoutApp {
     expanded_dirs: HashMap<PathBuf, Vec<PathBuf>>,
     disks: Vec<audioscout_core::disk::DiskInfo>,
     preview_cache: HashMap<String, egui::TextureHandle>,
+    /// Paths with a preview job currently accepted by the worker (waiting for
+    /// `UiEvent::PreviewReady`). Cleared when the result arrives or the scan
+    /// generation changes.
+    preview_inflight: HashSet<PathBuf>,
+    /// Paths whose submit was rejected (duplicate / queue full); retried by
+    /// `retry_missing_previews` while previews are pending.
+    preview_retry: HashSet<PathBuf>,
     // Cached peaks tree for fast waveform rendering
     // cached_channels: Vec of (channel_data, peaks_tree) for each visible channel (1 for mono, 2 for stereo/multichannel)
     cached_channels: Vec<(Vec<f32>, audioscout_core::peaks_tree::Peaks)>,
@@ -110,6 +117,7 @@ impl AudioScoutApp {
             column_layout: ColumnLayout::new(), selected_row: None, filter_text: String::new(),
             document: Document::new(), active_file: None, player,
             audio_view: AudioView::new(0), undo_stack, preview_cache: HashMap::new(),
+            preview_inflight: HashSet::new(), preview_retry: HashSet::new(),
             show_settings: false, show_columns_dialog: false, status_message: String::new(),
             normalize_dbfs: -1.0, expanded_dirs: HashMap::new(),
             disks: Vec::new(),
@@ -167,20 +175,58 @@ impl AudioScoutApp {
         self.preview_worker.clear_queue();
 
         for row in &self.file_rows {
-            // Skip if preview already exists
+            // Skip if preview already exists (scanner resolved it from cache,
+            // or a previous batch delivered it)
             if row.preview_uuid.is_some() {
                 continue;
             }
 
-            // Submit preview job
-            self.preview_worker.submit(PreviewJob {
+            // Submit preview job. If the worker drops the job (duplicate
+            // already rendering, or saturated queue), remember the path so we
+            // retry on the next scan instead of leaving ⏳ forever.
+            if !self.preview_worker.submit(PreviewJob {
                 path: row.path.clone(),
                 generation,
-            });
+            }) {
+                self.preview_retry.insert(row.path.clone());
+            } else {
+                self.preview_inflight.insert(row.path.clone());
+            }
         }
     }
 
-    fn process_events(&mut self) {
+    /// Background preview generation is event-driven: without an active
+    /// repaint loop, `PreviewReady` events could sit unread in the channel
+    /// long after the PNGs appeared on disk. While any thumbnail is still
+    /// missing, keep the UI pumping at a modest rate so results show up as
+    /// soon as they arrive.
+    fn previews_pending(&self) -> bool {
+        self.file_rows.iter().any(|r| r.preview_uuid.is_none())
+    }
+
+    /// Re-submit rows that are neither cached nor currently in flight
+    /// (e.g. jobs previously rejected because the queue was full).
+    fn retry_missing_previews(&mut self) {
+        let generation = self.scan_generation;
+        let missing: Vec<PathBuf> = self
+            .file_rows
+            .iter()
+            .filter(|r| r.preview_uuid.is_none())
+            .filter(|r| !self.preview_inflight.contains(&r.path))
+            .map(|r| r.path.clone())
+            .collect();
+
+        for path in missing {
+            if self
+                .preview_worker
+                .submit(PreviewJob { path: path.clone(), generation })
+            {
+                self.preview_inflight.insert(path);
+            }
+        }
+    }
+
+    fn process_events(&mut self, ctx: &egui::Context) {
         while let Ok(event) = self.event_rx.try_recv() {
             match event {
                 UiEvent::ScanDone { dir, rows, generation } => {
@@ -188,6 +234,9 @@ impl AudioScoutApp {
                         self.scan_generation = generation;
                         self.file_rows = rows;
                         self.column_layout.sort_rows(&mut self.file_rows);
+                        // Previous-generation bookkeeping is stale now.
+                        self.preview_inflight.clear();
+                        self.preview_retry.clear();
                         if let Some(file_str) = self.db.load_session("lastFile") {
                             let file_path = PathBuf::from(file_str);
                             if let Some(idx) = self.file_rows.iter().position(|r| r.path == file_path) {
@@ -197,14 +246,21 @@ impl AudioScoutApp {
 
                         // Request previews for all files
                         self.request_previews();
+                        // New rows may need thumbnails → start the pump.
+                        ctx.request_repaint();
                     }
                 }
                 UiEvent::PreviewReady { path, uuid, generation } => {
                     // Only update if this is the current generation
                     if generation == self.scan_generation {
+                        self.preview_inflight.remove(&path);
+                        self.preview_retry.remove(&path);
                         if let Some(row) = self.file_rows.iter_mut().find(|r| r.path == path) {
                             row.preview_uuid = Some(uuid);
                         }
+                        // Repaint so the freshly delivered thumbnail becomes
+                        // visible immediately instead of on the next input.
+                        ctx.request_repaint();
                     }
                 }
                 UiEvent::PlayheadUpdate { position_secs } => {
@@ -554,9 +610,19 @@ impl AudioScoutApp {
 
 impl eframe::App for AudioScoutApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.process_events();
+        self.process_events(ctx);
         self.handle_keyboard(ctx);
         if self.player.state() == TransportState::Playing { ctx.request_repaint_after(std::time::Duration::from_millis(50)); }
+
+        // Preview pump: while any thumbnail is still missing, keep draining
+        // events and repainting on a fixed cadence. Without this, egui's
+        // on-demand redraw could leave finished previews invisible (and their
+        // `PreviewReady` events unread in the channel) until the user moved
+        // the mouse — the "PNGs exist on disk but appear late in the UI" bug.
+        if self.previews_pending() {
+            self.retry_missing_previews();
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        }
 
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -1025,9 +1091,26 @@ impl eframe::App for AudioScoutApp {
                     if previews_dir.exists() {
                         let _ = std::fs::remove_dir_all(&previews_dir);
                     }
-                    // Clear in-memory cache
+                    // Clear in-memory texture cache
                     self.preview_cache.clear();
-                    self.status_message = "All previews deleted".to_string();
+                    // Drop the stale UUIDs from the visible rows: they point at
+                    // PNGs that no longer exist on disk. Without this,
+                    // `request_previews()` skips every row (it only submits
+                    // jobs for rows with `preview_uuid == None`) and the
+                    // preview pump thinks nothing is pending — so regeneration
+                    // never starts after deletion.
+                    for row in &mut self.file_rows {
+                        row.preview_uuid = None;
+                    }
+                    // Cancel any in-flight jobs rendering the deleted previews
+                    // and reset bookkeeping so fresh jobs are submitted.
+                    self.preview_worker.clear_queue();
+                    self.preview_inflight.clear();
+                    self.preview_retry.clear();
+                    // Kick off regeneration for the current directory.
+                    self.request_previews();
+                    ctx.request_repaint();
+                    self.status_message = "All previews deleted, regenerating…".to_string();
                 }
                 if ui.button("Clean orphaned previews").clicked() {
                     match audioscout_core::preview_worker::cleanup_previews() {

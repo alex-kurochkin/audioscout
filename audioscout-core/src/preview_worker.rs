@@ -316,6 +316,27 @@ fn preview_png_path(uuid: &str) -> PathBuf {
         .join(format!("{}.png", uuid))
 }
 
+/// Fast, *synchronous*, lock-free cache lookup used by the scanner: returns
+/// the UUID of an already-generated preview if its PNG is sitting in the
+/// previews directory.
+///
+/// The filename is deterministic (hash of path + mtime + size + channel
+/// count), so a pure `stat()` answers "is this thumbnail already rendered?"
+/// without touching SQLite or decoding any audio. Keeping the DB out of the
+/// scan path matters: while render threads are busy writing rows, a scanning
+/// thread issuing queries on a second connection could block behind those
+/// writes and delay the entire `ScanDone` event — which is exactly what made
+/// previews appear in the UI long after the PNGs showed up on disk.
+pub fn cached_preview_png(path: &Path, channels: u16) -> Option<String> {
+    let channels = if channels > 0 { channels } else { 1 };
+    let uuid = generate_preview_uuid(path, channels).ok()?;
+    if preview_png_path(&uuid).exists() {
+        Some(uuid)
+    } else {
+        None
+    }
+}
+
 /// Render a waveform preview image for the file list.
 ///
 /// Visual model taken from the `waveform-preview` example (per-track min/max
@@ -327,7 +348,7 @@ fn preview_png_path(uuid: &str) -> PathBuf {
 /// O(file size).
 ///
 /// Returns the existing UUID when the preview PNG is already cached.
-fn render_preview(path: &Path) -> Result<String, String> {
+pub fn render_preview(path: &Path) -> Result<String, String> {
     const PREVIEW_WIDTH: u32 = 340;
     // Envelope resolution: ~4 points per horizontal pixel is plenty for a
     // 340-px thumbnail and keeps the reduce pass trivially cheap.
