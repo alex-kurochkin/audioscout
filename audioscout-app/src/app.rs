@@ -11,7 +11,6 @@ use audioscout_core::disk::DiskProvider;
 use audioscout_core::preview_worker::{PreviewWorker, PreviewJob};
 use audioscout_core::{Document, EventChannel, Marker, PreviewMode, UiEvent, is_editable_file};
 use crossbeam_channel::Receiver;
-use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -53,7 +52,7 @@ pub struct AudioScoutApp {
     /// Active thumbnail style for the file list (Waveform / Spectrogram).
     /// Shared with the scanner (`Scanner::preview_mode_handle`) so cached
     /// lookups during a scan use the same mode as the submitted jobs.
-    preview_mode: Rc<Mutex<PreviewMode>>,
+    preview_mode: Arc<Mutex<PreviewMode>>,
     /// Per-mode texture caches. Keyed by UUID (which already embeds a
     /// mode-specific suffix), kept separate per mode so switching back and
     /// forth does not force re-uploading textures.
@@ -119,14 +118,18 @@ impl AudioScoutApp {
         let undo_dir = config_dir.join("undo");
         let undo_stack = UndoStack::new(undo_dir, config_store.config().undo_depth, config_store.config().undo_disk_limit_mb);
         let preview_worker = PreviewWorker::new(event_tx.clone());
+        let scanner = Scanner::new();
 
         let mut app = Self {
             config_store, db, event_rx, event_tx,
-            scanner: Scanner::new(), preview_worker,
+            scanner, preview_worker,
             current_dir: None, file_rows: Vec::new(), scan_generation: 0,
             column_layout: ColumnLayout::new(), selected_row: None, filter_text: String::new(),
             document: Document::new(), active_file: None, player,
-            audio_view: AudioView::new(0), undo_stack, preview_cache: HashMap::new(),
+            audio_view: AudioView::new(0), undo_stack,
+            preview_mode: scanner.preview_mode_handle(),
+            preview_cache_wave: HashMap::new(),
+            preview_cache_spectro: HashMap::new(),
             preview_inflight: HashSet::new(), preview_retry: HashSet::new(),
             show_settings: false, show_columns_dialog: false, status_message: String::new(),
             normalize_dbfs: -1.0, expanded_dirs: HashMap::new(),
@@ -180,6 +183,7 @@ impl AudioScoutApp {
 
     fn request_previews(&mut self) {
         let generation = self.scan_generation;
+        let mode = *self.preview_mode.lock().unwrap();
 
         // Clear queue to cancel any pending previews from previous directory
         self.preview_worker.clear_queue();
@@ -197,6 +201,7 @@ impl AudioScoutApp {
             if !self.preview_worker.submit(PreviewJob {
                 path: row.path.clone(),
                 generation,
+                mode,
             }) {
                 self.preview_retry.insert(row.path.clone());
             } else {
@@ -218,6 +223,7 @@ impl AudioScoutApp {
     /// (e.g. jobs previously rejected because the queue was full).
     fn retry_missing_previews(&mut self) {
         let generation = self.scan_generation;
+        let mode = *self.preview_mode.lock().unwrap();
         let missing: Vec<PathBuf> = self
             .file_rows
             .iter()
@@ -229,7 +235,7 @@ impl AudioScoutApp {
         for path in missing {
             if self
                 .preview_worker
-                .submit(PreviewJob { path: path.clone(), generation })
+                .submit(PreviewJob { path: path.clone(), generation, mode })
             {
                 self.preview_inflight.insert(path);
             }
@@ -782,7 +788,13 @@ impl eframe::App for AudioScoutApp {
             {
                 let column_layout = &self.column_layout;
                 let file_rows = &self.file_rows;
-                let preview_cache = &mut self.preview_cache;
+                // Per-mode texture caches: pick the one matching the active
+                // thumbnail style so switching modes never re-uploads or mixes
+                // wave/spectrogram textures.
+                let preview_cache: &mut HashMap<String, egui::TextureHandle> = match *self.preview_mode.lock().unwrap() {
+                    PreviewMode::Waveform => &mut self.preview_cache_wave,
+                    PreviewMode::Spectrogram => &mut self.preview_cache_spectro,
+                };
                 let selected_row = &mut self.selected_row;
                 let filter_text = self.filter_text.to_lowercase();
 
@@ -1197,8 +1209,9 @@ impl eframe::App for AudioScoutApp {
                     if previews_dir.exists() {
                         let _ = std::fs::remove_dir_all(&previews_dir);
                     }
-                    // Clear in-memory texture cache
-                    self.preview_cache.clear();
+                    // Clear in-memory texture caches (both modes)
+                    self.preview_cache_wave.clear();
+                    self.preview_cache_spectro.clear();
                     // Drop the stale UUIDs from the visible rows: they point at
                     // PNGs that no longer exist on disk. Without this,
                     // `request_previews()` skips every row (it only submits
@@ -1241,8 +1254,9 @@ impl eframe::App for AudioScoutApp {
         // Shutdown preview worker to stop background thread
         self.preview_worker.shutdown();
 
-        // Clear preview cache to free GPU memory
-        self.preview_cache.clear();
+        // Clear preview caches to free GPU memory
+        self.preview_cache_wave.clear();
+        self.preview_cache_spectro.clear();
 
         if let Some(dir) = &self.current_dir { let _ = self.db.save_session("lastDir", &dir.to_string_lossy()); }
         if let Some(file) = &self.active_file {
