@@ -85,15 +85,20 @@ fn heat(v: f32) -> Rgba<u8> {
     Rgba([(r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8, 255])
 }
 
-/// Render a spectrogram thumbnail from interleaved PCM samples.
+/// Render a spectrogram thumbnail covering the **entire** file.
 ///
 /// - mono → whole canvas; stereo/multichannel → first two tracks stacked
 ///   vertically (same channel-selection rule as the waveform previews);
 /// - window size 512 (radix-2), hop 256, Hann window;
 /// - per-column magnitude normalised by the global max (dB-ish log scale).
+///
+/// The analysis hop is derived from the signal length (`total_frames /
+/// width`), not fixed at 256: with a fixed hop only the first `width × 256`
+/// frames were analysed and the picture stopped at the beginning of long
+/// files. Now every one of the `width` columns averages a slice of the
+/// timeline, so the whole track is visible regardless of duration.
 pub fn render_spectrogram_preview(samples: &[f32], channels: u16, width: u32, height: u32) -> RgbaImage {
     const FFT_SIZE: usize = 512;
-    const HOP: usize = 256;
 
     let ch = (channels.max(1) as usize).min(2);
     let track_height = (height as usize) / ch;
@@ -111,9 +116,11 @@ pub fn render_spectrogram_preview(samples: &[f32], channels: u16, width: u32, he
         return img;
     }
 
-    // Number of analysis columns that fit into the canvas.
-    let cols = ((total_frames - FFT_SIZE) / HOP).max(1) as u32;
-    let cols = cols.min(width).max(1);
+    // One analysis column per horizontal pixel; hop spans the full signal so
+    // even a 3-hour file fits into 340 columns (each column then averages
+    // several windows). Bounded below by the classic hop for short signals.
+    let cols = width;
+    let hop = (total_frames / cols as usize).max(FFT_SIZE / 4);
 
     let bin_fracs = log_bin_fractions(bins);
 
@@ -121,31 +128,52 @@ pub fn render_spectrogram_preview(samples: &[f32], channels: u16, width: u32, he
     let mut track_maps: Vec<Vec<f32>> = Vec::with_capacity(ch);
     let mut global_max = 1e-9f32;
 
-    let mut re = vec![0.0f32; FFT_SIZE];
-    let mut im = vec![0.0f32; FFT_SIZE];
-
     for track in 0..ch {
         let mut map = vec![0.0f32; (cols as usize) * bins];
         for col in 0..cols as usize {
-            let frame_start = col * HOP;
-            // Fill the FFT buffers with windowed samples of this track.
-            for i in 0..FFT_SIZE {
-                let frame = frame_start + i;
-                let s = if frame < total_frames {
-                    samples[frame * ch + track]
-                } else {
-                    0.0
-                };
-                re[i] = s * hann[i];
-                im[i] = 0.0;
-            }
-            fft_radix2(&mut re, &mut im);
+            // This column covers the timeline slice [slice_start, slice_end);
+            // average several FFT windows spread over it so long files still
+            // fit into `width` columns without dropping the tail.
+            let last_start = total_frames.saturating_sub(FFT_SIZE);
+            let slice_start = (col * hop).min(last_start);
+            let slice_end = ((col + 1) * hop).clamp(slice_start + FFT_SIZE / 2, total_frames);
+            let n_windows = ((slice_end - slice_start) / (FFT_SIZE / 2)).min(8).max(1);
 
-            // Magnitudes at the log-spaced centre frequencies.
-            let nyq_bin = FFT_SIZE / 2;
-            for (bi, frac) in bin_fracs.iter().enumerate() {
-                let bin = ((*frac * (nyq_bin - 1) as f32).round() as usize).min(nyq_bin - 1);
-                let mag = (re[bin] * re[bin] + im[bin] * im[bin]).sqrt();
+            // Accumulate magnitudes across the column's windows.
+            let mut acc = vec![0.0f32; bins];
+            let mut re = vec![0.0f32; FFT_SIZE];
+            let mut im = vec![0.0f32; FFT_SIZE];
+            for w in 0..n_windows {
+                let frame_start = if n_windows == 1 {
+                    slice_start
+                } else {
+                    let span = (slice_end - slice_start - FFT_SIZE) as u64;
+                    slice_start + (span * w as u64 / n_windows as u64) as usize
+                };
+                let frame_start = frame_start.min(last_start);
+                // Fill the FFT buffers with windowed samples of this track.
+                for i in 0..FFT_SIZE {
+                    let frame = frame_start + i;
+                    let s = if frame < total_frames {
+                        samples[frame * ch + track]
+                    } else {
+                        0.0
+                    };
+                    re[i] = s * hann[i];
+                    im[i] = 0.0;
+                }
+                fft_radix2(&mut re, &mut im);
+
+                // Magnitudes at the log-spaced centre frequencies.
+                let nyq_bin = FFT_SIZE / 2;
+                for (bi, frac) in bin_fracs.iter().enumerate() {
+                    let bin = ((*frac * (nyq_bin - 1) as f32).round() as usize).min(nyq_bin - 1);
+                    acc[bi] += (re[bin] * re[bin] + im[bin] * im[bin]).sqrt();
+                }
+            }
+            let inv = 1.0 / n_windows as f32;
+            for bi in 0..bins {
+                let mag = acc[bi] * inv;
                 map[col * bins + bi] = mag;
                 if mag > global_max {
                     global_max = mag;
