@@ -183,34 +183,37 @@ impl EnvAccum {
 
 /// Absolute ceiling on the number of decoded frames a single preview may
 /// consume. It exists purely as a safety net against endless/corrupt streams;
-/// normal files are bounded by the byte budget below long before this kicks in.
+/// normal files are bounded by the seek plan / byte budget below long before
+/// this kicks in.
 const ENVELOPE_MAX_FRAMES: usize = 200_000_000;
 
 /// Decodes `path` and reduces it to a per-channel min/max envelope for a
 /// file-list preview thumbnail.
 ///
-/// Performance model (this is what replaced the old "decode the whole file,
-/// then downsample" behaviour that made large previews crawl):
-/// - **One pass over the data.** Peaks are folded into the envelope *while
-///   decoding*; the full sample array is never materialised.
-/// - **Fixed-size blocks.** The envelope has exactly `target_frames` points
-///   per channel regardless of file length, so rendering cost does not grow
-///   with duration.
-/// - **Byte budget.** Decoding stops after [`PREVIEW_DECODE_BUDGET`] bytes of
-/// *compressed* input have been consumed; the remainder of the envelope is
-///   padded flat. A preview therefore costs roughly the same for a 3-minute
-///   MP3 and a 2-hour WAV instead of scaling linearly with file size.
+/// Two strategies, chosen by format:
 ///
-/// All code paths are bounded: loops stop at end-of-stream, on the first
-/// decode error, at the byte budget, or at [`ENVELOPE_MAX_FRAMES`] — there is
-/// no unbounded "keep waiting" state that could stall the preview queue.
+/// - **PCM containers (WAV):** one streaming pass through the samples with a
+///   fixed block size derived from the header's frame count. Reading PCM is
+///   cheap and sequential, so this stays the fastest path.
+/// - **Compressed formats (MP3, ...):** *seek-sampled* decode. Instead of
+///   decoding every packet from start to finish (which is what made MP3
+///   previews scale linearly with file size — a 5-minute 320 kbps MP3 means
+///   ~7 MB and tens of thousands of frames decoded just to draw 1360 points),
+///   we jump to evenly spaced positions across the file and decode only short
+///   windows around each jump. Cost becomes O(target × window), independent
+///   of duration. Symphonia's MP3 demuxer seeks by bisection over the raw
+///   stream without decoding, so each jump is nearly free.
+///
+/// Both paths are additionally bounded by `budget_bytes` of consumed input
+/// and by [`ENVELOPE_MAX_FRAMES`] decoded frames, so a pathological file can
+/// never spin the preview worker forever.
 pub fn load_audio_envelope(path: &Path, target_frames: usize, budget_bytes: u64) -> Result<(Envelope, u32)> {
     let target = target_frames.max(1);
     let budget = budget_bytes.max(1 << 16);
     let ext = path.extension().and_then(|e| e.to_str()).map(|e| e.to_lowercase()).unwrap_or_default();
     let (mut env, sr) = match ext.as_str() {
         "wav" => envelope_from_hound(path, target, budget)?,
-        _ => envelope_with_symphonia(path, target, budget)?,
+        _ => envelope_seek_sampled(path, target, budget)?,
     };
     pad_envelope_to(&mut env, target);
     Ok((env, sr))
@@ -473,11 +476,30 @@ impl symphonia::core::io::MediaSource for MeteredFile {
     }
 }
 
-fn envelope_with_symphonia(path: &Path, target_frames: usize, budget_bytes: u64) -> Result<(Envelope, u32)> {
-    use symphonia::core::audio::SampleBuffer;
-    use symphonia::core::codecs::DecoderOptions;
-    use symphonia::core::errors::Error;
-    use symphonia::core::formats::FormatOptions;
+/// Frames decoded per envelope point when seek-sampling a compressed file.
+///
+/// One MP3 frame ≈ 26 ms @ 44.1 kHz ≈ 1152 frames, so 2048 covers at least a
+/// full packet around every seek target even with codec priming/skip delay.
+/// Total decode work is `target × WINDOW` frames — constant with respect to
+/// file duration (≈2.8 M frames for a 1360-point thumbnail, i.e. ~1 minute of
+/// audio regardless of whether the file lasts 3 minutes or 3 hours).
+const SEEK_WINDOW_FRAMES: usize = 2048;
+
+/// Seek-sampled envelope extraction for compressed formats (MP3, OGG, ...).
+///
+/// Why streaming decode was too slow for MP3: the only way to reduce an MP3
+/// is to decode it, and a full streaming pass costs O(duration). WAV avoids
+/// this because PCM can be *read* without decoding; compressed files need a
+/// different trick — we jump (via container seeks) to evenly spaced targets
+/// across the timeline and decode only [`SEEK_WINDOW_FRAMES`] around each
+/// jump. That yields one real min/max point per envelope slot while touching
+/// only a tiny slice of the stream.
+///
+/// Falls back to a bounded sequential pass when the stream turns out to be
+/// non-seekable or seeking produces no usable data (broken index, exotic
+/// container).
+fn envelope_seek_sampled(path: &Path, target_frames: usize, budget_bytes: u64) -> Result<(Envelope, u32)> {
+    use symphonia::core::formats::{FormatOptions, SeekMode};
     use symphonia::core::io::MediaSourceStream;
     use symphonia::core::meta::MetadataOptions;
     use symphonia::core::probe::Hint;
@@ -496,9 +518,182 @@ fn envelope_with_symphonia(path: &Path, target_frames: usize, budget_bytes: u64)
         .ok_or_else(|| AudioIoError::DecodeError("No audio track found".to_string()))?;
 
     let track_id = track.id;
-    let sample_rate = track.codec_params.sample_rate.unwrap_or(44100);
-    let ch = track.codec_params.channels.map(|c| c.count()).unwrap_or(1).max(1);
-    let total_frames_hint = track.codec_params.n_frames.unwrap_or(0) as usize;
+    let params = track.codec_params.clone();
+    let sample_rate = params.sample_rate.unwrap_or(44100).max(1);
+    let ch = params.channels.map(|c| c.count()).unwrap_or(1).max(1);
+
+    // Whether the *underlying file* supports seeking. Symphonia's MP3 demuxer
+    // uses `SeekMode::Coarse` to estimate a byte position from the timestamp
+    // and jump there directly (parsing only a handful of frame headers on the
+    // way); with a non-seekable source it would have to scan linearly, so in
+    // that case we stay on the bounded sequential path instead.
+    let seekable = std::fs::metadata(path).map(|m| m.len() > 0).unwrap_or(false);
+    let total_frames = params.n_frames.unwrap_or(0) as usize;
+
+    // Sequential fallback conditions: no seeking possible, or no known length
+    // to build a seek plan from, or the file is short enough that a single
+    // linear pass is cheaper than ~target random jumps anyway.
+    if !seekable || total_frames == 0 || total_frames <= target_frames * SEEK_WINDOW_FRAMES {
+        return envelope_sequential_symphonia(&mut format, track_id, &params, sample_rate, ch, target_frames, budget_bytes);
+    }
+
+    let block = (total_frames / target_frames).max(1);
+    let mut env = envelope_by_seeks(&mut format, track_id, &params, ch, target_frames, block, budget_bytes, &src_pos, SeekMode::Coarse);
+
+    // Did the seek plan actually produce real audio data anywhere? If not
+    // (broken index, unsupported seek behaviour), fall back to the bounded
+    // sequential reader instead of shipping an all-silence thumbnail.
+    let has_data = env.lo.iter().zip(env.hi.iter()).any(|(l, h)| {
+        l.iter().zip(h.iter()).any(|(&lo, &hi)| lo < 0.0 || hi > 0.0)
+    });
+    if !has_data {
+        let (fallback, _) = envelope_sequential_symphonia(&mut format, track_id, &params, sample_rate, ch, target_frames, budget_bytes)?;
+        if fallback.frames > env.frames {
+            env = fallback;
+        }
+    }
+
+    Ok((env, sample_rate))
+}
+
+/// Builds the envelope by jumping to `target` evenly spaced frame positions
+/// and decoding a small window at each one. Envelope slot `i` receives the
+/// min/max of the window starting at frame `i * block`, which matches the
+/// fixed-block layout the renderer expects.
+fn envelope_by_seeks(
+    format: &mut Box<dyn symphonia::core::formats::FormatReader>,
+    track_id: u32,
+    params: &symphonia::core::codecs::CodecParameters,
+    ch: usize,
+    target: usize,
+    block: usize,
+    budget_bytes: u64,
+    src_pos: &Arc<std::sync::atomic::AtomicU64>,
+    mode: symphonia::core::formats::SeekMode,
+) -> Envelope {
+    use symphonia::core::audio::SampleBuffer;
+    use symphonia::core::codecs::DecoderOptions;
+    use symphonia::core::errors::Error;
+    use symphonia::core::formats::SeekTo;
+
+    let mut lo: Vec<Vec<f32>> = (0..ch).map(|_| vec![0.0f32; target]).collect();
+    let mut hi: Vec<Vec<f32>> = (0..ch).map(|_| vec![0.0f32; target]).collect();
+
+    let mut decoder = match symphonia::default::get_codecs().make(params, &DecoderOptions::default()) {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::debug!("Codec init failed in seek sampler: {}", e);
+            return Envelope { channels: ch, frames: target, lo, hi };
+        }
+    };
+
+    let mut budget = Budget::new(budget_bytes);
+    let mut sample_buf: Option<SampleBuffer<f32>> = None;
+
+    for i in 0..target {
+        // Hard stop if the overall decode budget ran out in earlier slots:
+        // remaining envelope points stay flat (padded silence).
+        if budget.exhausted() || budget.seen >= ENVELOPE_MAX_FRAMES as u64 {
+            break;
+        }
+        let start_frame = i.saturating_mul(block) as u64;
+        let to = SeekTo::TimeStamp { ts: start_frame, track_id };
+        if format.seek(mode, to).is_err() {
+            // Seeking broke mid-plan: keep the points collected so far and
+            // let the caller decide whether to fall back.
+            break;
+        }
+        // Reset the decoder at each jump so priming/delay samples from the
+        // previous window don't leak into this one.
+        let _ = decoder.reset();
+
+        let mut got = 0usize; // interleaved samples collected for this slot
+        while got < ch * SEEK_WINDOW_FRAMES {
+            let packet = match format.next_packet() {
+                Ok(p) => p,
+                Err(_) => break,
+            };
+            if packet.track_id() != track_id {
+                continue;
+            }
+            match decoder.decode(&packet) {
+                Ok(audio_buf) => {
+                    if sample_buf.is_none() {
+                        let spec = *audio_buf.spec();
+                        let cap = audio_buf.capacity() as u64;
+                        sample_buf = Some(SampleBuffer::<f32>::new(cap, spec));
+                    }
+                    if let Some(buf) = &mut sample_buf {
+                        buf.copy_interleaved_ref(audio_buf);
+                        let s = buf.samples();
+                        let take = (ch * SEEK_WINDOW_FRAMES - got).min(s.len());
+                        fold_window(s, take, ch, i, &mut lo, &mut hi);
+                        got += take;
+                    }
+                }
+                Err(Error::DecodeError(_)) => continue,
+                Err(_) => break,
+            }
+            if got + ch * SEEK_WINDOW_FRAMES >= ENVELOPE_MAX_FRAMES {
+                break;
+            }
+        }
+
+        // Account the *compressed* bytes this window actually consumed. The
+        // metered source reports its current position; a forward-only stretch
+        // of reads adds `pos - last_pos`, while the next seek rewinds below
+        // `last_pos` — that rewind is not real read traffic, so we clamp it
+        // out (`add_until` ignores non-monotonic positions) and keep the
+        // watermark. This makes the byte budget bound genuine I/O only, and
+        // because the per-slot work is already constant, total consumption is
+        // O(target × window bytes) — independent of file duration.
+        let pos = src_pos.load(std::sync::atomic::Ordering::Relaxed);
+        budget.add_until(pos);
+    }
+
+    Envelope { channels: ch, frames: target, lo, hi }
+}
+
+/// Folds one decoded window into envelope slot `i` (per-channel min/max).
+#[inline]
+fn fold_window(samples: &[f32], len: usize, ch: usize, slot: usize, lo: &mut [Vec<f32>], hi: &mut [Vec<f32>]) {
+    let n = ch.min(8);
+    let mut mins = [f32::INFINITY; 8];
+    let mut maxs = [f32::NEG_INFINITY; 8];
+    for frame in samples[..len].chunks(ch) {
+        for c in 0..n {
+            let s = frame[c];
+            mins[c] = mins[c].min(s);
+            maxs[c] = maxs[c].max(s);
+        }
+    }
+    for c in 0..ch {
+        let (mn, mx) = (mins[c % 8], maxs[c % 8]);
+        if mn <= mx {
+            // NaN-safe: only overwrite the flat default when real data arrived.
+            lo[c][slot] = lo[c][slot].min(mn);
+            hi[c][slot] = hi[c][slot].max(mx);
+        }
+    }
+}
+
+/// Bounded sequential decode → envelope. Used as the fallback for
+/// non-seekable streams and as the fast path for short compressed files
+/// where seeking would cost more than simply reading through.
+fn envelope_sequential_symphonia(
+    format: &mut Box<dyn symphonia::core::formats::FormatReader>,
+    track_id: u32,
+    params: &symphonia::core::codecs::CodecParameters,
+    sample_rate: u32,
+    ch: usize,
+    target_frames: usize,
+    budget_bytes: u64,
+) -> Result<(Envelope, u32)> {
+    use symphonia::core::audio::SampleBuffer;
+    use symphonia::core::codecs::DecoderOptions;
+    use symphonia::core::errors::Error;
+
+    let total_frames_hint = params.n_frames.unwrap_or(0) as usize;
     let block = if total_frames_hint > 0 {
         (total_frames_hint / target_frames).max(1)
     } else {
@@ -507,7 +702,7 @@ fn envelope_with_symphonia(path: &Path, target_frames: usize, budget_bytes: u64)
     };
 
     let mut decoder = symphonia::default::get_codecs()
-        .make(&track.codec_params, &DecoderOptions::default())
+        .make(params, &DecoderOptions::default())
         .map_err(|e| AudioIoError::DecodeError(format!("Codec init failed: {}", e)))?;
 
     let mut acc = EnvAccum::new(ch, block);
@@ -539,13 +734,10 @@ fn envelope_with_symphonia(path: &Path, target_frames: usize, budget_bytes: u64)
             Err(_) => continue,
         }
 
-        // Stop as soon as the byte budget (or the absolute frame cap) is hit:
-        // a preview must never decode a whole multi-hundred-megabyte file, and
-        // a damaged stream that keeps yielding packets must not keep this
-        // worker — and every preview queued behind it — busy forever. The
-        // read position of the metered source tells us exactly how many input
-        // bytes the demuxer has consumed so far.
-        budget.add_until(src_pos.load(std::sync::atomic::Ordering::Relaxed));
+        // Rough input-byte accounting: decoded f32 bytes plus per-packet
+        // overhead. Keeps the fallback bounded without instrumenting every
+        // read of the source.
+        budget.add(4096);
         if budget.exhausted() || acc.frames_in() >= ENVELOPE_MAX_FRAMES {
             break;
         }
