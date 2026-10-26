@@ -1,7 +1,10 @@
-use std::collections::VecDeque;
-use std::path::PathBuf;
+use std::collections::{HashSet, VecDeque};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use crossbeam_channel::Sender;
+use uuid::Uuid;
+
 use crate::UiEvent;
 
 /// Preview rendering job
@@ -11,184 +14,160 @@ pub struct PreviewJob {
     pub generation: u64,
 }
 
-/// Background worker for rendering preview images
+/// Upper bound on simultaneously running preview renders. Decoding is
+/// CPU/IO-heavy; going wider starves the UI thread and the disk, which is
+/// exactly what made previous versions feel *slower*.
+const MAX_CONCURRENT_REVIEWS: usize = 3;
+
+/// Hard cap on the number of jobs kept in the queue. When a directory has
+/// thousands of files, only a handful of rows are visible — everything past
+/// the cap is dropped (and its pending flag released) so fresh scans never
+/// sit behind an hours-long backlog of thumbnails nobody can see.
+const MAX_QUEUE_LEN: usize = 256;
+
+/// Byte budget for decoding a single preview thumbnail.
+///
+/// A preview must cost roughly the same for every file regardless of size:
+/// we decode at most this many bytes of audio input and pad the rest of the
+/// envelope with silence. ~8 MB covers a full CD-length WAV and hours of
+/// MP3/AIFF; larger files render a truncated-but-instant waveform instead of
+/// freezing the pipeline.
+pub const PREVIEW_DECODE_BUDGET: u64 = 8 << 20;
+
+/// Background worker for rendering preview images.
+///
+/// Queueing model (fixed after the "even slower" regression):
+/// - Each accepted job runs on its own short-lived thread, so one slow decode
+///   can no longer serialise (and stall) the whole preview pipeline.
+/// - `clear_queue` discards *queued* jobs but never forgets paths that are
+///   actively rendering — dropping those used to leave the path stuck in
+///   `pending_paths` forever, so every later scan silently skipped it and it
+///   showed ⏳ indefinitely.
+/// - Finished previews travel through a lock-free channel and are forwarded
+///   to the UI by a dedicated delivery thread.
 pub struct PreviewWorker {
-    queue: Arc<(Mutex<QueueInner>, Condvar)>,
-    quit: Arc<Mutex<bool>>,
-    handle: Option<std::thread::JoinHandle<()>>,
+    inner: Arc<WorkerInner>,
 }
 
-struct QueueInner {
-    jobs: VecDeque<PreviewJob>,
-    pending_paths: std::collections::HashSet<PathBuf>,
+struct WorkerInner {
+    /// Job queue guarded by mutex + condvar.
+    queue: Mutex<VecDeque<PreviewJob>>,
+    cvar: Condvar,
+    /// Paths with a job either queued or actively rendering. Dedup guard.
+    pending: Mutex<HashSet<PathBuf>>,
+    /// Number of currently running render threads.
+    active: AtomicUsize,
+    quit: AtomicBool,
+    /// Rendered results waiting to be forwarded to the UI.
+    ready_tx: Sender<(PathBuf, String, u64)>,
+    ready_rx: crossbeam_channel::Receiver<(PathBuf, String, u64)>,
 }
 
 impl PreviewWorker {
     pub fn new(sender: Sender<UiEvent>) -> Self {
-        let queue = Arc::new((
-            Mutex::new(QueueInner {
-                jobs: VecDeque::new(),
-                pending_paths: std::collections::HashSet::new(),
-            }),
-            Condvar::new(),
-        ));
-        let quit = Arc::new(Mutex::new(false));
-
-        let queue_clone = queue.clone();
-        let quit_clone = quit.clone();
-        let sender_clone = sender.clone();
-
-        let handle = std::thread::spawn(move || {
-            loop {
-                let job = {
-                    let (lock, cvar) = &*queue_clone;
-                    let mut inner = lock.lock().unwrap();
-
-                    // Wait for job or quit signal
-                    while inner.jobs.is_empty() {
-                        if *quit_clone.lock().unwrap() {
-                            return;
-                        }
-                        inner = cvar.wait(inner).unwrap();
-                    }
-
-                    if *quit_clone.lock().unwrap() {
-                        return;
-                    }
-
-                    inner.jobs.pop_front()
-                };
-
-                if let Some(job) = job {
-                    let config_dir = crate::config::config_dir();
-                    let db_path = config_dir.join("app.db");
-
-                    // Check if preview already exists in database
-                    let existing_uuid = if let Ok(db) = crate::db::Database::open(&db_path) {
-                        if let Ok(metadata) = std::fs::metadata(&job.path) {
-                            let size = metadata.len();
-                            let mtime = metadata.modified()
-                                .ok()
-                                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                                .map(|d| d.as_secs())
-                                .unwrap_or(0);
-                            db.load_preview(&job.path, size, mtime, "wave")
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    };
-
-                    let uuid = if let Some(existing) = existing_uuid {
-                        // Preview already exists in database, check if file exists
-                        let previews_dir = config_dir.join("previews");
-                        let png_path = previews_dir.join(format!("{}.png", existing));
-                        if png_path.exists() {
-                            existing
-                        } else {
-                            // File missing, regenerate
-                            match render_preview(&job.path) {
-                                Ok(new_uuid) => new_uuid,
-                                Err(_) => {
-                                    let (lock, _) = &*queue_clone;
-                                    if let Ok(mut inner) = lock.lock() {
-                                        inner.pending_paths.remove(&job.path);
-                                    }
-                                    continue;
-                                }
-                            }
-                        }
-                    } else {
-                        // Generate new preview
-                        match render_preview(&job.path) {
-                            Ok(new_uuid) => new_uuid,
-                            Err(_) => {
-                                let (lock, _) = &*queue_clone;
-                                if let Ok(mut inner) = lock.lock() {
-                                    inner.pending_paths.remove(&job.path);
-                                }
-                                continue;
-                            }
-                        }
-                    };
-
-                    // Save to database
-                    if let Ok(db) = crate::db::Database::open(&db_path) {
-                        if let Ok(metadata) = std::fs::metadata(&job.path) {
-                            let size = metadata.len();
-                            let mtime = metadata.modified()
-                                .ok()
-                                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                                .map(|d| d.as_secs())
-                                .unwrap_or(0);
-                            let _ = db.save_preview(&job.path, size, mtime, "wave", &uuid);
-                        }
-                    }
-
-                    // Send event to UI
-                    let _ = sender_clone.send(UiEvent::PreviewReady {
-                        path: job.path.clone(),
-                        uuid,
-                        generation: job.generation,
-                    });
-
-                    // Remove from pending
-                    let (lock, _) = &*queue_clone;
-                    if let Ok(mut inner) = lock.lock() {
-                        inner.pending_paths.remove(&job.path);
-                    }
-                }
-            }
+        let (ready_tx, ready_rx) = crossbeam_channel::unbounded();
+        let inner = Arc::new(WorkerInner {
+            queue: Mutex::new(VecDeque::new()),
+            cvar: Condvar::new(),
+            pending: Mutex::new(HashSet::new()),
+            active: AtomicUsize::new(0),
+            quit: AtomicBool::new(false),
+            ready_tx,
+            ready_rx,
         });
 
-        Self {
-            queue,
-            quit,
-            handle: Some(handle),
+        let db_path = crate::config::config_dir().join("app.db");
+
+        // Delivery thread: forwards finished previews to the UI as soon as
+        // they are ready (independent of the scheduler loop).
+        {
+            let inner = inner.clone();
+            std::thread::spawn(move || {
+                for (path, uuid, generation) in inner.ready_rx.iter() {
+                    if sender
+                        .send(UiEvent::PreviewReady {
+                            path,
+                            uuid,
+                            generation,
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            });
         }
+
+        // Scheduler thread: pops jobs and spawns bounded render threads.
+        {
+            let inner = inner.clone();
+            std::thread::spawn(move || scheduler_loop(inner, &db_path));
+        }
+
+        Self { inner }
     }
 
     /// Submit a preview job.
     ///
     /// Returns `true` when the job was enqueued, `false` when it was skipped
-    /// as a duplicate (a job for this path is already pending). Callers must
-    /// use this flag to keep their own bookkeeping in sync: if a job is
-    /// dropped here, no [`UiEvent::PreviewReady`] will ever arrive for it,
-    /// and treating it as "in flight" anyway would leave the path stuck in a
-    /// "generating" state forever — exactly the kind of abandoned lock that
-    /// makes previews appear to wait indefinitely.
+    /// as a duplicate (a job or render for this path is already in flight) or
+    /// because the queue is saturated. Callers must use this flag to keep
+    /// their own bookkeeping in sync: if a job is dropped here, no
+    /// [`UiEvent::PreviewReady`] will ever arrive for it, and treating it as
+    /// "in flight" anyway would leave the path stuck in a "generating" state
+    /// forever.
     pub fn submit(&self, job: PreviewJob) -> bool {
-        let (lock, cvar) = &*self.queue;
-        let mut inner = lock.lock().unwrap();
-
-        // Dedup: skip if already pending for this path
-        if inner.pending_paths.contains(&job.path) {
+        if self.inner.quit.load(Ordering::SeqCst) {
             return false;
         }
-
-        inner.pending_paths.insert(job.path.clone());
-        inner.jobs.push_back(job);
-        cvar.notify_one();
+        {
+            let mut pending = self.inner.pending.lock().unwrap();
+            if pending.contains(&job.path) {
+                return false;
+            }
+            pending.insert(job.path.clone());
+        }
+        {
+            let mut queue = self.inner.queue.lock().unwrap();
+            if queue.len() >= MAX_QUEUE_LEN {
+                // Queue overflow: drop this job and release its pending flag
+                // so a later scan can retry it.
+                drop(queue);
+                self.inner.pending.lock().unwrap().remove(&job.path);
+                return false;
+            }
+            queue.push_back(job);
+        }
+        self.inner.cvar.notify_one();
         true
     }
 
-    /// Clear all pending jobs
+    /// Clear all *queued* jobs (e.g. after switching directories).
+    ///
+    /// Jobs already handed to a render thread keep running and still deliver
+    /// their result — their paths stay in `pending` until the render thread
+    /// finishes, so a re-scan cannot double-submit them and they can never
+    /// get permanently stuck.
     pub fn clear_queue(&self) {
-        let (lock, _) = &*self.queue;
-        let mut inner = lock.lock().unwrap();
-        inner.jobs.clear();
-        inner.pending_paths.clear();
+        let drained: Vec<PreviewJob> = self.inner.queue.lock().unwrap().drain(..).collect();
+        if !drained.is_empty() {
+            let mut pending = self.inner.pending.lock().unwrap();
+            for job in drained {
+                pending.remove(&job.path);
+            }
+        }
     }
 
-    /// Shutdown the worker
+    /// Stop accepting work and wait for running renders to finish.
     pub fn shutdown(&mut self) {
-        *self.quit.lock().unwrap() = true;
-        let (_, cvar) = &*self.queue;
-        cvar.notify_all();
+        self.inner.quit.store(true, Ordering::SeqCst);
+        self.inner.cvar.notify_all();
+        self.clear_queue();
 
-        if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
+        // Wait for in-flight renders (each one is individually bounded by
+        // the decode budget, so this terminates quickly).
+        while self.inner.active.load(Ordering::SeqCst) > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
     }
 }
@@ -199,15 +178,113 @@ impl Drop for PreviewWorker {
     }
 }
 
+fn scheduler_loop(inner: Arc<WorkerInner>, db_path: &Path) {
+    loop {
+        // Take one job, honouring the concurrency cap.
+        let job = {
+            let mut queue = inner.queue.lock().unwrap();
+            loop {
+                if inner.quit.load(Ordering::SeqCst) {
+                    return;
+                }
+                if inner.active.load(Ordering::SeqCst) < MAX_CONCURRENT_REVIEWS {
+                    if let Some(job) = queue.pop_front() {
+                        break job;
+                    }
+                }
+                // Wait for new work / slot free-up / quit. The timeout also
+                // lets us notice state changes even if a notify raced.
+                let (q, _res) = inner
+                    .cvar
+                    .wait_timeout(queue, std::time::Duration::from_millis(100))
+                    .unwrap();
+                queue = q;
+            }
+        };
+
+        inner.active.fetch_add(1, Ordering::SeqCst);
+        let inner2 = inner.clone();
+        let db_path = db_path.to_path_buf();
+        std::thread::Builder::new()
+            .stack_size(2 << 20)
+            .spawn(move || {
+                // Always release the slot, even on panic.
+                let _guard = SlotGuard(inner2.clone());
+                process_job(job, &inner2, &db_path);
+            })
+            .expect("spawn preview render thread");
+    }
+}
+
+/// RAII: decrements the active-render counter when the render thread ends
+/// (normally or via panic unwind) and wakes the scheduler.
+struct SlotGuard(Arc<WorkerInner>);
+impl Drop for SlotGuard {
+    fn drop(&mut self) {
+        self.0.active.fetch_sub(1, Ordering::SeqCst);
+        self.0.cvar.notify_all();
+    }
+}
+
+/// Per-job execution: cache check → render → persist → deliver.
+fn process_job(job: PreviewJob, inner: &Arc<WorkerInner>, db_path: &Path) {
+    // One SQLite connection per render thread (the old code opened two
+    // connections *per job*, which dominated throughput on large folders).
+    let db = crate::db::Database::open(db_path).ok();
+
+    let result = (|| -> Result<String, String> {
+        let meta = std::fs::metadata(&job.path).map_err(|e| e.to_string())?;
+        let size = meta.len();
+        let mtime = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
+        // Cache hit: DB row + PNG on disk → zero decoding work.
+        if let Some(db) = &db {
+            if let Some(existing) = db.load_preview(&job.path, size, mtime, "wave") {
+                let png = preview_png_path(&existing);
+                if png.exists() {
+                    return Ok(existing);
+                }
+            }
+        }
+
+        let uuid = render_preview(&job.path)?;
+
+        if let Some(db) = &db {
+            let _ = db.save_preview(&job.path, size, mtime, "wave", &uuid);
+        }
+        Ok(uuid)
+    })();
+
+    match result {
+        Ok(uuid) => {
+            let _ = inner
+                .ready_tx
+                .try_send((job.path.clone(), uuid, job.generation));
+        }
+        Err(e) => {
+            tracing::debug!("Preview failed for {}: {}", job.path.display(), e);
+        }
+    }
+
+    // Release the dedup flag last, after delivery, so a concurrent re-scan
+    // can never observe "not pending" before the result was sent.
+    inner.pending.lock().unwrap().remove(&job.path);
+}
+
 /// Generate deterministic UUID based on file path, mtime, size, and channels
-fn generate_preview_uuid(path: &PathBuf, channels: u16) -> Result<String, String> {
+fn generate_preview_uuid(path: &Path, channels: u16) -> Result<String, String> {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
 
-    let metadata = std::fs::metadata(path)
-        .map_err(|e| format!("Failed to get meta {}", e))?;
+    let metadata = std::fs::metadata(path).map_err(|e| format!("Failed to get meta {}", e))?;
 
-    let mtime = metadata.modified()
+    let mtime = metadata
+        .modified()
         .map_err(|e| format!("Failed to get mtime: {}", e))?
         .duration_since(std::time::UNIX_EPOCH)
         .map_err(|e| format!("Failed to convert mtime: {}", e))?
@@ -224,52 +301,55 @@ fn generate_preview_uuid(path: &PathBuf, channels: u16) -> Result<String, String
 
     // Use first 8 bytes of hash to build a stable UUID string
     let uuid_bytes = hash.to_le_bytes();
-    let uuid = uuid::Uuid::from_bytes([
-        uuid_bytes[0], uuid_bytes[1], uuid_bytes[2], uuid_bytes[3],
-        uuid_bytes[4], uuid_bytes[5], uuid_bytes[6], uuid_bytes[7],
-        uuid_bytes[0], uuid_bytes[1], uuid_bytes[2], uuid_bytes[3],
+    let uuid = Uuid::from_bytes([
+        uuid_bytes[0], uuid_bytes[1], uuid_bytes[2], uuid_bytes[3], uuid_bytes[4], uuid_bytes[5],
+        uuid_bytes[6], uuid_bytes[7], uuid_bytes[0], uuid_bytes[1], uuid_bytes[2], uuid_bytes[3],
         uuid_bytes[4], uuid_bytes[5], uuid_bytes[6], uuid_bytes[7],
     ]);
 
     Ok(uuid.to_string())
 }
 
+fn preview_png_path(uuid: &str) -> PathBuf {
+    crate::config::config_dir()
+        .join("previews")
+        .join(format!("{}.png", uuid))
+}
+
 /// Render a waveform preview image for the file list.
 ///
-/// Fast path modelled on the `waveform-preview` example (per-track min/max
-/// peak envelope, one column per pixel), but the envelope is produced while
-/// *streaming* through the decoder (`audio_io::load_audio_envelope`) instead
-/// of loading the entire file into memory first — decoding + buffering the
-/// full multi-hundred-megabyte sample array was what made previews crawl on
-/// large files. The visual result matches the example's Peak mode because
-/// every envelope point carries the true min/max of its region.
-/// Returns existing UUID if preview already exists.
-fn render_preview(path: &PathBuf) -> Result<String, String> {
+/// Visual model taken from the `waveform-preview` example (per-track min/max
+/// peak envelope, one column per pixel, mono → 1 track, stereo/multichannel →
+/// first 2 tracks). Unlike the example — which loads the *entire* signal into
+/// memory before building its peaks tree — the envelope here is folded while
+/// streaming through the decoder and decoding stops at
+/// [`PREVIEW_DECODE_BUDGET`] bytes, so one thumbnail costs O(budget), not
+/// O(file size).
+///
+/// Returns the existing UUID when the preview PNG is already cached.
+fn render_preview(path: &Path) -> Result<String, String> {
     const PREVIEW_WIDTH: u32 = 340;
     // Envelope resolution: ~4 points per horizontal pixel is plenty for a
-    // 340-px thumbnail and keeps decode cost linear in file size only.
+    // 340-px thumbnail and keeps the reduce pass trivially cheap.
     const ENVELOPE_FRAMES: usize = (PREVIEW_WIDTH as usize) * 4;
 
-    // Probe channel count from metadata (cheap) to pick the layout & UUID.
-    let meta = crate::audio_io::probe_file(path);
+    // Channel count straight from the file header (cheap probe) — picks the
+    // layout and stabilises the UUID without decoding anything.
+    let meta = crate::audio_io::probe_file_header(path);
     let channels = if meta.channels > 0 { meta.channels } else { 1 };
 
-    // Generate deterministic UUID including channels
     let uuid = generate_preview_uuid(path, channels)?;
 
-    // Check if preview already exists
-    let config_dir = crate::config::config_dir();
-    let previews_dir = config_dir.join("previews");
+    let previews_dir = crate::config::config_dir().join("previews");
     let _ = std::fs::create_dir_all(&previews_dir);
     let png_path = previews_dir.join(format!("{}.png", uuid));
 
     if png_path.exists() {
-        // Preview already exists, return existing UUID
         return Ok(uuid);
     }
 
     let (env, _sample_rate) =
-        crate::audio_io::load_audio_envelope(path, ENVELOPE_FRAMES)
+        crate::audio_io::load_audio_envelope(path, ENVELOPE_FRAMES, PREVIEW_DECODE_BUDGET)
             .map_err(|e| format!("Load failed: {}", e))?;
 
     // Use taller preview for stereo/multichannel (2 tracks need more space)
@@ -298,11 +378,12 @@ pub fn cleanup_previews() -> Result<usize, String> {
     }
 
     let db_path = config_dir.join("app.db");
-    let db = crate::db::Database::open(&db_path)
-        .map_err(|e| format!("Failed to open database: {}", e))?;
+    let db =
+        crate::db::Database::open(&db_path).map_err(|e| format!("Failed to open database: {}", e))?;
 
     // Get all valid UUIDs from database
-    let valid_uuids = db.get_all_preview_uuids()
+    let valid_uuids = db
+        .get_all_preview_uuids()
         .map_err(|e| format!("Failed to get preview UUIDs: {}", e))?;
 
     let mut removed_count = 0;

@@ -5,6 +5,7 @@ pub mod ffmpeg;
 
 use crate::{AudioMeta, ProbeStatus, SampleType};
 use std::path::Path;
+use std::sync::Arc;
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -180,41 +181,141 @@ impl EnvAccum {
     }
 }
 
-/// Hard cap for a single envelope decode.
-///
-/// A damaged stream (or an endless source) must never stall the preview
-/// pipeline forever: once we have folded this many frames into the envelope
-/// we stop reading and render what we have. At typical thumbnail resolutions
-/// the cap corresponds to many hours of audio, so valid files are unaffected.
+/// Absolute ceiling on the number of decoded frames a single preview may
+/// consume. It exists purely as a safety net against endless/corrupt streams;
+/// normal files are bounded by the byte budget below long before this kicks in.
 const ENVELOPE_MAX_FRAMES: usize = 200_000_000;
 
-/// Decodes `path` and reduces it to a per-channel min/max envelope with
-/// roughly `target_frames` points per channel, streaming through the decoder.
+/// Decodes `path` and reduces it to a per-channel min/max envelope for a
+/// file-list preview thumbnail.
 ///
-/// Fast path modelled on the `waveform-preview` example: a ~340-px thumbnail
-/// needs only a few hundred envelope points per track, so we fold peaks while
-/// reading instead of buffering hundreds of megabytes of samples.
+/// Performance model (this is what replaced the old "decode the whole file,
+/// then downsample" behaviour that made large previews crawl):
+/// - **One pass over the data.** Peaks are folded into the envelope *while
+///   decoding*; the full sample array is never materialised.
+/// - **Fixed-size blocks.** The envelope has exactly `target_frames` points
+///   per channel regardless of file length, so rendering cost does not grow
+///   with duration.
+/// - **Byte budget.** Decoding stops after [`PREVIEW_DECODE_BUDGET`] bytes of
+/// *compressed* input have been consumed; the remainder of the envelope is
+///   padded flat. A preview therefore costs roughly the same for a 3-minute
+///   MP3 and a 2-hour WAV instead of scaling linearly with file size.
 ///
-/// Every code path below is *bounded*: the loops stop at end-of-stream, on
-/// the first decode error, or at [`ENVELOPE_MAX_FRAMES`] — there is no
-/// unbounded "keep waiting" state that could make preview generation hang
-/// indefinitely behind a stuck reader.
-pub fn load_audio_envelope(path: &Path, target_frames: usize) -> Result<(Envelope, u32)> {
+/// All code paths are bounded: loops stop at end-of-stream, on the first
+/// decode error, at the byte budget, or at [`ENVELOPE_MAX_FRAMES`] — there is
+/// no unbounded "keep waiting" state that could stall the preview queue.
+pub fn load_audio_envelope(path: &Path, target_frames: usize, budget_bytes: u64) -> Result<(Envelope, u32)> {
+    let target = target_frames.max(1);
+    let budget = budget_bytes.max(1 << 16);
     let ext = path.extension().and_then(|e| e.to_str()).map(|e| e.to_lowercase()).unwrap_or_default();
-    match ext.as_str() {
-        "wav" => envelope_from_hound(path, target_frames.max(1)),
-        _ => envelope_with_symphonia(path, target_frames.max(1)),
+    let (mut env, sr) = match ext.as_str() {
+        "wav" => envelope_from_hound(path, target, budget)?,
+        _ => envelope_with_symphonia(path, target, budget)?,
+    };
+    pad_envelope_to(&mut env, target);
+    Ok((env, sr))
+}
+
+/// Cheap header-only probe used by the preview pipeline: reads just enough
+/// of the file to learn the channel count / sample rate. Never decodes audio
+/// data, so it is safe to call before committing to a full envelope pass.
+pub fn probe_file_header(path: &Path) -> AudioMeta {
+    let zero = || AudioMeta {
+        duration_secs: 0.0,
+        sample_rate: 0,
+        channels: 0,
+        sample_type: SampleType::Compressed,
+        comment: None,
+        status: ProbeStatus::Broken,
+    };
+    let ext = path.extension().and_then(|e| e.to_str()).map(|e| e.to_lowercase()).unwrap_or_default();
+    if ext == "wav" {
+        return match hound::WavReader::open(path) {
+            Ok(r) => {
+                let spec = r.spec();
+                AudioMeta {
+                    duration_secs: r.len() as f64 / spec.sample_rate.max(1) as f64,
+                    sample_rate: spec.sample_rate,
+                    channels: spec.channels,
+                    sample_type: match spec.sample_format {
+                        hound::SampleFormat::Float => SampleType::Float32,
+                        hound::SampleFormat::Int => match spec.bits_per_sample {
+                            8 => SampleType::UInt8,
+                            16 => SampleType::Int16,
+                            24 => SampleType::Int24,
+                            32 => SampleType::Int32,
+                            _ => SampleType::Compressed,
+                        },
+                    },
+                    comment: None,
+                    status: ProbeStatus::Ok,
+                }
+            }
+            Err(_) => zero(),
+        };
+    }
+    match probe_with_symphonia(path) {
+        Ok(m) => m,
+        Err(_) => zero(),
     }
 }
 
-fn envelope_from_hound(path: &Path, target_frames: usize) -> Result<(Envelope, u32)> {
-    let reader = hound::WavReader::open(path)
+/// Pads the envelope with flat (silent) points up to exactly `target` frames.
+///
+/// When decoding stopped early because of the byte budget, the waveform is
+/// drawn across the *full* file duration, so the truncated part reads as
+/// silence rather than compressing the visible audio into a fraction of the
+/// width. This also guarantees uniform per-channel lengths.
+fn pad_envelope_to(env: &mut Envelope, target: usize) {
+    for c in 0..env.channels {
+        let cur = env.lo[c].len();
+        if cur < target {
+            env.lo[c].resize(target, 0.0);
+            env.hi[c].resize(target, 0.0);
+        }
+    }
+    env.frames = env.lo.first().map(|v| v.len()).unwrap_or(0);
+}
+
+/// Byte-level progress tracker shared by both envelope readers.
+struct Budget {
+    limit: u64,
+    seen: u64,
+    /// Bytes already accounted for (used by the seekable reader to translate
+    /// absolute positions into increments).
+    last_pos: u64,
+}
+
+impl Budget {
+    fn new(limit: u64) -> Self {
+        Self { limit, seen: 0, last_pos: 0 }
+    }
+    fn exhausted(&self) -> bool {
+        self.seen >= self.limit
+    }
+    fn add(&mut self, delta: u64) {
+        self.seen += delta;
+    }
+    /// Accounts for an absolute stream position (monotonic).
+    fn add_until(&mut self, pos: u64) {
+        if pos > self.last_pos {
+            self.seen += pos - self.last_pos;
+            self.last_pos = pos;
+        }
+    }
+}
+
+fn envelope_from_hound(path: &Path, target_frames: usize, budget_bytes: u64) -> Result<(Envelope, u32)> {
+    let probe = hound::WavReader::open(path)
         .map_err(|e| AudioIoError::DecodeError(format!("WAV open: {}", e)))?;
-    let spec = reader.spec();
+    let spec = probe.spec();
     let ch = spec.channels.max(1) as usize;
-    let total_samples = reader.len() as usize;
+    let total_samples = probe.len() as usize;
+    drop(probe);
+
+    // One envelope point per equal slice of the file; each slice is reduced
+    // from the stream exactly once.
     let block = (total_samples / ch).div_ceil(target_frames).max(1);
-    drop(reader);
 
     // BufReader: hound's WavReader issues one read() per sample otherwise.
     let file = std::io::BufReader::with_capacity(
@@ -226,12 +327,13 @@ fn envelope_from_hound(path: &Path, target_frames: usize) -> Result<(Envelope, u
         .map_err(|e| AudioIoError::DecodeError(format!("WAV open: {}", e)))?;
 
     let mut acc = EnvAccum::new(ch, block);
+    let mut budget = Budget::new(budget_bytes);
     const CHUNK: usize = 1 << 14; // samples per batch
 
     match spec.sample_format {
         hound::SampleFormat::Int => match spec.bits_per_sample {
-            8 | 16 => pump_scaled::<i16>(&mut reader, if spec.bits_per_sample == 8 { 1.0 / 128.0 } else { 1.0 / 32768.0 }, &mut acc),
-            24 | 32 => pump_scaled::<i32>(&mut reader, if spec.bits_per_sample == 24 { 1.0 / 8388608.0 } else { 1.0 / 2147483648.0 }, &mut acc),
+            8 | 16 => pump_scaled::<i16>(&mut reader, if spec.bits_per_sample == 8 { 1.0 / 128.0 } else { 1.0 / 32768.0 }, &mut acc, &mut budget),
+            24 | 32 => pump_scaled::<i32>(&mut reader, if spec.bits_per_sample == 24 { 1.0 / 8388608.0 } else { 1.0 / 2147483648.0 }, &mut acc, &mut budget),
             bits => return Err(AudioIoError::UnsupportedFormat(format!("Unsupported bits: {}", bits))),
         },
         hound::SampleFormat::Float => {
@@ -251,8 +353,9 @@ fn envelope_from_hound(path: &Path, target_frames: usize) -> Result<(Envelope, u
                 if buf.is_empty() {
                     break;
                 }
+                budget.add((buf.len() * (spec.bits_per_sample as usize / 8)) as u64);
                 acc.push(&buf);
-                if buf.len() < CHUNK || acc.frames_in() >= ENVELOPE_MAX_FRAMES {
+                if buf.len() < CHUNK || acc.frames_in() >= ENVELOPE_MAX_FRAMES || budget.exhausted() {
                     break;
                 }
             }
@@ -266,16 +369,19 @@ fn envelope_from_hound(path: &Path, target_frames: usize) -> Result<(Envelope, u
 /// Reads PCM samples in chunks, scales them to f32 and feeds the envelope
 /// accumulator — no full-file buffering anywhere.
 ///
-/// Bounded on three independent conditions: clean end of stream, first
-/// sample-read error, and the [`ENVELOPE_MAX_FRAMES`] safety cap. The old
-/// version silently swallowed errors (`Some(Ok(v)) => …, _ => break` inside
-/// a fixed-size refill was fine, but the outer loop had no frame cap, so a
-/// pathological file could keep the worker busy forever and every later
-/// preview job would appear to "just wait").
-fn pump_scaled<T>(reader: &mut hound::WavReader<std::io::BufReader<std::fs::File>>, scale: f32, acc: &mut EnvAccum)
-where
+/// Bounded on four independent conditions: clean end of stream, first
+/// sample-read error, the byte budget, and the [`ENVELOPE_MAX_FRAMES`] safety
+/// cap. Without these caps a pathological file could keep the worker busy
+/// forever and every later preview job would appear to "just wait".
+fn pump_scaled<T>(
+    reader: &mut hound::WavReader<std::io::BufReader<std::fs::File>>,
+    scale: f32,
+    acc: &mut EnvAccum,
+    budget: &mut Budget,
+) where
     T: hound::Sample + Copy + HoundToFloat,
 {
+    let bytes_per_sample = std::mem::size_of::<T>();
     let mut it = reader.samples::<T>();
     let mut raw: Vec<T> = Vec::with_capacity(1 << 14);
     let mut buf: Vec<f32> = Vec::with_capacity(1 << 14);
@@ -292,9 +398,13 @@ where
         if raw.is_empty() {
             break;
         }
+        budget.add((raw.len() * bytes_per_sample) as u64);
         buf.extend(raw.iter().map(|&v| v.to_f32(scale)));
         acc.push(&buf);
-        if raw.len() < (1 << 14) || acc.frames_in() >= ENVELOPE_MAX_FRAMES {
+        if raw.len() < (1 << 14)
+            || acc.frames_in() >= ENVELOPE_MAX_FRAMES
+            || budget.exhausted()
+        {
             break;
         }
     }
@@ -313,7 +423,57 @@ impl HoundToFloat for i32 {
     fn to_f32(self, scale: f32) -> f32 { self as f32 * scale }
 }
 
-fn envelope_with_symphonia(path: &Path, target_frames: usize) -> Result<(Envelope, u32)> {
+/// Seekable media-source wrapper used to measure how many *input* bytes the
+/// demuxer actually consumed, so the preview can stop after a fixed budget.
+///
+/// The position is updated by the `Read`/`Seek` implementations below and
+/// read back through [`MeteredFile::position`] (shared via `Arc<AtomicU64>`
+/// because symphonia takes ownership of the source).
+struct MeteredFile {
+    file: std::fs::File,
+    len: u64,
+    pos: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl MeteredFile {
+    fn new(path: &Path) -> Result<(Self, Arc<std::sync::atomic::AtomicU64>)> {
+        let file = std::fs::File::open(path)?;
+        let len = file.metadata()?.len();
+        let pos = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        Ok((
+            Self { file, len, pos: pos.clone() },
+            pos,
+        ))
+    }
+}
+
+impl std::io::Read for MeteredFile {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.file.read(buf)?;
+        self.pos.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+        Ok(n)
+    }
+}
+
+impl std::io::Seek for MeteredFile {
+    fn seek(&mut self, from: std::io::SeekFrom) -> std::io::Result<u64> {
+        let np = self.file.seek(from)?;
+        self.pos.store(np, std::sync::atomic::Ordering::Relaxed);
+        Ok(np)
+    }
+}
+
+impl symphonia::core::io::MediaSource for MeteredFile {
+    fn is_seekable(&self) -> bool {
+        true
+    }
+
+    fn byte_len(&self) -> Option<u64> {
+        Some(self.len)
+    }
+}
+
+fn envelope_with_symphonia(path: &Path, target_frames: usize, budget_bytes: u64) -> Result<(Envelope, u32)> {
     use symphonia::core::audio::SampleBuffer;
     use symphonia::core::codecs::DecoderOptions;
     use symphonia::core::errors::Error;
@@ -322,8 +482,8 @@ fn envelope_with_symphonia(path: &Path, target_frames: usize) -> Result<(Envelop
     use symphonia::core::meta::MetadataOptions;
     use symphonia::core::probe::Hint;
 
-    let file = std::fs::File::open(path)?;
-    let mss = MediaSourceStream::new(Box::new(file), Default::default());
+    let (metered, src_pos) = MeteredFile::new(path)?;
+    let mss = MediaSourceStream::new(Box::new(metered), Default::default());
     let mut hint = Hint::new();
     if let Some(ext) = path.extension().and_then(|e| e.to_str()) { hint.with_extension(ext); }
 
@@ -351,6 +511,7 @@ fn envelope_with_symphonia(path: &Path, target_frames: usize) -> Result<(Envelop
         .map_err(|e| AudioIoError::DecodeError(format!("Codec init failed: {}", e)))?;
 
     let mut acc = EnvAccum::new(ch, block);
+    let mut budget = Budget::new(budget_bytes);
     let mut sample_buf: Option<SampleBuffer<f32>> = None;
 
     loop {
@@ -378,11 +539,14 @@ fn envelope_with_symphonia(path: &Path, target_frames: usize) -> Result<(Envelop
             Err(_) => continue,
         }
 
-        // Hard decode cap: a damaged stream that keeps yielding packets must
-        // not keep this worker (and every preview queued behind it) busy
-        // forever. Stop early and render what we have.
-        if acc.frames_in() >= ENVELOPE_MAX_FRAMES {
-            tracing::warn!("Envelope decode capped at {} frames: {}", ENVELOPE_MAX_FRAMES, path.display());
+        // Stop as soon as the byte budget (or the absolute frame cap) is hit:
+        // a preview must never decode a whole multi-hundred-megabyte file, and
+        // a damaged stream that keeps yielding packets must not keep this
+        // worker — and every preview queued behind it — busy forever. The
+        // read position of the metered source tells us exactly how many input
+        // bytes the demuxer has consumed so far.
+        budget.add_until(src_pos.load(std::sync::atomic::Ordering::Relaxed));
+        if budget.exhausted() || acc.frames_in() >= ENVELOPE_MAX_FRAMES {
             break;
         }
     }
