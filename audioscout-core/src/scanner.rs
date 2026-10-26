@@ -1,6 +1,6 @@
 use crate::{table::FileRow, is_audio_file};
 use crossbeam_channel::Sender;
-use crate::UiEvent;
+use crate::{PreviewMode, UiEvent};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;

@@ -5,13 +5,16 @@ use std::sync::{Arc, Condvar, Mutex};
 use crossbeam_channel::Sender;
 use uuid::Uuid;
 
-use crate::UiEvent;
+use crate::{PreviewMode, UiEvent};
 
 /// Preview rendering job
 #[derive(Debug, Clone)]
 pub struct PreviewJob {
     pub path: PathBuf,
     pub generation: u64,
+    /// Thumbnail style to render. The worker renders it into a PNG keyed by
+    /// a mode-specific UUID, so wave and spectrogram caches coexist.
+    pub mode: PreviewMode,
 }
 
 /// Upper bound on simultaneously running preview renders. Decoding is
@@ -244,7 +247,7 @@ fn process_job(job: PreviewJob, inner: &Arc<WorkerInner>, db_path: &Path) {
 
         // Cache hit: DB row + PNG on disk → zero decoding work.
         if let Some(db) = &db {
-            if let Some(existing) = db.load_preview(&job.path, size, mtime, "wave") {
+            if let Some(existing) = db.load_preview(&job.path, size, mtime, job.mode.as_str()) {
                 let png = preview_png_path(&existing);
                 if png.exists() {
                     return Ok(existing);
@@ -252,10 +255,10 @@ fn process_job(job: PreviewJob, inner: &Arc<WorkerInner>, db_path: &Path) {
             }
         }
 
-        let uuid = render_preview(&job.path)?;
+        let uuid = render_preview(&job.path, job.mode)?;
 
         if let Some(db) = &db {
-            let _ = db.save_preview(&job.path, size, mtime, "wave", &uuid);
+            let _ = db.save_preview(&job.path, size, mtime, job.mode.as_str(), &uuid);
         }
         Ok(uuid)
     })();
@@ -276,8 +279,11 @@ fn process_job(job: PreviewJob, inner: &Arc<WorkerInner>, db_path: &Path) {
     inner.pending.lock().unwrap().remove(&job.path);
 }
 
-/// Generate deterministic UUID based on file path, mtime, size, and channels
-fn generate_preview_uuid(path: &Path, channels: u16) -> Result<String, String> {
+/// Generate deterministic UUID based on file path, mtime, size, and channels.
+///
+/// `mode_suffix` distinguishes caches for different preview styles (wave vs
+/// spectrogram) so their PNGs never overwrite each other.
+fn generate_preview_uuid(path: &Path, channels: u16, mode_suffix: &str) -> Result<String, String> {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
 
@@ -297,6 +303,7 @@ fn generate_preview_uuid(path: &Path, channels: u16) -> Result<String, String> {
     mtime.hash(&mut hasher);
     size.hash(&mut hasher);
     channels.hash(&mut hasher); // Include channels in hash
+    mode_suffix.hash(&mut hasher); // …and the preview mode
     let hash = hasher.finish();
 
     // Use first 8 bytes of hash to build a stable UUID string
@@ -327,9 +334,9 @@ fn preview_png_path(uuid: &str) -> PathBuf {
 /// thread issuing queries on a second connection could block behind those
 /// writes and delay the entire `ScanDone` event — which is exactly what made
 /// previews appear in the UI long after the PNGs showed up on disk.
-pub fn cached_preview_png(path: &Path, channels: u16) -> Option<String> {
+pub fn cached_preview_png(path: &Path, channels: u16, mode: PreviewMode) -> Option<String> {
     let channels = if channels > 0 { channels } else { 1 };
-    let uuid = generate_preview_uuid(path, channels).ok()?;
+    let uuid = generate_preview_uuid(path, channels, mode.uuid_suffix()).ok()?;
     if preview_png_path(&uuid).exists() {
         Some(uuid)
     } else {
@@ -337,18 +344,21 @@ pub fn cached_preview_png(path: &Path, channels: u16) -> Option<String> {
     }
 }
 
-/// Render a waveform preview image for the file list.
+/// Render a preview image (waveform or spectrogram) for the file list.
 ///
-/// Visual model taken from the `waveform-preview` example (per-track min/max
-/// peak envelope, one column per pixel, mono → 1 track, stereo/multichannel →
-/// first 2 tracks). Unlike the example — which loads the *entire* signal into
-/// memory before building its peaks tree — the envelope here is folded while
-/// streaming through the decoder and decoding stops at
+/// Waveform visual model taken from the `waveform-preview` example (per-track
+/// min/max peak envelope, one column per pixel, mono → 1 track,
+/// stereo/multichannel → first 2 tracks). Unlike the example — which loads the
+/// *entire* signal into memory before building its peaks tree — the envelope
+/// here is folded while streaming through the decoder and decoding stops at
 /// [`PREVIEW_DECODE_BUDGET`] bytes, so one thumbnail costs O(budget), not
 /// O(file size).
 ///
+/// Spectrogram mode decodes up to the same byte budget and runs a windowed
+/// FFT over the samples (`render::spectrogram`).
+///
 /// Returns the existing UUID when the preview PNG is already cached.
-pub fn render_preview(path: &Path) -> Result<String, String> {
+pub fn render_preview(path: &Path, mode: PreviewMode) -> Result<String, String> {
     const PREVIEW_WIDTH: u32 = 340;
     // Envelope resolution: ~4 points per horizontal pixel is plenty for a
     // 340-px thumbnail and keeps the reduce pass trivially cheap.
@@ -359,7 +369,7 @@ pub fn render_preview(path: &Path) -> Result<String, String> {
     let meta = crate::audio_io::probe_file_header(path);
     let channels = if meta.channels > 0 { meta.channels } else { 1 };
 
-    let uuid = generate_preview_uuid(path, channels)?;
+    let uuid = generate_preview_uuid(path, channels, mode.uuid_suffix())?;
 
     let previews_dir = crate::config::config_dir().join("previews");
     let _ = std::fs::create_dir_all(&previews_dir);
@@ -369,24 +379,58 @@ pub fn render_preview(path: &Path) -> Result<String, String> {
         return Ok(uuid);
     }
 
-    let (env, _sample_rate) =
-        crate::audio_io::envelope::load_audio_envelope(path, ENVELOPE_FRAMES, PREVIEW_DECODE_BUDGET)
+    // Use taller preview for stereo/multichannel (2 tracks need more space)
+    let height = if channels == 1 { 20u32 } else { 40u32 };
+
+    let img = match mode {
+        PreviewMode::Waveform => {
+            let (env, _sample_rate) = crate::audio_io::envelope::load_audio_envelope(
+                path,
+                ENVELOPE_FRAMES,
+                PREVIEW_DECODE_BUDGET,
+            )
             .map_err(|e| format!("Load failed: {}", e))?;
 
-    // Use taller preview for stereo/multichannel (2 tracks need more space)
-    let height = if env.channels == 1 { 20u32 } else { 40u32 };
-
-    let img = crate::render::waveform::render_envelope(
-        &env,
-        PREVIEW_WIDTH,
-        height,
-        crate::render::waveform::Style::Dark,
-    );
+            crate::render::waveform::render_envelope(
+                &env,
+                PREVIEW_WIDTH,
+                height,
+                crate::render::waveform::Style::Dark,
+            )
+        }
+        PreviewMode::Spectrogram => {
+            // The FFT analysis needs real samples, not a min/max envelope.
+            // Decode within the same byte budget used for waveforms; long
+            // files simply get a truncated-but-instant spectrogram.
+            let (samples, _sr, ch, _st) =
+                load_audio_bounded(path, PREVIEW_DECODE_BUDGET as usize * 8)
+                    .map_err(|e| format!("Load failed: {}", e))?;
+            crate::render::spectrogram::render_spectrogram_preview(
+                &samples,
+                if ch > 0 { ch } else { channels },
+                PREVIEW_WIDTH,
+                height,
+            )
+        }
+    };
 
     // Save as PNG
     img.save(&png_path).map_err(|e| format!("Save failed: {}", e))?;
 
     Ok(uuid)
+}
+
+/// Decode at most `max_frames` of audio (interleaved f32) for spectrogram
+/// previews, reusing the standard loader and truncating afterwards. Keeping
+/// the cap modest bounds both decode time and memory for long/large files.
+fn load_audio_bounded(path: &Path, max_frames: usize) -> crate::audio_io::Result<(Vec<f32>, u32, u16)> {
+    let (samples, sr, ch, st) = crate::audio_io::load_audio(path)?;
+    let ch = (ch.max(1)) as usize;
+    let keep_frames = max_frames.min(samples.len() / ch);
+    let mut samples = samples;
+    samples.truncate(keep_frames * ch);
+    let _ = st;
+    Ok((samples, sr, ch as u16))
 }
 
 /// Clean up orphaned preview files

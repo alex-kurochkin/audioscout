@@ -14,6 +14,33 @@ pub mod undo;
 use crossbeam_channel::{Receiver, Sender};
 use std::path::PathBuf;
 
+/// Preview rendering mode for the file-list thumbnails (and, per the spec,
+/// an independent toggle from the audio-view visualization mode).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreviewMode {
+    Waveform,
+    Spectrogram,
+}
+
+impl PreviewMode {
+    /// Key stored alongside previews in the DB (`previews.mode` column).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PreviewMode::Waveform => "wave",
+            PreviewMode::Spectrogram => "spectro",
+        }
+    }
+
+    /// Deterministic suffix mixed into the preview UUID so waveform and
+    /// spectrogram PNGs never overwrite each other in the cache directory.
+    pub fn uuid_suffix(self) -> &'static str {
+        match self {
+            PreviewMode::Waveform => "",
+            PreviewMode::Spectrogram => "-spectro",
+        }
+    }
+}
+
 /// Events sent from background threads to UI
 #[derive(Debug, Clone)]
 pub enum UiEvent {

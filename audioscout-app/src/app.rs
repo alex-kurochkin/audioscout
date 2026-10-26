@@ -13,8 +13,6 @@ use audioscout_core::{Document, EventChannel, Marker, UiEvent, is_editable_file}
 use crossbeam_channel::Receiver;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::cell::RefCell;
-use std::rc::Rc;
 use std::sync::Arc;
 use image::GenericImageView;
 
@@ -784,7 +782,8 @@ impl eframe::App for AudioScoutApp {
                     .max_height(list_max_height)
                     .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
                     .show(ui, |ui| {
-                        // Collected inside the scroll closure, applied after it.
+                        // Collected inside the scroll closure, appended to
+                        // `paths_to_load` after the closure returns.
                         let mut local_paths_to_load: Vec<PathBuf> = Vec::new();
 
                         let grid = egui::Grid::new("file_table_body")
@@ -919,19 +918,17 @@ impl eframe::App for AudioScoutApp {
                             }
                         });
 
-                        local_paths_to_load
+                        // Hand the collected double-click paths over to the
+                        // outer `paths_to_load` (loaded after CentralPanel).
+                        paths_to_load.append(&mut local_paths_to_load);
                     });
-
-                // Apply actions collected inside the scroll closure
-                // (paths are loaded later, after CentralPanel, like before).
-                paths_to_load.append(&mut list_paths_to_load);
 
                 // Store the measured header height for stable estimates next frame.
                 {
                     let id = ui.id().with("file_table_header_size");
                     ui.data_mut(|d| d.insert_temp(id, header_height));
                 }
-
+            };
             // Header row lives OUTSIDE the ScrollArea: it stays pinned while
             // scrolling and no longer inflates the scroll content height.
             let mut header_rect = egui::Rect::NOTHING;
@@ -1021,14 +1018,14 @@ impl eframe::App for AudioScoutApp {
                 // For stereo/multichannel, separator lines are drawn in the waveform rendering loop
                 if num_tracks == 1 {
                     let mid_y = rect.center().y;
-                    ui.painter().line_segment([egui::pos2(rect.left(), mid_y), egui::pos2(rect.right(), mid_y)], egui::Stroke::new(1.0, egui::Color32::from_rgb(60, 60, 65)));
+                    ui.painter().line_segment([egui::pos2(rect.left(), mid_y), egui::pos2(rect.right(), mid_y)], egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(60, 60, 65)));
                 }
 
                 // Cursor
                 let cursor_x = self.audio_view.frame_to_x(self.audio_view.cursor_frame, rect.width() as u32);
                 let cursor_screen_x = rect.left() + cursor_x;
                 if cursor_screen_x >= rect.left() && cursor_screen_x <= rect.right() {
-                    ui.painter().line_segment([egui::pos2(cursor_screen_x, rect.top()), egui::pos2(cursor_screen_x, rect.bottom())], egui::Stroke::new(1.5, egui::Color32::RED));
+                    ui.painter().line_segment([egui::pos2(cursor_screen_x, rect.top()), egui::pos2(cursor_screen_x, rect.bottom())], egui::Stroke::new(1.5_f32, egui::Color32::RED));
                 }
 
                 // Markers
@@ -1040,7 +1037,7 @@ impl eframe::App for AudioScoutApp {
                         let mut y = rect.top();
                         while y < rect.bottom() {
                             let seg_end = (y + 4.0).min(rect.bottom());
-                            ui.painter().line_segment([egui::pos2(screen_x, y), egui::pos2(screen_x, seg_end)], egui::Stroke::new(1.0, color));
+                            ui.painter().line_segment([egui::pos2(screen_x, y), egui::pos2(screen_x, seg_end)], egui::Stroke::new(1.0_f32, color));
                             y += 8.0;
                         }
                         ui.painter().text(egui::pos2(screen_x + 2.0, rect.top() + 2.0), egui::Align2::LEFT_TOP, &marker.name, egui::FontId::proportional(10.0), color);
@@ -1076,7 +1073,7 @@ impl eframe::App for AudioScoutApp {
                         if track_idx > 0 {
                             ui.painter().line_segment(
                                 [egui::pos2(rect.left(), track_top), egui::pos2(rect.right(), track_top)],
-                                egui::Stroke::new(1.0, egui::Color32::from_rgb(60, 60, 65))
+                                egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(60, 60, 65))
                             );
                         }
 
@@ -1090,7 +1087,7 @@ impl eframe::App for AudioScoutApp {
                             let y_bot = track_mid_y - min_val * half_h;
                             ui.painter().line_segment(
                                 [egui::pos2(x, y_top), egui::pos2(x, y_bot)],
-                                egui::Stroke::new(1.0, egui::Color32::from_rgb(50, 200, 80))
+                                egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(50, 200, 80))
                             );
                         }
                     }
