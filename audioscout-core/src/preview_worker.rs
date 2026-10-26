@@ -370,7 +370,7 @@ pub fn render_preview(path: &Path) -> Result<String, String> {
     }
 
     let (env, _sample_rate) =
-        crate::audio_io::load_audio_envelope(path, ENVELOPE_FRAMES, PREVIEW_DECODE_BUDGET)
+        crate::audio_io::envelope::load_audio_envelope(path, ENVELOPE_FRAMES, PREVIEW_DECODE_BUDGET)
             .map_err(|e| format!("Load failed: {}", e))?;
 
     // Use taller preview for stereo/multichannel (2 tracks need more space)
