@@ -149,19 +149,28 @@ impl PreviewWorker {
         }
     }
 
-    /// Submit a preview job
-    pub fn submit(&self, job: PreviewJob) {
+    /// Submit a preview job.
+    ///
+    /// Returns `true` when the job was enqueued, `false` when it was skipped
+    /// as a duplicate (a job for this path is already pending). Callers must
+    /// use this flag to keep their own bookkeeping in sync: if a job is
+    /// dropped here, no [`UiEvent::PreviewReady`] will ever arrive for it,
+    /// and treating it as "in flight" anyway would leave the path stuck in a
+    /// "generating" state forever — exactly the kind of abandoned lock that
+    /// makes previews appear to wait indefinitely.
+    pub fn submit(&self, job: PreviewJob) -> bool {
         let (lock, cvar) = &*self.queue;
         let mut inner = lock.lock().unwrap();
 
         // Dedup: skip if already pending for this path
         if inner.pending_paths.contains(&job.path) {
-            return;
+            return false;
         }
 
         inner.pending_paths.insert(job.path.clone());
         inner.jobs.push_back(job);
         cvar.notify_one();
+        true
     }
 
     /// Clear all pending jobs

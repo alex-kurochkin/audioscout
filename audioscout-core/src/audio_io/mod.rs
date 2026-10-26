@@ -63,6 +63,9 @@ pub struct Envelope {
 struct EnvAccum {
     channels: usize,
     block_frames: usize,
+    /// Total frames fed into the accumulator — used by callers to enforce a
+    /// hard decode cap so a pathological file can never spin forever.
+    frames_in: usize,
     /// Raw interleaved samples carried between decoder packets so that
     /// envelope blocks never straddle a packet boundary incorrectly.
     carry: Vec<f32>,
@@ -76,6 +79,7 @@ impl EnvAccum {
         Self {
             channels: ch,
             block_frames: block_frames.max(1),
+            frames_in: 0,
             carry: Vec::new(),
             lo: (0..ch).map(|_| Vec::new()).collect(),
             hi: (0..ch).map(|_| Vec::new()).collect(),
@@ -128,6 +132,7 @@ impl EnvAccum {
             return;
         }
         let ch = self.channels;
+        self.frames_in += samples.len() / ch;
         let stride = self.block_frames * ch;
 
         if !self.carry.is_empty() {
@@ -165,10 +170,23 @@ impl EnvAccum {
         self.lo.first().map(|v| v.len()).unwrap_or(0)
     }
 
+    /// Total number of audio frames fed so far (for decode-cap enforcement).
+    fn frames_in(&self) -> usize {
+        self.frames_in
+    }
+
     fn into_envelope(self) -> Envelope {
         Envelope { channels: self.channels, frames: self.frames_out(), lo: self.lo, hi: self.hi }
     }
 }
+
+/// Hard cap for a single envelope decode.
+///
+/// A damaged stream (or an endless source) must never stall the preview
+/// pipeline forever: once we have folded this many frames into the envelope
+/// we stop reading and render what we have. At typical thumbnail resolutions
+/// the cap corresponds to many hours of audio, so valid files are unaffected.
+const ENVELOPE_MAX_FRAMES: usize = 200_000_000;
 
 /// Decodes `path` and reduces it to a per-channel min/max envelope with
 /// roughly `target_frames` points per channel, streaming through the decoder.
@@ -176,6 +194,11 @@ impl EnvAccum {
 /// Fast path modelled on the `waveform-preview` example: a ~340-px thumbnail
 /// needs only a few hundred envelope points per track, so we fold peaks while
 /// reading instead of buffering hundreds of megabytes of samples.
+///
+/// Every code path below is *bounded*: the loops stop at end-of-stream, on
+/// the first decode error, or at [`ENVELOPE_MAX_FRAMES`] — there is no
+/// unbounded "keep waiting" state that could make preview generation hang
+/// indefinitely behind a stuck reader.
 pub fn load_audio_envelope(path: &Path, target_frames: usize) -> Result<(Envelope, u32)> {
     let ext = path.extension().and_then(|e| e.to_str()).map(|e| e.to_lowercase()).unwrap_or_default();
     match ext.as_str() {
@@ -219,6 +242,9 @@ fn envelope_from_hound(path: &Path, target_frames: usize) -> Result<(Envelope, u
                 while buf.len() < CHUNK {
                     match it.next() {
                         Some(Ok(v)) => buf.push(v),
+                        // End of stream *or* a corrupt sample: stop reading.
+                        // Never retry — a broken tail must not become an
+                        // infinite loop that starves the whole preview queue.
                         _ => break,
                     }
                 }
@@ -226,7 +252,7 @@ fn envelope_from_hound(path: &Path, target_frames: usize) -> Result<(Envelope, u
                     break;
                 }
                 acc.push(&buf);
-                if buf.len() < CHUNK {
+                if buf.len() < CHUNK || acc.frames_in() >= ENVELOPE_MAX_FRAMES {
                     break;
                 }
             }
@@ -239,6 +265,13 @@ fn envelope_from_hound(path: &Path, target_frames: usize) -> Result<(Envelope, u
 
 /// Reads PCM samples in chunks, scales them to f32 and feeds the envelope
 /// accumulator — no full-file buffering anywhere.
+///
+/// Bounded on three independent conditions: clean end of stream, first
+/// sample-read error, and the [`ENVELOPE_MAX_FRAMES`] safety cap. The old
+/// version silently swallowed errors (`Some(Ok(v)) => …, _ => break` inside
+/// a fixed-size refill was fine, but the outer loop had no frame cap, so a
+/// pathological file could keep the worker busy forever and every later
+/// preview job would appear to "just wait").
 fn pump_scaled<T>(reader: &mut hound::WavReader<std::io::BufReader<std::fs::File>>, scale: f32, acc: &mut EnvAccum)
 where
     T: hound::Sample + Copy + HoundToFloat,
@@ -252,6 +285,7 @@ where
         while raw.len() < (1 << 14) {
             match it.next() {
                 Some(Ok(v)) => raw.push(v),
+                // EOF or corrupt data → stop; do not spin on the iterator.
                 _ => break,
             }
         }
@@ -260,7 +294,7 @@ where
         }
         buf.extend(raw.iter().map(|&v| v.to_f32(scale)));
         acc.push(&buf);
-        if raw.len() < (1 << 14) {
+        if raw.len() < (1 << 14) || acc.frames_in() >= ENVELOPE_MAX_FRAMES {
             break;
         }
     }
@@ -342,6 +376,14 @@ fn envelope_with_symphonia(path: &Path, target_frames: usize) -> Result<(Envelop
                 tracing::warn!("Skipping corrupted packet: {}", m);
             }
             Err(_) => continue,
+        }
+
+        // Hard decode cap: a damaged stream that keeps yielding packets must
+        // not keep this worker (and every preview queued behind it) busy
+        // forever. Stop early and render what we have.
+        if acc.frames_in() >= ENVELOPE_MAX_FRAMES {
+            tracing::warn!("Envelope decode capped at {} frames: {}", ENVELOPE_MAX_FRAMES, path.display());
+            break;
         }
     }
 
