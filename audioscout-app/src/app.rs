@@ -147,6 +147,12 @@ impl AudioScoutApp {
         // kept alive for the whole session (tz §5.2). Without an audio device
         // RodioOutput::new returns None and playback is silently unavailable.
         let output = RodioOutput::new(player.clone(), event_tx.clone());
+        // DEBUG (playback diagnostics): a None here means the audio device
+        // never opened — Play can then only run the state machine, no sound.
+        match &output {
+            Some(_) => tracing::info!("[app] audio output initialized OK"),
+            None => tracing::error!("[app] NO AUDIO OUTPUT (RodioOutput::new returned None) — playback will be silent; check '[output]' error lines above and libasound2/cpal device availability"),
+        }
         let undo_dir = config_dir.join("undo");
         let undo_stack = UndoStack::new(undo_dir, config_store.config().undo_depth, config_store.config().undo_disk_limit_mb);
         let preview_worker = PreviewWorker::new(event_tx.clone());
@@ -410,6 +416,10 @@ impl AudioScoutApp {
         self.player.lock().unwrap_or_else(|p| p.into_inner()).reset();
         match audioscout_core::audio_io::load_audio(path) {
             Ok((samples, sr, ch, st)) => {
+                // DEBUG (playback diagnostics): frames==0 here means the file
+                // decoded to an empty buffer — Play would compute end==start
+                // and drop the append.
+                tracing::info!("[load] OK {path:?} samples={} sr={sr} ch={ch} frames={}", samples.len(), samples.len() / (ch.max(1) as usize));
                 self.document = Document {
                     samples, sample_rate: sr, channels: ch, markers: Vec::new(),
                     source_path: path.to_path_buf(), temp_path: None, dirty: false, sample_type: st,
@@ -433,7 +443,7 @@ impl AudioScoutApp {
                 // Build peaks tree cache for fast waveform rendering
                 self.rebuild_peaks_cache();
             }
-            Err(e) => { self.status_message = format!("Load failed: {}", e); }
+            Err(e) => { tracing::error!("[load] FAILED {path:?}: {e}"); self.status_message = format!("Load failed: {}", e); }
         }
     }
 
@@ -647,6 +657,7 @@ impl AudioScoutApp {
         if state == TransportState::Playing {
             // Pause: freeze position + in-flight PCM (§5.3). Without a real
             // output device the state machine alone carries the semantics.
+            tracing::debug!("[play] pause pressed (state={state:?})");
             if let Some(out) = &self.output { out.pause(); }
             let mut ctrl = self.player.lock().unwrap_or_else(|p| p.into_inner());
             ctrl.pause();
@@ -660,6 +671,22 @@ impl AudioScoutApp {
             // false for every start==0 file and silently drop the append —
             // the button toggled but nothing played.
             let end = sel.map(|(_, b)| b).unwrap_or(self.document.total_frames());
+            // DEBUG (playback diagnostics): the full decision context at the
+            // exact moment the user presses Play/Space. If playback does not
+            // start, one of these values names the culprit:
+            //   output=None          → audio device failed to open at startup
+            //                          (see "[output] ... FAILED" lines),
+            //   total_frames=0       → the document is empty/not loaded,
+            //   e <= s               → degenerate range, dropped by apply_play.
+            tracing::info!(
+                "[play] pressed state={state:?} sel={sel:?} start={start} end={end} \
+                 total_frames={} sr={} ch={} output={} path={:?}",
+                self.document.total_frames(),
+                self.document.sample_rate,
+                self.document.channels,
+                self.output.is_some(),
+                self.active_file,
+            );
             if let Some(out) = &self.output {
                 out.play(start, end);
             }
@@ -721,10 +748,17 @@ impl AudioScoutApp {
         if now.duration_since(self.last_playhead_poll) < std::time::Duration::from_millis(50) {
             return;
         }
+        let first_poll = self.last_playhead_poll.elapsed() > std::time::Duration::from_secs(1);
         self.last_playhead_poll = now;
         if self.output.is_some() {
             // Real playback position arrives through PlayheadUpdate events —
             // nothing to advance here, the event handler owns the cursor.
+            // DEBUG: if the state machine says Playing but the cursor never
+            // moves, no PlayheadUpdate is coming from the output thread; log
+            // once per second so this stall is visible in the console.
+            if first_poll && self.audio_view.cursor_frame == self.player.lock().unwrap_or_else(|p| p.into_inner()).start_frame() {
+                tracing::warn!("[poll] state=Playing but playhead not advancing (no PlayheadUpdate from output thread?)");
+            }
             return;
         }
         // Device-less degradation: advance the state machine's simulated

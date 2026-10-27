@@ -111,35 +111,62 @@ impl RodioOutput {
     /// browsing/editing, transport state simply never advances (graceful
     /// degradation, §0 runtime-dependency note about libasound2).
     pub fn new(controller: Arc<Mutex<Controller>>, event_tx: Sender<UiEvent>) -> Option<Self> {
-        let (stream, handle) = rodio::OutputStream::try_default().ok()?;
+        // DEBUG (playback diagnostics): every early return below is a hard
+        // reason why playback can never start — log which stage failed.
+        let (stream, handle) = match rodio::OutputStream::try_default() {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::error!("[output] OutputStream::try_default FAILED: {e} — audio device unavailable, playback will never start");
+                return None;
+            }
+        };
         // rodio 0.19 API: `Sink::connect_new` does not exist — construct via
         // `Sink::try_new(&OutputStreamHandle)` (the error variant can only
         // happen if the stream died between calls; fall back to silence then).
         // NOTE: 0.19 has no `set_speed_of_playback` — playback rate stays 1.0.
-        let sink = rodio::Sink::try_new(&handle).ok()?;
+        let sink = match rodio::Sink::try_new(&handle) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!("[output] Sink::try_new FAILED: {e} — playback will never start");
+                return None;
+            }
+        };
+        tracing::info!("[output] OutputStream + Sink created OK");
 
         let shared = Arc::new(SharedOutput::default());
         let (tx, rx) = bounded::<Cmd>(16);
         let holder = Arc::new(OutputStreamHolder { _stream: stream });
 
-        std::thread::Builder::new()
+        let join = std::thread::Builder::new()
             .name("player-controller".into())
             .spawn({
                 let shared = shared.clone();
                 let controller = controller.clone();
                 move || controller_thread(sink, rx, controller, shared, event_tx)
-            })
-            .ok()?;
+            });
+        match join {
+            Ok(_) => tracing::info!("[output] controller thread spawned OK"),
+            Err(e) => {
+                tracing::error!("[output] controller thread spawn FAILED: {e} — playback will never start");
+                return None;
+            }
+        }
 
         Some(Self { tx, shared, controller, _holder: holder })
     }
 
     pub fn load_document(&self, doc: Arc<Document>) {
-        let _ = self.tx.send(Cmd::Load { doc });
+        tracing::debug!("[output] send Cmd::Load frames={} sr={} ch={}", doc.total_frames(), doc.sample_rate, doc.channels);
+        if let Err(e) = self.tx.send(Cmd::Load { doc }) {
+            tracing::error!("[output] Cmd::Load send FAILED: {e} — controller thread is gone");
+        }
     }
 
     pub fn play(&self, start: u64, end: u64) {
-        let _ = self.tx.send(Cmd::Play { start, end });
+        tracing::debug!("[output] send Cmd::Play start={start} end={end}");
+        if let Err(e) = self.tx.send(Cmd::Play { start, end }) {
+            tracing::error!("[output] Cmd::Play send FAILED: {e} — controller thread is gone, playback cannot start");
+        }
     }
 
     pub fn pause(&self) {
@@ -309,7 +336,15 @@ fn controller_thread(
                     ctrl.mark_playing(s, e);
                     sink.set_volume(ctrl.volume());
                     loop_enabled = ctrl.is_looping();
+                    drop(ctrl);
+                    tracing::info!("[output] PLAY appended slice [{s},{e}) of {total} frames sr={} ch={} vol — source active", d.sample_rate, d.channels.max(1));
+                } else {
+                    // DEBUG: empty playable range — this is exactly the case
+                    // where the button toggles but nothing ever plays.
+                    tracing::error!("[output] PLAY DROPPED: empty range start={} end={} total={}", $start, $end, total);
                 }
+            } else {
+                tracing::error!("[output] PLAY with no document loaded — cannot append");
             }
         }};
     }
@@ -325,10 +360,14 @@ fn controller_thread(
 
         match cmd_opt {
             Some(Cmd::Load { doc: new_doc }) => {
+                tracing::debug!("[output] recv Cmd::Load frames={} sr={} ch={}", new_doc.total_frames(), new_doc.sample_rate, new_doc.channels);
                 sink.stop(); // drop the current source BEFORE loading (§5.3)
                 // A Play deferred while no document existed is applied to the
                 // freshly loaded buffer now (BUGFIX: play never started).
                 let deferred = pending_play.take();
+                if deferred.is_some() {
+                    tracing::info!("[output] applying DEFERRED play {:?} on Load", deferred);
+                }
                 doc = Some(new_doc);
                 sel_start = 0;
                 sel_end = 0;
@@ -352,8 +391,10 @@ fn controller_thread(
                 // "stop предыдущего вывода + сброс resume point" happen in
                 // the Load arm below).
                 if doc.is_none() {
+                    tracing::warn!("[output] recv Cmd::Play start={start} end={end} BEFORE any Load — parked as pending_play");
                     pending_play = Some((start, end));
                 } else {
+                    tracing::debug!("[output] recv Cmd::Play start={start} end={end}");
                     apply_play!(start, end);
                 }
             }
