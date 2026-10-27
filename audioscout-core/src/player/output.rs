@@ -171,15 +171,16 @@ impl Drop for RodioOutput {
 
 /// Interleaved PCM slice [start_frame, end_frame) × channels, taken from the
 /// document buffer (§5.2: "SamplesBuffer<f32> ... срез [start,end) × каналов").
-/// rodio 0.19: `SamplesBuffer<I::IntoIter>` — build it by moving a `Vec<f32>`
-/// iterator in, so the concrete type is just `SamplesBuffer<std::vec::IntoIter<f32>>`.
-fn slice_to_buffer(doc: &Document, start_frame: u64, end_frame: u64) -> rodio::buffer::SamplesBuffer<std::vec::IntoIter<f32>> {
+/// rodio 0.19: `SamplesBuffer<S>` requires `S: Sample`, i.e. the element type
+/// itself (`f32`) — NOT an iterator. The data argument is `D: Into<Vec<S>>`,
+/// so we move the plain `Vec<f32>` in directly.
+fn slice_to_buffer(doc: &Document, start_frame: u64, end_frame: u64) -> rodio::buffer::SamplesBuffer<f32> {
     let ch = doc.channels.max(1) as usize;
     let total = doc.total_frames();
     let s = start_frame.min(total) as usize;
     let e = end_frame.clamp(s as u64 + 1, total) as usize;
     let data: Vec<f32> = doc.samples[s * ch..e * ch].to_vec();
-    rodio::buffer::SamplesBuffer::new(ch as u16, doc.sample_rate, data.into_iter())
+    rodio::buffer::SamplesBuffer::new(ch as u16, doc.sample_rate, data)
 }
 
 /// Wraps a `SamplesBuffer` and taps every sample for the volume-meter
@@ -188,7 +189,7 @@ fn slice_to_buffer(doc: &Document, start_frame: u64, end_frame: u64) -> rodio::b
 /// прокидывает сэмплы дальше"). Also publishes the consumed-sample counter
 /// used for playhead polling.
 struct MeteredSource {
-    inner: rodio::buffer::SamplesBuffer<std::vec::IntoIter<f32>>,
+    inner: rodio::buffer::SamplesBuffer<f32>,
     channels: u16,
     shared: Arc<SharedOutput>,
     // Per-channel RMS accumulators (f64 over the current meter window).
@@ -201,12 +202,14 @@ impl Iterator for MeteredSource {
     type Item = f32;
     #[inline]
     fn next(&mut self) -> Option<f32> {
+        // `SamplesBuffer<f32>: Iterator<Item = f32>` (rodio 0.19), so the
+        // element type is inferred concretely here — no annotation needed.
         match self.inner.next() {
             Some(v) => {
                 // Absolute peak per channel + running RMS sums, updated on
                 // every sample so the UI poll sees a fresh window (§3.5.1).
                 let idx = self.shared.consumed_samples.fetch_add(1, Ordering::Relaxed);
-                let av: f32 = v.abs();
+                let av = v.abs();
                 let is_left = self.channels < 2 || (idx % self.channels as u64) == 0;
                 {
                     let mut meter = self.shared.meter.lock().unwrap_or_else(|p| p.into_inner());
@@ -236,6 +239,9 @@ impl Iterator for MeteredSource {
     }
 }
 
+// rodio 0.19 `Source` inherits `Iterator`; the metadata getters resolve on
+// `SamplesBuffer<f32>` once `S: Sample` holds (which f32 does). All four
+// overrides simply forward to the wrapped buffer.
 impl rodio::Source for MeteredSource {
     fn current_frame_len(&self) -> Option<usize> { self.inner.current_frame_len() }
     fn channels(&self) -> u16 { self.inner.channels() }

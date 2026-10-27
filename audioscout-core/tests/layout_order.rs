@@ -316,3 +316,62 @@ fn audio_view_mode_has_a_single_toggle_button() {
         "the table-preview waveform/spectrogram toggle must remain"
     );
 }
+
+// Regression guard for the rodio 0.19 audio-output compile errors:
+// `SamplesBuffer<S>` takes S = the sample TYPE (f32), not an iterator —
+// passing `data.into_iter()` produced E0277/E0599 ("Vec<f32>: rodio::Sample
+// not satisfied"). Also guards against resurrecting the non-existent
+// `Sink::set_speed_of_playback` API from older rodio.
+#[test]
+fn output_uses_samples_buffer_of_sample_type_not_iterator() {
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/src/player/output.rs");
+    let code: String = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("cannot read {}: {}", path, e))
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    // SamplesBuffer is parameterized by the element type f32 everywhere.
+    assert!(
+        code.contains("SamplesBuffer<f32>"),
+        "output.rs must use rodio::buffer::SamplesBuffer<f32> (S = sample type)"
+    );
+    // No iterator-as-sample-type anywhere (the exact mistake from the build log).
+    assert!(
+        !code.contains("IntoIter"),
+        "SamplesBuffer must NOT be parameterized with an iterator type"
+    );
+    assert!(
+        !code.contains(".into_iter())") && !code.contains("into_iter(),\n"),
+        "SamplesBuffer::new must receive the Vec<f32> directly (D: Into<Vec<S>>)"
+    );
+    // rodio 0.19 has no speed-of-playback knob on Sink.
+    assert!(
+        !code.contains("set_speed_of_playback"),
+        "rodio 0.19 Sink has no set_speed_of_playback; must not be called"
+    );
+}
+
+// The Controller must expose exactly one definition of each accessor that
+// previously got duplicated (E0592: current_frame/current_secs/resume_frame/reset).
+#[test]
+fn controller_has_no_duplicate_public_accessors() {
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/src/player/controller.rs");
+    let code: String = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("cannot read {}: {}", path, e))
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    for name in ["current_frame", "current_secs", "resume_frame", "reset"] {
+        let needle = format!("pub fn {}(", name);
+        let count = code.matches(&needle).count();
+        assert_eq!(count, 1, "`{}` defined {} times in controller.rs (must be exactly 1)", name, count);
+    }
+    // Stale references removed together with the duplicates.
+    assert!(!code.contains("sync_from_output"), "controller.rs still calls removed sync_from_output");
+    assert!(!code.contains("self.meter"), "controller.rs still references removed meter field");
+    assert!(!code.contains("use super::output::AudioOutput"), "AudioOutput does not exist in output.rs (it is RodioOutput)");
+}
