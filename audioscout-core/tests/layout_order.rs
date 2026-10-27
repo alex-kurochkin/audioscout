@@ -446,18 +446,19 @@ fn controller_exposes_playback_position_sync() {
 }
 
 #[test]
-fn device_enumeration_uses_rodio_api_not_cpal_internals() {
-    // Regression: device enumeration for the ALSA-'default' preference must go
-    // through rodio's own public API (`rodio::supported_output_devices()`,
-    // returning `rodio::Device`). Three consecutive builds failed because we
-    // reached into cpal instead:
-    //   * bare `cpal::` paths — cpal is NOT a direct dependency (E0433);
-    //   * `rodio::cpal::host_ids()` / `Host::from_id` — these cpal 0.15 items
-    //     are gated behind platform macros and are unreachable through
-    //     rodio's re-export (E0425/E0599);
-    //   * `SupportedOutputConfigs<'_, '_>` — the type takes no lifetimes
-    //     anyway (E0107), but the whole probe is unnecessary since rodio
-    //     already filters output-capable devices.
+fn device_enumeration_uses_cpal_015_host_api_via_rodio_reexport() {
+    // Regression over FOUR broken builds of the ALSA-'default' device scan:
+    //   * bare `cpal::` paths — cpal is NOT a direct dependency of
+    //     audioscout-core (E0433); the crate root IS reachable as
+    //     `rodio::cpal` though, because rodio 0.19 does `pub use cpal::{self, ...}`;
+    //   * `cpal::host_ids()` — removed in cpal 0.13+, the 0.15 free function is
+    //     `available_hosts()` (E0425);
+    //   * `Host::from_id(...)` — never existed; the constructor is the free
+    //     function `host_from_id(HostId) -> Result<Host, HostUnavailable>` (E0599);
+    //   * `rodio::supported_output_devices()` — does not exist in rodio 0.19 (E0425);
+    //   * trait methods `devices()/name()/supported_output_configs()` only
+    //     resolve with `cpal::traits::{HostTrait, DeviceTrait}` imported,
+    //     otherwise inference fails (E0282).
     let path = concat!(env!("CARGO_MANIFEST_DIR"), "/src/player/output.rs");
     let code: String = std::fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("cannot read {}: {}", path, e))
@@ -466,16 +467,25 @@ fn device_enumeration_uses_rodio_api_not_cpal_internals() {
         .collect::<Vec<_>>()
         .join("\n");
 
-    // No cpal usage at all — neither the bare crate nor rodio's re-export.
-    assert!(!code.contains("cpal::"), "cpal path used — enumerate devices via rodio's public API instead");
+    // Only ever via rodio's re-export, never the unlinked bare crate.
+    let without_reexport = code.replace("rodio::cpal", "");
+    assert!(!without_reexport.contains("cpal::"), "bare cpal:: path — cpal is not a direct dependency, use rodio::cpal::");
 
-    // Rodio's own enumeration + Device wrapper are what compiles here.
-    assert_eq!(code.matches("rodio::supported_output_devices()").count(), 1, "missing rodio::supported_output_devices() enumeration");
-    assert!(code.contains("Vec<(rodio::Device, String)>"), "device list must be typed with rodio::Device, not cpal types");
-    assert!(!code.contains("SupportedOutputConfigs"), "leftover cpal config-probing type");
+    // Correct cpal 0.15 host API surface.
+    assert!(code.contains("rodio::cpal::available_hosts()"), "must enumerate hosts via cpal 0.15 available_hosts()");
+    assert!(code.contains("rodio::cpal::host_from_id(host_id)"), "must build Host via the free fn host_from_id");
+    assert!(!code.contains("host_ids()"), "leftover pre-0.13 cpal API host_ids()");
+    assert!(!code.contains("Host::from_id"), "nonexistent cpal API Host::from_id");
+    assert!(!code.contains("supported_output_devices()"), "nonexistent rodio 0.19 API supported_output_devices");
+    assert!(code.contains("use rodio::cpal::traits::{DeviceTrait, HostTrait};"), "trait imports required for devices()/name()/supported_output_configs()");
+
+    // Output-capability filtering and device typing.
+    assert!(code.contains("supported_output_configs()"), "devices must be probed for output configs (skip capture-only PCMs)");
+    assert!(code.contains("Vec<(rodio::cpal::Device, String)>"), "device list typed with the cpal::Device that OutputStream::try_from_device accepts");
 
     // The scan feeds the ALSA 'default' preference and the fallback stays.
     assert_eq!(code.matches("fn list_output_devices").count(), 1);
+    assert_eq!(code.matches("fn find_alsa_default_device").count(), 1);
     assert!(code.contains("OutputStream::try_from_device(&device)"), "ALSA default device must be opened via try_from_device");
     assert!(code.contains("OutputStream::try_default()"), "fallback to the system default device must remain");
 }

@@ -669,37 +669,69 @@ fn channels_of(doc: &Option<Arc<Document>>) -> u16 {
     doc.as_ref().map(|d| d.channels.max(1)).unwrap_or(2)
 }
 
-/// Enumerate all output-capable devices through **rodio's own API**.
+/// Enumerate all output-capable devices through **cpal's public host API**
+/// (re-exported verbatim by rodio as `rodio::cpal`).
 ///
-/// Deliberately no direct cpal usage: rodio 0.19 re-exports cpal only as an
-/// opaque `pub use` in some code paths, and several cpal 0.15 items we tried
-/// before (`host_ids`, `Host::from_id`) are gated behind cpal's platform
-/// macros and are NOT reachable through `rodio::cpal` — the build broke with
-/// E0425/E0599 twice over this. `rodio::default_output_device()` and
-/// `rodio::supported_output_devices()` are public rodio functions returning
-/// rodio's own `rodio::Device` wrapper, which is exactly what
-/// `OutputStream::try_from_device(&rodio::Device)` expects.
+/// Verified against the exact sources of rodio 0.19 / cpal 0.15.3:
+/// * rodio's `lib.rs` contains `pub use cpal::{self, ...}` — so `rodio::cpal`
+///   IS the cpal crate root, including its top-level free functions;
+/// * cpal 0.15 has NO `host_ids()` function (that was cpal 0.11-era API) and
+///   NO `Host::from_id` associated fn — the correct pair is the free
+///   functions `cpal::available_hosts() -> Vec<HostId>` and
+///   `cpal::host_from_id(HostId) -> Result<Host, HostUnavailable>`;
+/// * rodio 0.19 has no `rodio::supported_output_devices()` at all (E0425),
+///   so device enumeration must go through cpal directly;
+/// * device listing needs the trait methods from `cpal::traits::HostTrait`
+///   (`devices()`) and `cpal::traits::DeviceTrait` (`name()`,
+///   `supported_output_configs()`) imported into scope — without them the
+///   calls don't resolve and type inference fails (E0282).
 ///
-/// Output-capability filtering already happened inside rodio when it built
-/// these lists, so no per-device config probing is needed here.
-fn list_output_devices() -> Vec<(rodio::Device, String)> {
-    rodio::supported_output_devices()
-        .into_iter()
-        .map(|d| {
-            let name = d.name();
-            (d, name)
-        })
-        .collect()
+/// Each device is probed with `supported_output_configs()` so only genuinely
+/// output-capable devices are returned (on ALSA every card AND every extra
+/// PCM like "hdmi:CARD=…" shows up; opening a capture-only or dead PCM would
+/// silently kill playback). The returned `rodio::cpal::Device` is the same
+/// type `rodio::OutputStream::try_from_device(&Device)` accepts.
+fn list_output_devices() -> Vec<(rodio::cpal::Device, String)> {
+    use rodio::cpal::traits::{DeviceTrait, HostTrait};
+    let mut out = Vec::new();
+    for host_id in rodio::cpal::available_hosts() {
+        let host: rodio::cpal::Host = match rodio::cpal::host_from_id(host_id) {
+            Ok(h) => h,
+            Err(e) => {
+                tracing::debug!("[output] host {host_id:?} unavailable: {e}");
+                continue;
+            }
+        };
+        let devices: rodio::cpal::Devices = match host.devices() {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::warn!("[output] host {host_id:?} device enumeration failed: {e}");
+                continue;
+            }
+        };
+        for device in devices {
+            let name: String = device.name().unwrap_or_else(|_| "<unnamed>".to_string());
+            // Keep only devices that actually expose an output stream config.
+            let outputs = match device.supported_output_configs() {
+                Ok(cfgs) => cfgs.next().is_some(),
+                Err(_) => false,
+            };
+            if outputs {
+                out.push((device, name));
+            }
+        }
+    }
+    out
 }
 
-/// Find the ALSA "default" output device among rodio's enumerated devices.
+/// Find the ALSA "default" output device among the enumerated devices.
 ///
 /// On Linux the ALSA backend exposes every alsa-lib PCM name as a separate
 /// device, and the virtual "default" (which follows the user's desktop sound
 /// settings / dmix route) is identifiable by its name. Returns the first
 /// match; `None` on non-ALSA backends or enumeration failure (the caller
 /// then falls back to `OutputStream::try_default`).
-fn find_alsa_default_device() -> Option<(rodio::Device, String)> {
+fn find_alsa_default_device() -> Option<(rodio::cpal::Device, String)> {
     for (device, name) in list_output_devices() {
         let lname = name.to_lowercase();
         // Match the ALSA virtual default ("default") and dmix-mapped variants.
