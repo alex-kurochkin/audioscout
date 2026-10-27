@@ -678,9 +678,23 @@ fn channels_of(doc: &Option<Arc<Document>>) -> u16 {
 /// directly via `rodio::cpal` — a re-export pinned to the exact cpal version
 /// rodio was built against, which guarantees ABI-compatible `Device` handles
 /// for `OutputStream::try_from_device`.
+///
+/// cpal 0.15 specifics respected here:
+/// * the host-id type is an associated type (`HostId`), not a standalone
+///   generic parameter, and its iterator item is `Result<HostId, HostId>`;
+/// * `SupportedOutputConfigs` has **no** lifetime parameters;
+/// * `Devices` implements `ExactSizeIterator`, so it can be iterated by value
+///   without any type annotations.
 fn list_cpal_output_devices() -> Vec<(rodio::cpal::Device, String)> {
     let mut out = Vec::new();
-    for host in rodio::cpal::host_ids() {
+    for host_id in rodio::cpal::host_ids().into_iter().flatten() {
+        let host = match unsafe { rodio::cpal::Host::from_id(host_id) } {
+            Ok(h) => h,
+            Err(e) => {
+                tracing::debug!("[output] cpal host open failed: {e:?}");
+                continue;
+            }
+        };
         let devices = match host.devices() {
             Ok(d) => d,
             Err(e) => {
@@ -695,12 +709,14 @@ fn list_cpal_output_devices() -> Vec<(rodio::cpal::Device, String)> {
                 Ok(n) => n,
                 Err(_) => continue,
             };
-            let supports_output = device
-                .supported_output_configs()
-                .map(|mut configs: rodio::cpal::SupportedOutputConfigs<'_, '_>| {
-                    Iterator::next(&mut configs).is_some()
-                })
-                .unwrap_or(false);
+            // Any supported output config at all means the device is usable
+            // for playback. `configs` borrows `device`, hence the inner scope.
+            let supports_output = {
+                match device.supported_output_configs() {
+                    Ok(mut configs) => Iterator::next(&mut configs).is_some(),
+                    Err(_) => false,
+                }
+            };
             if supports_output {
                 out.push((device, name));
             }

@@ -444,3 +444,39 @@ fn controller_exposes_playback_position_sync() {
     assert!(!body.contains("resume_frame"), "playback sync must not overwrite the resume point");
     assert!(body.contains("self.state != TransportState::Playing"), "playback sync must no-op outside Playing");
 }
+
+#[test]
+fn device_enumeration_uses_cpal_015_host_api() {
+    // Regression: the ALSA-'default' preference must compile against cpal
+    // 0.15 (as re-exported by rodio 0.19). Earlier attempts broke the build
+    // with: bare `cpal::` paths (cpal is not a direct dependency),
+    // `for host in host_ids()` (host_ids yields Result<HostId, HostId>, not
+    // Host), and `SupportedOutputConfigs<'_, '_>` (the type takes NO lifetime
+    // arguments in cpal 0.15).
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/src/player/output.rs");
+    let code: String = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("cannot read {}: {}", path, e))
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    // cpal must only be reached through rodio's pinned re-export.
+    let stripped = code.replace("rodio::cpal", "");
+    assert!(!stripped.contains("cpal::"), "bare `cpal::` path used — cpal is not a direct dependency of audioscout-core");
+
+    // host_ids() items are Result<HostId, HostId>: they must be flattened and
+    // turned into Host via Host::from_id before use.
+    assert!(code.contains(".into_iter().flatten()"), "host_ids() iterator not flattened over its Result items");
+    assert_eq!(code.matches("rodio::cpal::Host::from_id").count(), 1, "missing single Host::from_id(host_id) call");
+    assert!(!code.contains("for host in rodio::cpal::host_ids()"), "iterating host_ids() as if it yielded Host values");
+
+    // SupportedOutputConfigs has zero lifetime parameters in cpal 0.15.
+    assert!(!code.contains("SupportedOutputConfigs<"), "lifetime arguments supplied to SupportedOutputConfigs (takes none in cpal 0.15)");
+
+    // The scan feeds the ALSA 'default' preference and the fallback stays.
+    assert_eq!(code.matches("fn list_cpal_output_devices").count(), 1);
+    assert!(code.contains("OutputStream::try_from_device(&device)"), "ALSA default device must be opened via try_from_device");
+    assert!(code.contains("OutputStream::try_default()"), "fallback to the system default device must remain");
+}
+
