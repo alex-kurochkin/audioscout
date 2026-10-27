@@ -206,6 +206,33 @@ impl Controller {
     pub fn current_secs(&self, sample_rate: u32) -> f64 {
         self.current_frame as f64 / sample_rate.max(1) as f64
     }
+    /// Device-less fallback clock (§1.2/§5.3): when no audio output is
+    /// available the state machine advances on its own — called from the UI
+    /// playhead poll every 50 ms while `state == Playing`. Honours loop and
+    /// session bounds; a non-loop session finishes at `end_frame` back at
+    /// the session start, exactly like the real output thread does.
+    pub fn tick(&mut self, dt: std::time::Duration, doc: &Document) {
+        if self.state != TransportState::Playing {
+            return;
+        }
+        let sr = doc.sample_rate.max(1) as f64;
+        let advance = (dt.as_secs_f64() * sr).round().max(0.0) as u64;
+        let next = self.current_frame.saturating_add(advance);
+        let end = if self.end_frame > self.start_frame { self.end_frame } else { doc.total_frames() };
+        if next >= end {
+            if self.loop_enabled && end > self.start_frame {
+                let span = end - self.start_frame;
+                let wrapped = self.start_frame + (next - self.start_frame) % span;
+                self.current_frame = wrapped;
+                self.playhead.set_position_samples(wrapped);
+            } else {
+                self.finish_session_at(self.start_frame);
+            }
+        } else {
+            self.current_frame = next;
+            self.playhead.set_position_samples(next);
+        }
+    }
     pub fn resume_frame(&self) -> u64 {
         self.resume_frame
     }
@@ -409,5 +436,39 @@ mod tests {
         assert_eq!(c.resume_frame(), 0);
         assert_eq!(c.start_frame(), 0);
         assert_eq!(c.end_frame(), 0);
+    }
+
+    #[test]
+    fn tick_advances_fallback_clock_and_finishes_at_end() {
+        // §1.2/§5.3 device-less degradation: the UI poll drives `tick` while
+        // playing; it must advance by dt*sample_rate and finish the session
+        // back at the start point when the range is exhausted.
+        let (mut c, doc) = controller_with_doc(1000, 1); // sample_rate = 1000
+        c.play(&doc, Some((0, 100)));
+        c.tick(std::time::Duration::from_millis(50), &doc); // +50 frames
+        assert_eq!(c.current_frame(), 50);
+        assert_eq!(c.state(), TransportState::Playing);
+        c.tick(std::time::Duration::from_millis(50), &doc); // reaches end=100
+        assert_eq!(c.state(), TransportState::Stopped);
+        assert_eq!(c.current_frame(), 0); // rewound to session start
+    }
+
+    #[test]
+    fn tick_wraps_when_looping() {
+        let (mut c, doc) = controller_with_doc(1000, 1);
+        c.set_loop(true);
+        c.play(&doc, Some((0, 100)));
+        c.tick(std::time::Duration::from_millis(75), &doc); // +75 → 75
+        c.tick(std::time::Duration::from_millis(50), &doc); // +50 → wraps to 25
+        assert_eq!(c.state(), TransportState::Playing);
+        assert_eq!(c.current_frame(), 25);
+    }
+
+    #[test]
+    fn tick_is_noop_when_not_playing() {
+        let (mut c, doc) = controller_with_doc(1000, 1);
+        c.tick(std::time::Duration::from_millis(50), &doc);
+        assert_eq!(c.current_frame(), 0);
+        assert_eq!(c.state(), TransportState::Stopped);
     }
 }

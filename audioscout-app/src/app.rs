@@ -84,8 +84,10 @@ pub struct AudioScoutApp {
     /// load, edits/undo/redo, mode switch) so a re-render is triggered even
     /// when the numeric view key stays the same.
     document_generation: u64,
-    /// 50 ms playhead poll bookkeeping (§1.2/§5.3): last time the transport
-    /// was polled while playing.
+    /// 50 ms playhead poll bookkeeping (§1.2/§5.3): last time the UI-side
+    /// fallback poll read the transport position while playing (the output
+    /// thread is the primary source of PlayheadUpdate events; this throttle
+    /// only drives the cursor when no real audio device is available).
     last_playhead_poll: std::time::Instant,
 }
 
@@ -700,6 +702,38 @@ impl AudioScoutApp {
         self.player.lock().unwrap_or_else(|p| p.into_inner()).state()
     }
 
+    /// UI-side playhead poll (§1.2/§5.3, 50 ms cadence driven by the repaint
+    /// loop in `update`). The rodio output thread already emits
+    /// `PlayheadUpdate` events from the real audio clock; this fallback keeps
+    /// the cursor moving when no audio device is available (the state
+    /// machine advances on its own clock via `Controller::tick`) and simply
+    /// refreshes the cursor from the controller otherwise. `last_playhead_poll`
+    /// throttles the work to one poll per 50 ms tick.
+    fn poll_playhead(&mut self) {
+        if self.player_state() != TransportState::Playing {
+            return;
+        }
+        let now = std::time::Instant::now();
+        if now.duration_since(self.last_playhead_poll) < std::time::Duration::from_millis(50) {
+            return;
+        }
+        self.last_playhead_poll = now;
+        if self.output.is_some() {
+            // Real playback position arrives through PlayheadUpdate events —
+            // nothing to advance here, the event handler owns the cursor.
+            return;
+        }
+        // Device-less degradation: advance the state machine's simulated
+        // clock and mirror it into the waveform cursor.
+        let frame = {
+            let mut ctrl = self.player.lock().unwrap_or_else(|p| p.into_inner());
+            ctrl.tick(std::time::Duration::from_millis(50), &self.document);
+            ctrl.current_frame()
+        };
+        self.audio_view.set_cursor(frame);
+        self.audio_view.auto_scroll_to_cursor();
+    }
+
     fn player_current_secs(&self) -> f64 {
         let ctrl = self.player.lock().unwrap_or_else(|p| p.into_inner());
         ctrl.current_secs(self.document.sample_rate)
@@ -920,6 +954,10 @@ impl eframe::App for AudioScoutApp {
         }
         self.process_events(ctx);
         self.handle_keyboard(ctx);
+        // 50 ms playhead poll (§1.2/§5.3): with a live output the position
+        // arrives via PlayheadUpdate events; without one this fallback tick
+        // advances the state machine's clock so the cursor still moves.
+        self.poll_playhead();
         if self.player_state() == TransportState::Playing { ctx.request_repaint_after(std::time::Duration::from_millis(50)); }
 
         // Preview pump: while any thumbnail is still missing, keep draining
