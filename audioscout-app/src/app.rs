@@ -73,6 +73,12 @@ pub struct AudioScoutApp {
     /// load, edits/undo/redo, mode switch) so a re-render is triggered even
     /// when the numeric view key stays the same.
     document_generation: u64,
+    /// 50 ms playhead poll bookkeeping (§1.2/§5.3): last time the transport
+    /// was polled while playing.
+    last_playhead_poll: std::time::Instant,
+    /// Peak-hold state for the instantaneous loudness meters (§3.5.1):
+    /// per-bar held peak and when it was reached.
+    meter_hold: [Option<(f32, std::time::Instant)>; 2],
 }
 
 impl AudioScoutApp {
@@ -154,6 +160,8 @@ impl AudioScoutApp {
             view_spectro_texture: None,
             view_spectro_key: None,
             document_generation: 0,
+            last_playhead_poll: std::time::Instant::now(),
+            meter_hold: [None, None],
         };
 
         // Restore the two independent Waveform/Spectrogram toggles from the
