@@ -121,3 +121,58 @@ fn toggle_buttons_present() {
     assert!(av.contains("pub enum AudioViewMode"), "AudioViewMode enum missing");
     assert!(av.contains("pub fn toggle_mode"), "AudioView::toggle_mode missing");
 }
+
+/// Regression test for the *window height* bug: the file window (the table's
+/// vertical ScrollArea inside the CentralPanel) must be sized from egui's own
+/// `available_height()` only. All four bottom panels — status bar, file
+/// actions, player controls and the resizable visualization window — are
+/// declared before the CentralPanel, so their real, measured space is already
+/// reserved by the time the central area computes its remaining height. The
+/// old code additionally subtracted a hand-made estimate of the very same
+/// stack (`bottom_panels_height`, built from hardcoded 40 px / 20 px
+/// constants), double-counting the reservation and making the file window far
+/// shorter than it should be (and unstable: every drift of the estimate
+/// triggered another repaint).
+#[test]
+fn file_list_height_uses_only_eguis_available_height() {
+    // Comment-insensitive view of the source: explanatory BUGFIX comments may
+    // mention the removed identifiers, only real code references matter.
+    let code: String = app_source()
+        .lines()
+        .map(|l| {
+            let t = l.trim_start();
+            if t.starts_with("//") {
+                ""
+            } else {
+                match l.find("//") {
+                    Some(i) => &l[..i],
+                    None => l,
+                }
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let src = app_source();
+
+    // The stale cross-frame estimate and its ad-hoc measurement are gone.
+    assert!(
+        !code.contains("bottom_panels_height"),
+        "the file-list height must not rely on a hand-made bottom-stack estimate"
+    );
+    assert!(
+        !code.contains("measured_stack") && !code.contains("stack_below_this_panel"),
+        "manual bottom-stack measurement duplicates egui's own reservation"
+    );
+
+    // The list height is derived directly from `available_height()`.
+    assert!(
+        src.contains("let list_max_height = ui.available_height().max(60.0);"),
+        "file-list height must be exactly the space egui has left above the bottom stack"
+    );
+
+    // …and that value is what clamps the table's scroll area.
+    assert!(
+        src.contains(".max_height(list_max_height)"),
+        "the file-list ScrollArea must use the computed height"
+    );
+}

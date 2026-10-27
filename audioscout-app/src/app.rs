@@ -73,14 +73,6 @@ pub struct AudioScoutApp {
     /// load, edits/undo/redo, mode switch) so a re-render is triggered even
     /// when the numeric view key stays the same.
     document_generation: u64,
-    /// Measured total height of the bottom panel stack (status bar +
-    /// visualization window + player controls + file actions), taken from
-    /// the *previous* frame. The four panels are declared before the
-    /// CentralPanel so egui already reserves their space, but on the very
-    /// first frame the resizable audio view has no size yet — until it does,
-    /// the file list falls back to this estimate (or a default) so its rows
-    /// never render underneath the player windows.
-    bottom_panels_height: f32,
 }
 
 impl AudioScoutApp {
@@ -162,7 +154,6 @@ impl AudioScoutApp {
             view_spectro_texture: None,
             view_spectro_key: None,
             document_generation: 0,
-            bottom_panels_height: 0.0,
         };
 
         // Restore the two independent Waveform/Spectrogram toggles from the
@@ -1062,19 +1053,6 @@ impl eframe::App for AudioScoutApp {
         // the player, i.e. docked *above* it: this is the panel the transport
         // controls must sit under (bug #1).
         egui::TopBottomPanel::bottom("actions").default_height(40.0).show(ctx, |ui| {
-            // Fallback measurement of the bottom stack for the very first
-            // frame (before egui has reserved anything). This panel is the
-            // last-but-one declared, so at its entry only the panels docked
-            // below it — audio_view + player — exist as reserves; the status
-            // bar (~20 px) and this actions panel's own height are added
-            // explicitly. `screen_rect().height() - available_height()` thus
-            // measures the FULL bottom stack (including the resizable
-            // visualization window) every frame; the CentralPanel below uses
-            // that value to shrink the file list accordingly (bug #2).
-            let stack_below_this_panel = ui.ctx().screen_rect().height() - ui.available_height();
-            let actions_own_height = 40.0; // this panel's default/measured height
-            let status_bar_height = 20.0; // status panel declared after this one
-            let measured_stack = stack_below_this_panel + actions_own_height + status_bar_height;
             ui.horizontal(|ui| {
                 if ui.button("Mute").clicked() { self.mute_selection(); }
                 ui.label("Normalize:");
@@ -1088,12 +1066,6 @@ impl eframe::App for AudioScoutApp {
                     ui.strong(name);
                 }
             });
-            if (measured_stack - self.bottom_panels_height).abs() > 1.0 {
-                self.bottom_panels_height = measured_stack;
-                // Re-layout once so the table height catches up immediately
-                // after the user drags the audio-view separator.
-                ui.ctx().request_repaint();
-            }
         });
 
         // Status bar — declared LAST among the bottom panels, which docks it
@@ -1124,20 +1096,22 @@ impl eframe::App for AudioScoutApp {
             // so the scrollbar spans the real list region.
             //
             // BUGFIX (window height): the file-list height must account for
-            // the whole bottom stack — actions panel + player controls + the
-            // (user-resizable) visualization window + status bar. All four
+            // the whole bottom stack — status bar + file actions + player
+            // controls + the (user-resizable) visualization window. All four
             // bottom panels are declared *before* this CentralPanel, so egui
-            // already reserves their measured space and `available_height()`
-            // tracks any resize of the audio-view window. Additionally the
-            // actions panel explicitly measures the full stack height into
-            // `bottom_panels_height` every frame; if that measurement is
-            // larger than what egui has reserved here (e.g. on the very
-            // first frame before the resizable view was ever laid out), the
-            // difference is subtracted as well, so list rows can never render
-            // underneath the player windows.
-            let reserved_below = ui.ctx().screen_rect().height() - ui.available_height();
-            let extra_first_frame_reserve = (self.bottom_panels_height - reserved_below).max(0.0);
-            let list_max_height = (ui.available_height() - extra_first_frame_reserve).max(60.0);
+            // has already reserved their real, measured space: here
+            // `ui.available_height()` is exactly what is left between the
+            // current cursor position and the top edge of the bottom stack
+            // (panel margins/inner spacing are subtracted by egui itself
+            // when the scroll area allocates its rect). The buggy version
+            // ALSO subtracted a hand-made estimate of the same bottom stack
+            // (`bottom_panels_height`, computed with hardcoded constants in
+            // the actions panel), i.e. it double-counted the reserved space:
+            // the file window came out far shorter than it should be, and
+            // every drift of that estimate forced an extra re-layout frame.
+            // Now the available height is used directly, so resizing the
+            // visualization panel still shrinks/grows the list one-to-one.
+            let list_max_height = ui.available_height().max(60.0);
 
             // Borrow the pieces the row loop needs *before* opening the
             // table closure, so `self` is not captured mutably inside.
