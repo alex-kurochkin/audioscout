@@ -89,6 +89,11 @@ pub struct AudioScoutApp {
     /// thread is the primary source of PlayheadUpdate events; this throttle
     /// only drives the cursor when no real audio device is available).
     last_playhead_poll: std::time::Instant,
+    /// BUGFIX (playback freezes ~0.5 s after start): set once per detected
+    /// audio-stream stall so the status-bar message is shown a single time
+    /// and re-armed when playback resumes (`poll_playhead` clears it on
+    /// every non-stalled tick).
+    stall_notified: bool,
 }
 
 impl AudioScoutApp {
@@ -183,6 +188,7 @@ impl AudioScoutApp {
             view_spectro_key: None,
             document_generation: 0,
             last_playhead_poll: std::time::Instant::now(),
+            stall_notified: false,
         };
 
         // Restore the two independent Waveform/Spectrogram toggles from the
@@ -750,23 +756,41 @@ impl AudioScoutApp {
         }
         self.last_playhead_poll = now;
         if self.output.is_some() {
-            // BUGFIX (playback "never starts", frozen cursor, sink.stop() on
-            // every button press): `PlayheadUpdate` events are NOT the only
-            // position source we need. The output thread emits them at most
-            // every ~30 ms and only while its 50 ms command-poll loop runs;
-            // egui also throttles redraws when the window is idle, so relying
-            // on events alone left the cursor stuck at frame 0 and made live
-            // playback look like a hang. Read the real audio clock directly
-            // from SharedOutput every poll tick (tz §5.3: пул позиции ±50 мс)
-            // and drive the cursor + auto-scroll from it. Events stay as an
-            // additional fresher update path.
-            let shared = self.output.as_ref().expect("output present").shared.clone();
-            let ch = self.document.channels.max(1);
-            let frame = shared.current_frame(ch);
+            // BUGFIX (playback freezes ~0.5 s after start, no sound): the
+            // audio stream can be killed by PulseAudio/ALSA while the app
+            // still thinks it is Playing — then neither the cursor nor the
+            // meter ever move again. `poll_stall` watches the real sample
+            // clock and pauses the transport on a >1 s freeze; surface that
+            // to the user once per stall instead of letting the UI hang in a
+            // fake playing state.
+            let stalled = self
+                .output
+                .as_mut()
+                .map(|out| out.poll_stall())
+                .unwrap_or(false);
+            if stalled {
+                self.stall_notified = true;
+                self.status_message = "Playback stalled: audio stream was dropped \
+                                       by the system (PulseAudio/ALSA). Press Play \
+                                       to retry."
+                    .to_string();
+                ctx.request_repaint();
+                return;
+            }
+            if self.stall_notified && self.player_state() == TransportState::Playing {
+                // A fresh play attempt after a stall — clear the warning.
+                self.stall_notified = false;
+            }
             // BUGFIX (Play/Pause restarts from 0): the state machine's
             // current_frame must follow the real audio clock, otherwise
             // Pause freezes resume_frame at a stale value and every repeated
-            // Play re-appends the slice from the session start.
+            // Play re-appends the slice from the session start. Read the
+            // clock directly from SharedOutput every poll tick (tz §5.3: пул
+            // позиции ±50 мс) — PlayheadUpdate events stay as an additional
+            // fresher update path.
+            let shared = self.output.as_ref().expect("output present").shared.clone();
+            let ch = self.document.channels.max(1);
+            let frame = shared.current_frame(ch);
             {
                 let mut ctrl = self.player.lock().unwrap_or_else(|p| p.into_inner());
                 ctrl.sync_playback_position(frame);

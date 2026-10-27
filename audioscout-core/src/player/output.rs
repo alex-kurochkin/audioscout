@@ -124,6 +124,11 @@ pub struct RodioOutput {
     pub shared: Arc<SharedOutput>,
     controller: Arc<Mutex<Controller>>,
     _holder: Arc<OutputStreamHolder>,
+    /// Previous value of the `consumed_samples` audio clock, observed by
+    /// `poll_stall()` on each UI tick.
+    last_consumed: u64,
+    /// When the audio clock last moved (or playback was not active).
+    last_clock_move: std::time::Instant,
 }
 
 impl RodioOutput {
@@ -304,7 +309,55 @@ impl RodioOutput {
             }
         }
 
-        Some(Self { tx, shared, controller, _holder: holder })
+        Some(Self {
+            tx,
+            shared,
+            controller,
+            _holder: holder,
+            last_consumed: 0,
+            last_clock_move: std::time::Instant::now(),
+        })
+    }
+
+    /// BUGFIX (playback silently freezes ~0.5 s after start with the cursor
+    /// stuck): detect a dead audio stream and make the app recover instead of
+    /// hanging in a fake "Playing" state. `MeteredSource::next()` runs inside
+    /// the cpal callback and advances `consumed_samples`; if PulseAudio/ALSA
+    /// drops the stream, the callback stops firing and the clock freezes —
+    /// the only externally observable symptom of a dead endpoint. The UI poll
+    /// calls this method every 50 ms tick; when transport says Playing, a
+    /// source is attached, and the clock has not moved for >1 s, we pause the
+    /// transport and report `true` once so the app can surface the error.
+    pub fn poll_stall(&mut self) -> bool {
+        let playing = self.controller_state() == TransportState::Playing;
+        let active = self.shared.source_active.load(Ordering::Relaxed);
+        let consumed = self.shared.consumed_samples.load(Ordering::Relaxed);
+        if !playing || !active {
+            self.last_consumed = consumed;
+            self.last_clock_move = std::time::Instant::now();
+            return false;
+        }
+        if consumed != self.last_consumed {
+            self.last_consumed = consumed;
+            self.last_clock_move = std::time::Instant::now();
+            return false;
+        }
+        if self.last_clock_move.elapsed() > std::time::Duration::from_secs(1) {
+            tracing::error!(
+                "[output] STALL DETECTED: Playing & source active but audio clock \
+                 frozen at consumed={consumed} for >1s — pausing transport \
+                 (stream was likely dropped by PulseAudio/ALSA)"
+            );
+            // Reset first so the next call doesn't re-fire until the clock
+            // moves again; then pause the Sink and the state machine.
+            self.last_clock_move = std::time::Instant::now();
+            let _ = self.tx.send(Cmd::Pause);
+            if let Ok(mut ctrl) = self.controller.lock() {
+                ctrl.pause();
+            }
+            return true;
+        }
+        false
     }
 
     pub fn load_document(&self, doc: Arc<Document>) {
@@ -414,10 +467,17 @@ struct MeteredSource {
     inner: rodio::buffer::SamplesBuffer<f32>,
     channels: u16,
     shared: Arc<SharedOutput>,
+    // Local mirror of the global `consumed_samples` clock. Incremented in
+    // `next()` and flushed into the atomic only every 512 samples — see the
+    // BUGFIX note below (atomic-per-sample starved the cpal callback).
+    local_idx: u64,
     // Per-channel RMS accumulators (f64 over the current meter window).
     rms_sum_l: f64,
     rms_sum_r: f64,
     rms_count: usize,
+    // Window peak holders (published to the shared meter with the window).
+    peak_l: f32,
+    peak_r: f32,
 }
 
 impl Iterator for MeteredSource {
@@ -428,36 +488,70 @@ impl Iterator for MeteredSource {
         // element type is inferred concretely here — no annotation needed.
         match self.inner.next() {
             Some(v) => {
-                // Absolute peak per channel + running RMS sums, updated on
-                // every sample so the UI poll sees a fresh window (§3.5.1).
-                let idx = self.shared.consumed_samples.fetch_add(1, Ordering::Relaxed);
+                // BUGFIX (playback dies ~0.5 s after start, disk hammering):
+                // this iterator runs inside the cpal audio callback. A
+                // contended `fetch_add` on the shared atomic AND a mutex lock
+                // on EVERY sample made the callback overrun; PulseAudio then
+                // dropped the stream after its first period (~0.5 s at
+                // 44.1 kHz) — exactly the observed symptom. The hot path now
+                // touches only thread-local state; the global clock and the
+                // meter are published once per 512-sample window.
+                let idx = self.local_idx;
+                self.local_idx += 1;
                 let av = v.abs();
                 let is_left = self.channels < 2 || (idx % self.channels as u64) == 0;
-                {
-                    let mut meter = self.shared.meter.lock().unwrap_or_else(|p| p.into_inner());
-                    if is_left {
-                        if av > meter.peak_l { meter.peak_l = av; }
-                        self.rms_sum_l += (v as f64).powi(2);
-                    } else {
-                        if av > meter.peak_r { meter.peak_r = av; }
-                        self.rms_sum_r += (v as f64).powi(2);
-                    }
+                if is_left {
+                    if av > self.peak_l { self.peak_l = av; }
+                    self.rms_sum_l += (v as f64).powi(2);
+                } else {
+                    if av > self.peak_r { self.peak_r = av; }
+                    self.rms_sum_r += (v as f64).powi(2);
                 }
                 self.rms_count += 1;
                 if self.rms_count >= 512 {
-                    // Publish the RMS block stats and reset the window.
-                    let mut meter = self.shared.meter.lock().unwrap_or_else(|p| p.into_inner());
-                    let n = self.rms_count.max(1) as f64;
-                    meter.rms_l = (self.rms_sum_l / n).sqrt() as f32;
-                    meter.rms_r = (self.rms_sum_r / n).sqrt() as f32;
-                    self.rms_sum_l = 0.0;
-                    self.rms_sum_r = 0.0;
-                    self.rms_count = 0;
+                    self.publish();
                 }
                 Some(v)
             }
-            None => None,
+            None => {
+                // Source exhausted — flush whatever remains in the window so
+                // the final partial block still reaches the meter/clock.
+                if self.rms_count > 0 {
+                    self.publish();
+                }
+                None
+            }
         }
+    }
+}
+
+impl MeteredSource {
+    /// Push the accumulated window into the shared atomics/mutex. Called at
+    /// most once per 512 samples (~11 ms at 44.1 kHz stereo) — cheap enough
+    /// for the audio callback even under contention.
+    fn publish(&mut self) {
+        // Advance the global clock by the number of samples produced since
+        // the last publish (store-free: relative update keeps pause/resume
+        // and cross-source appends consistent).
+        self.shared
+            .consumed_samples
+            .fetch_add(self.rms_count as u64, Ordering::Relaxed);
+        let n = self.rms_count.max(1) as f64;
+        let (rms_l, rms_r, peak_l, peak_r) = (
+            (self.rms_sum_l / n).sqrt() as f32,
+            (self.rms_sum_r / n).sqrt() as f32,
+            std::mem::take(&mut self.peak_l),
+            std::mem::take(&mut self.peak_r),
+        );
+        if let Ok(mut meter) = self.shared.meter.try_lock() {
+            meter.rms_l = rms_l;
+            meter.rms_r = rms_r;
+            if peak_l > meter.peak_l { meter.peak_l = peak_l; }
+            if peak_r > meter.peak_r { meter.peak_r = peak_r; }
+        }
+        self.rms_sum_l = 0.0;
+        self.rms_sum_r = 0.0;
+        self.rms_count = 0;
     }
 }
 
@@ -529,9 +623,12 @@ fn controller_thread(
                         inner: slice_to_buffer(d, s, e, stream_format),
                         channels: d.channels.max(1),
                         shared: shared.clone(),
+                        local_idx: 0,
                         rms_sum_l: 0.0,
                         rms_sum_r: 0.0,
                         rms_count: 0,
+                        peak_l: 0.0,
+                        peak_r: 0.0,
                     };
                     sink.append(src);
                     shared.source_active.store(true, Ordering::Relaxed);
@@ -652,9 +749,12 @@ fn controller_thread(
                                 inner: slice_to_buffer(d, s, e, stream_format),
                                 channels: ch,
                                 shared: shared.clone(),
+                                local_idx: 0,
                                 rms_sum_l: 0.0,
                                 rms_sum_r: 0.0,
                                 rms_count: 0,
+                                peak_l: 0.0,
+                                peak_r: 0.0,
                             };
                             sink.append(src);
                             shared.source_active.store(true, Ordering::Relaxed);
@@ -683,9 +783,12 @@ fn controller_thread(
                             inner: slice_to_buffer(d, sel_start, sel_end, stream_format),
                             channels: ch,
                             shared: shared.clone(),
+                            local_idx: 0,
                             rms_sum_l: 0.0,
                             rms_sum_r: 0.0,
                             rms_count: 0,
+                            peak_l: 0.0,
+                            peak_r: 0.0,
                         };
                         sink.append(src);
                     }
@@ -789,9 +892,12 @@ fn controller_thread(
                         inner: slice_to_buffer(d, sel_start, sel_end, stream_format),
                         channels: ch,
                         shared: shared.clone(),
+                        local_idx: 0,
                         rms_sum_l: 0.0,
                         rms_sum_r: 0.0,
                         rms_count: 0,
+                        peak_l: 0.0,
+                        peak_r: 0.0,
                     };
                     sink.append(src);
                 }
