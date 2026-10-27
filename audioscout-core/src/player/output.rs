@@ -115,6 +115,30 @@ pub struct OutputStreamHolder {
     pub stream_channels: u16,
 }
 
+/// Shared pacing state between the controller thread (which owns the Sink)
+/// and the pump thread (which feeds it from the document buffer).
+#[derive(Default)]
+struct PumpState {
+    /// The [start,end) file-frame range currently playing, if any. Written
+    /// by the controller on Play/Seek/Stop/Pause/Load, read by the pump.
+    session: Mutex<Option<(u64, u64)>>,
+    /// File frame the pump must feed next (only meaningful while Some above).
+    cursor_frame: AtomicU64,
+    /// Live Sink reference, published once when the controller thread starts.
+    sink: Mutex<Option<rodio::Sink>>,
+    /// The document currently loaded — owned by the controller thread and
+    /// cloned into here on every `Cmd::Load` so the pump can slice it without
+    /// reaching back into the controller's locals (§5.2: single writer).
+    doc: Mutex<Option<Arc<Document>>>,
+    /// Shared playhead/meter clock — the SAME Arc the controller thread and
+    /// the UI poll read. Every chunk the pump appends carries this into its
+    /// MeteredSource so consumed-sample accounting stays coherent; a fresh
+    /// default here would pin the UI cursor at 0 while audio played fine.
+    shared: Option<Arc<SharedOutput>>,
+    /// Stop signal for the pump thread (controller-thread shutdown / app exit).
+    quit: AtomicBool,
+}
+
 /// Output-side player: spawns the controller thread on creation and talks to
 /// it through a bounded command channel. Safe to call before anything is
 /// loaded — commands without a document are ignored (§1.2: "нажатия раньше
@@ -129,6 +153,10 @@ pub struct RodioOutput {
     last_consumed: u64,
     /// When the audio clock last moved (or playback was not active).
     last_clock_move: std::time::Instant,
+    /// BUGFIX (playback dies ~0.5 s after start): pacing state shared with
+    /// the pump thread; the pump is signalled through this on every session
+    /// change and told to quit when the output is dropped.
+    pump: Arc<PumpState>,
 }
 
 impl RodioOutput {
@@ -284,6 +312,15 @@ impl RodioOutput {
 
         let shared = Arc::new(SharedOutput::default());
         let (tx, rx) = bounded::<Cmd>(16);
+        // BUGFIX (playback dies ~0.5 s after start; disk hammering): pacing
+        // state for the pump thread — see `pump_thread` below and PumpState.
+        // The pump MUST publish into the same SharedOutput that the controller
+        // thread reads for playhead/meter polling; passing a fresh default
+        // would freeze the UI cursor at 0 even while audio played fine.
+        let pump = Arc::new(PumpState {
+            shared: Some(shared.clone()),
+            ..Default::default()
+        });
         // Keep a clone of the stream handle alive for the whole session —
         // see the BUGFIX note on `OutputStreamHolder` (dropping every handle
         // destroys the cpal stream and mutes playback completely).
@@ -299,7 +336,8 @@ impl RodioOutput {
             .spawn({
                 let shared = shared.clone();
                 let controller = controller.clone();
-                move || controller_thread(sink, rx, controller, shared, event_tx, stream_format)
+                let pump = pump.clone();
+                move || controller_thread(sink, rx, controller, shared, event_tx, stream_format, pump)
             });
         match join {
             Ok(_) => tracing::info!("[output] controller thread spawned OK"),
@@ -316,6 +354,7 @@ impl RodioOutput {
             _holder: holder,
             last_consumed: 0,
             last_clock_move: std::time::Instant::now(),
+            pump,
         })
     }
 
@@ -404,6 +443,10 @@ impl RodioOutput {
 
 impl Drop for RodioOutput {
     fn drop(&mut self) {
+        // BUGFIX (playback dies ~0.5 s after start): stop the pump thread
+        // BEFORE signalling the controller so no new chunks are queued while
+        // the output is being torn down.
+        self.pump.quit.store(true, Ordering::Relaxed);
         let _ = self.tx.send(Cmd::Shutdown);
     }
 }
@@ -577,7 +620,29 @@ fn controller_thread(
     // (sample_rate, channels) the OutputStream was opened with — every slice
     // is resampled/mixed to this format before append (see slice_to_buffer).
     stream_format: (u32, u16),
+    // BUGFIX (playback dies ~0.5 s after start): pacing state for the pump
+    // thread; the Sink clone published here lets the queue be refilled at the
+    // hardware clock instead of in one giant `slice_to_buffer` allocation.
+    pump: Arc<PumpState>,
 ) {
+    // Publish the Sink and spawn the pump thread (§5.2: "поток вывода один",
+    // pacing lives next to it). The pump holds its OWN copy of the currently
+    // loaded document (single writer: the Load arm below) and appends small
+    // chunks into the Sink as the hardware clock consumes them.
+    *pump.sink.lock().unwrap_or_else(|p| p.into_inner()) = Some(sink.clone());
+    {
+        let pump = pump.clone();
+        let sf = stream_format;
+        if let Err(e) = std::thread::Builder::new()
+            .name("player-pump".into())
+            .spawn(move || pump_thread(pump, sf))
+        {
+            tracing::error!("[output] pump thread spawn FAILED: {e} — playback will drain after the first chunk");
+        } else {
+            tracing::info!("[output] pump thread spawned OK");
+        }
+    }
+
     // Document currently loaded into the player. Kept as Arc so slices can be
     // copied cheaply when a new source is appended.
     let mut doc: Option<Arc<Document>> = None;
@@ -599,6 +664,23 @@ fn controller_thread(
     // Append the [start,end) slice of the current document to the sink and
     // mirror the new session into the shared state (§5.3). Shared by the
     // Play arm and by the deferred play applied on Load.
+    //
+    // BUGFIX (playback dies ~0.5 s after start; disk hammering, no sound):
+    // the WHOLE session used to be resampled in one go (`slice_to_buffer(d,
+    // s, e)`) — for a 166 k-frame file that is a ~60 MB allocation plus a
+    // memcpy storm (the "disk" the user heard was page-cache churn), and the
+    // Sink then consumed it at the hardware clock while nothing refilled the
+    // queue → silence right after the first pre-buffered period. The pump
+    // thread now owns pacing: `apply_play` only records the session range and
+    // seeds the audio clock; small chunks are appended as they are consumed.
+    //
+    // CRITICAL FIX (previous attempt still froze at ~0.5 s): `apply_play`
+    // itself must NOT append any chunk — otherwise the controller thread and
+    // the pump race on the same cursor, producing a double-feed of the first
+    // chunk and an immediate stall once both realize the cursor already moved
+    // past the session end. The controller's ONLY job here is to publish the
+    // session bounds and rewind the cursor; every audible sample comes from
+    // `pump_thread`.
     macro_rules! apply_play {
         ($start:expr, $end:expr) => {{
             if let Some(d) = &doc {
@@ -607,37 +689,23 @@ fn controller_thread(
                 let (s, e) = if $end > $start { ($start.min(total), $end.min(total)) } else { ($start.min(total), total) };
                 if e > s {
                     sink.stop();
-                    // BUGFIX (playhead frozen at 0, UI looks like playback
-                    // never started): the consumed-sample counter must be
-                    // seeded from the slice start in RAW SAMPLE units. The old
-                    // code stored `s * channels` while MeteredSource counts
-                    // one increment per sample — for stereo this made every
-                    // position readout half of the true frame index, and any
-                    // later unit mismatch pinned the cursor at 0.
+                    *pump.session.lock().unwrap_or_else(|p| p.into_inner()) = None; // freeze the pump during retarget
                     shared.consumed_samples.store(stream_sample_at(d, s, stream_format), Ordering::Relaxed);
                     shared.pos_offset.store(s, Ordering::Relaxed);
                     shared.session_start_frame.store(s, Ordering::Relaxed);
                     sel_start = s;
                     sel_end = e;
-                    let src = MeteredSource {
-                        inner: slice_to_buffer(d, s, e, stream_format),
-                        channels: d.channels.max(1),
-                        shared: shared.clone(),
-                        local_idx: 0,
-                        rms_sum_l: 0.0,
-                        rms_sum_r: 0.0,
-                        rms_count: 0,
-                        peak_l: 0.0,
-                        peak_r: 0.0,
-                    };
-                    sink.append(src);
+                    pump.cursor_frame.store(s, Ordering::Relaxed);
+                    // Publish the session AFTER seeding the cursor so the pump
+                    // never sees a live session pointing at a stale frame.
+                    *pump.session.lock().unwrap_or_else(|p| p.into_inner()) = Some((s, e));
                     shared.source_active.store(true, Ordering::Relaxed);
                     let mut ctrl = controller.lock().unwrap_or_else(|p| p.into_inner());
                     ctrl.mark_playing(s, e);
                     sink.set_volume(ctrl.volume());
                     loop_enabled = ctrl.is_looping();
                     drop(ctrl);
-                    tracing::info!("[output] PLAY appended slice [{s},{e}) of {total} frames sr={} ch={} vol — source active", d.sample_rate, d.channels.max(1));
+                    tracing::info!("[output] PLAY session [{s},{e}) of {total} frames sr={} ch={} vol — pump engaged", d.sample_rate, d.channels.max(1));
                 } else {
                     // DEBUG: empty playable range — this is exactly the case
                     // where the button toggles but nothing ever plays.
@@ -651,12 +719,11 @@ fn controller_thread(
 
     'outer: loop {
         // Block until something happens: a command, or the current source
-        // finishing (poll cadence ~50 ms, §5.3).
-        let cmd_opt = if sink.empty() {
-            rx.recv().ok()
-        } else {
-            rx.recv_timeout(std::time::Duration::from_millis(50)).ok()
-        };
+        // finishing (poll cadence ~50 ms, §5.3). With the pump active the
+        // Sink queue is deliberately kept near-empty (only one chunk ahead),
+        // so `sink.empty()` can no longer mean "session over" — completion
+        // detection moved into the poll section below (cursor >= sel_end).
+        let cmd_opt = rx.recv_timeout(std::time::Duration::from_millis(50)).ok();
 
         match cmd_opt {
             Some(Cmd::Load { doc: new_doc }) => {
@@ -668,7 +735,11 @@ fn controller_thread(
                 if deferred.is_some() {
                     tracing::info!("[output] applying DEFERRED play {:?} on Load", deferred);
                 }
-                doc = Some(new_doc);
+                *pump.session.lock().unwrap_or_else(|p| p.into_inner()) = None;
+                doc = Some(new_doc.clone());
+                // Publish the document for the pump thread (single writer —
+                // this controller thread; the pump only ever reads it).
+                *pump.doc.lock().unwrap_or_else(|p| p.into_inner()) = Some(new_doc);
                 sel_start = 0;
                 sel_end = 0;
                 shared.session_start_frame.store(0, Ordering::Relaxed);
@@ -700,6 +771,7 @@ fn controller_thread(
             }
             Some(Cmd::Pause) => {
                 pending_play = None; // a parked Play must not survive Pause
+                *pump.session.lock().unwrap_or_else(|p| p.into_inner()) = None;
                 sink.stop();
                 shared.source_active.store(false, Ordering::Relaxed);
                 let mut ctrl = controller.lock().unwrap_or_else(|p| p.into_inner());
@@ -718,6 +790,7 @@ fn controller_thread(
             }
             Some(Cmd::Stop) => {
                 pending_play = None; // ... or Stop (§5.3 stop = silence)
+                *pump.session.lock().unwrap_or_else(|p| p.into_inner()) = None;
                 sink.stop();
                 shared.source_active.store(false, Ordering::Relaxed);
                 let start = shared.session_start_frame.load(Ordering::Relaxed);
@@ -738,6 +811,7 @@ fn controller_thread(
                     let target = if sel_end > sel_start { frame.clamp(sel_start, sel_end.saturating_sub(1)) } else { frame };
                     let target = target.min(d.total_frames());
                     sink.stop(); // drop the current source BEFORE appending the new slice
+                    *pump.session.lock().unwrap_or_else(|p| p.into_inner()) = None;
                     shared.consumed_samples.store(frame_to_stream_samples(target, d.sample_rate, stream_format), Ordering::Relaxed);
                     shared.pos_offset.store(target, Ordering::Relaxed);
                     {
@@ -745,18 +819,8 @@ fn controller_thread(
                         ctrl.mark_seek(target);
                         if ctrl.is_playing() {
                             let (s, e) = (target, if sel_end > sel_start { sel_end } else { d.total_frames() });
-                            let src = MeteredSource {
-                                inner: slice_to_buffer(d, s, e, stream_format),
-                                channels: ch,
-                                shared: shared.clone(),
-                                local_idx: 0,
-                                rms_sum_l: 0.0,
-                                rms_sum_r: 0.0,
-                                rms_count: 0,
-                                peak_l: 0.0,
-                                peak_r: 0.0,
-                            };
-                            sink.append(src);
+                            pump.cursor_frame.store(s, Ordering::Relaxed);
+                            *pump.session.lock().unwrap_or_else(|p| p.into_inner()) = Some((s, e));
                             shared.source_active.store(true, Ordering::Relaxed);
                             sel_start = s;
                             sel_end = e;
@@ -764,6 +828,7 @@ fn controller_thread(
                             shared.source_active.store(false, Ordering::Relaxed);
                         }
                     }
+                    let _ = ch;
                 }
             }
             Some(Cmd::SetLoop { enabled }) => {
@@ -774,23 +839,15 @@ fn controller_thread(
                 // playhead back to the loop start without glitch-restart of
                 // the Sink itself (§3.5).
                 if enabled && ctrl.state() == TransportState::Playing && shared.source_active.load(Ordering::Relaxed) {
-                    if let Some(d) = &doc {
-                        let ch = d.channels.max(1);
+                    if sel_end > sel_start {
                         sink.stop();
-                        shared.consumed_samples.store(frame_to_stream_samples(sel_start, d.sample_rate, stream_format), Ordering::Relaxed);
+                        *pump.session.lock().unwrap_or_else(|p| p.into_inner()) = None;
+                        if let Some(d) = &doc {
+                            shared.consumed_samples.store(frame_to_stream_samples(sel_start, d.sample_rate, stream_format), Ordering::Relaxed);
+                        }
                         shared.pos_offset.store(sel_start, Ordering::Relaxed);
-                        let src = MeteredSource {
-                            inner: slice_to_buffer(d, sel_start, sel_end, stream_format),
-                            channels: ch,
-                            shared: shared.clone(),
-                            local_idx: 0,
-                            rms_sum_l: 0.0,
-                            rms_sum_r: 0.0,
-                            rms_count: 0,
-                            peak_l: 0.0,
-                            peak_r: 0.0,
-                        };
-                        sink.append(src);
+                        pump.cursor_frame.store(sel_start, Ordering::Relaxed);
+                        *pump.session.lock().unwrap_or_else(|p| p.into_inner()) = Some((sel_start, sel_end));
                     }
                 }
             }
@@ -804,18 +861,27 @@ fn controller_thread(
         }
 
         // ---- poll section: runs after every command or timeout tick ----
+        // BUGFIX (playback dies ~0.5 s after start): position now comes from
+        // the pump's own audio clock (`consumed_samples`, advanced by
+        // MeteredSource inside the cpal callback) converted back to file
+        // frames — `sink.get_pos()` resets per appended chunk and produced a
+        // sawtoothing cursor once the queue holds several sources. Completion
+        // = the pump has fed everything up to sel_end AND the sink drained.
         let (pos_frame, finished) = {
             let ctrl = controller.lock().unwrap_or_else(|p| p.into_inner());
-            // rodio 0.19: Sink::get_pos() returns the elapsed playback
-            // Duration of the current source (§5.3 playhead polling);
-            // convert it to a frame index via the sample rate and add the
-            // offset where the appended slice started.
-            let sr = doc.as_ref().map(|d| d.sample_rate.max(1) as f64).unwrap_or(44100.0);
-            let pos_secs = sink.get_pos().as_secs_f64();
-            let pos = (pos_secs * sr) as u64 + shared.pos_offset.load(Ordering::Relaxed);
+            let counter = shared.consumed_samples.load(Ordering::Relaxed);
+            let pos = stream_frame_of(&counter, doc.as_deref(), channels_of(&doc), stream_format);
             let playing = ctrl.state() == TransportState::Playing;
             let active = shared.source_active.load(Ordering::Relaxed);
-            (pos, playing && active && sink.empty())
+            let pumped_done = {
+                let sess = pump.session.lock().unwrap_or_else(|p| p.into_inner());
+                match &*sess {
+                    Some(&(s, e)) => pump.cursor_frame.load(Ordering::Relaxed) >= e && s < e,
+                    None => false,
+                }
+            };
+            drop(ctrl);
+            (pos, playing && active && pumped_done && sink.empty())
         };
 
         // DEBUG (playback diagnostics): if the state machine says Playing and
@@ -881,29 +947,24 @@ fn controller_thread(
 
         if finished {
             if loop_enabled && sel_end > sel_start {
-                // Loop sessions never report natural completion — restart the
-                // slice transparently (§5.3: "При Loop событие окончания
-                // приходит только на ошибках").
-                if let Some(d) = &doc {
-                    let ch = d.channels.max(1);
-                    shared.consumed_samples.store(frame_to_stream_samples(sel_start, d.sample_rate, stream_format), Ordering::Relaxed);
-                    shared.pos_offset.store(sel_start, Ordering::Relaxed);
-                    let src = MeteredSource {
-                        inner: slice_to_buffer(d, sel_start, sel_end, stream_format),
-                        channels: ch,
-                        shared: shared.clone(),
-                        local_idx: 0,
-                        rms_sum_l: 0.0,
-                        rms_sum_r: 0.0,
-                        rms_count: 0,
-                        peak_l: 0.0,
-                        peak_r: 0.0,
-                    };
-                    sink.append(src);
-                }
+                // Loop sessions never report natural completion — rewind the
+                // pump cursor and let `pump_thread` re-feed the slice from
+                // sel_start (§5.3: "При Loop событие окончания приходит только
+                // на ошибках"). The controller must NOT append anything itself,
+                // otherwise it races with the pump on the same Sink queue.
+                shared.consumed_samples.store(
+                    frame_to_stream_samples(sel_start, doc.as_ref().map(|d| d.sample_rate).unwrap_or(44100), stream_format),
+                    Ordering::Relaxed,
+                );
+                shared.pos_offset.store(sel_start, Ordering::Relaxed);
+                pump.cursor_frame.store(sel_start, Ordering::Relaxed);
+                *pump.session.lock().unwrap_or_else(|p| p.into_inner()) = Some((sel_start, sel_end));
             } else {
                 // Natural end of a non-loop session: rewind the playhead to
-                // the session start point (§5.3).
+                // the session start point (§5.3). Freeze the pump so no new
+                // chunks are queued while we transition to Stopped.
+                *pump.session.lock().unwrap_or_else(|p| p.into_inner()) = None;
+                sink.stop();
                 let start = shared.session_start_frame.load(Ordering::Relaxed);
                 match &doc {
                     Some(d) => shared.consumed_samples.store(stream_sample_at(d, start, stream_format), Ordering::Relaxed),
@@ -918,6 +979,112 @@ fn controller_thread(
                 let _ = event_tx.send(UiEvent::PlaybackFinished);
             }
         }
+    }
+}
+
+/// BUGFIX (playback dies ~0.5 s after start): pacing thread for the Sink.
+///
+/// The previous implementation appended the whole [start,end) session as one
+/// giant `SamplesBuffer<f32>` inside `apply_play!`. For a 166 k-frame file
+/// that is a ~60 MB allocation + memcpy storm (the disk hammering the user
+/// observed was page-cache churn), and once the cpal hardware clock drained
+/// the first pre-buffered period (~0.5 s at 44.1 kHz) there was nothing left
+/// in the queue → silence.
+///
+/// The pump now owns all audible samples: it watches the audio clock advanced
+/// by `MeteredSource` inside the cpal callback, and whenever the Sink has
+/// consumed enough frames it appends the NEXT small chunk (≈0.5 s of audio)
+/// resampled to the device's stream format. The controller thread NEVER
+/// appends — only publishes the session bounds (`session`, `cursor_frame`)
+/// and rewinds them on Play/Seek/Loop-restart; everything else is frozen by
+/// setting `session = None` (Pause/Stop/Load/shutdown).
+fn pump_thread(pump: Arc<PumpState>, stream_format: (u32, u16)) {
+    const CHUNK_SECONDS: f64 = 0.5;
+    const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(25);
+
+    loop {
+        if pump.quit.load(Ordering::Relaxed) {
+            break;
+        }
+        let session = *pump.session.lock().unwrap_or_else(|p| p.into_inner());
+        let (s_start, s_end) = match session {
+            Some(r) if r.0 < r.1 => r,
+            _ => {
+                std::thread::sleep(POLL_INTERVAL);
+                continue;
+            }
+        };
+        let doc = pump.doc.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        let sink_guard = pump.sink.lock().unwrap_or_else(|p| p.into_inner());
+        let sink = match sink_guard.as_ref() {
+            Some(s) => s.clone(),
+            None => {
+                drop(sink_guard);
+                std::thread::sleep(POLL_INTERVAL);
+                continue;
+            }
+        };
+        let d = match doc {
+            Some(d) => d,
+            None => {
+                drop(sink_guard);
+                std::thread::sleep(POLL_INTERVAL);
+                continue;
+            }
+        };
+
+        let src_rate = d.sample_rate.max(1) as u64;
+        let dst_rate = stream_format.0.max(1) as u64;
+        let dst_ch = stream_format.1.max(1) as u64;
+        let total = d.total_frames();
+
+        let cursor = pump.cursor_frame.load(Ordering::Relaxed).min(total);
+        if cursor >= s_end.min(total) {
+            // Everything audible has been handed to the Sink; wait for the
+            // controller to detect drain-completion or issue a new session.
+            drop(sink_guard);
+            std::thread::sleep(POLL_INTERVAL);
+            continue;
+        }
+
+        // How many STREAM samples correspond to CHUNK_SECONDS of wall time?
+        let chunk_stream_samples = ((CHUNK_SECONDS * dst_rate as f64) as u64 * dst_ch).max(dst_ch);
+        // How many FILE frames fit into that chunk?
+        let frames_per_chunk = (chunk_stream_samples / dst_ch).max(1);
+        // Convert to file frames using the ratio src_rate/dst_rate.
+        let file_frames_in_chunk = ((frames_per_chunk as u64 * src_rate) / dst_rate.max(1)).max(1);
+        let next_end = cursor.saturating_add(file_frames_in_chunk).min(s_end).min(total);
+        if next_end <= cursor {
+            drop(sink_guard);
+            std::thread::sleep(POLL_INTERVAL);
+            continue;
+        }
+
+        let ch_file = d.channels.max(1);
+        // Clone the shared clock BEFORE taking the sink lock so MeteredSource
+        // publishes into the same atomics the controller/UI poll reads.
+        let shared_for_chunk = match pump.shared.as_ref() {
+            Some(s) => s.clone(),
+            None => Arc::new(SharedOutput::default()),
+        };
+        drop(sink_guard); // release the mutex before any potentially slow work
+        let buffer = slice_to_buffer(&d, cursor, next_end, stream_format);
+        let metered = MeteredSource {
+            inner: buffer,
+            channels: ch_file,
+            shared: shared_for_chunk,
+            local_idx: 0,
+            rms_sum_l: 0.0,
+            rms_sum_r: 0.0,
+            rms_count: 0,
+            peak_l: 0.0,
+            peak_r: 0.0,
+        };
+        let sink_clone = sink.clone();
+        sink_clone.append(metered);
+        pump.cursor_frame.store(next_end, Ordering::Relaxed);
+        // Yield briefly so we don't spin faster than the hardware consumes.
+        std::thread::sleep(std::time::Duration::from_millis(10));
     }
 }
 
