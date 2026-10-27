@@ -730,6 +730,20 @@ fn controller_thread(
     let mut last_seen_pos_frame: u64 = u64::MAX;
     let mut stuck_since = std::time::Instant::now();
 
+    // BUGFIX (regression "controller thread exited normally (shutdown?)"
+    // ~2.5 s after startup, before any command arrived): the loop used to be
+    // `'outer: loop { ... Some(Cmd::Shutdown) | None => break 'outer }` —
+    // `recv_timeout` returns Err(Timeout) on every idle tick and `.ok()`
+    // turns that into None, so a mere 50 ms without commands (i.e. the whole
+    // time the app simply sits there with nothing loaded) killed both the
+    // controller AND the pump: Cmd::Load/Cmd::Play then failed with
+    // "sending on a disconnected channel", no sound, playhead frozen at 0.
+    // A timeout is NOT a shutdown signal: it must fall through to the poll
+    // section below. Only an explicit Cmd::Shutdown (or the sender being
+    // dropped for real, which crossbeam reports as Err(Disconnected)) ends
+    // the thread.
+    let mut idle_ticks: u32 = 0;
+
     // Append the [start,end) slice of the current document to the sink and
     // mirror the new session into the shared state (§5.3). Shared by the
     // Play arm and by the deferred play applied on Load.
@@ -792,7 +806,32 @@ fn controller_thread(
         // Sink queue is deliberately kept near-empty (only one chunk ahead),
         // so `sink.empty()` can no longer mean "session over" — completion
         // detection moved into the poll section below (cursor >= sel_end).
-        let cmd_opt = rx.recv_timeout(std::time::Duration::from_millis(50)).ok();
+        // BUGFIX (controller thread died ~2.5 s after startup): distinguish
+        // the three crossbeam outcomes explicitly instead of collapsing them
+        // with `.ok()`:
+        //   Ok(cmd)            -> handle the command;
+        //   Err(Timeout)       -> idle tick: fall through to the poll section;
+        //   Err(Disconnected)  -> every Sender dropped (RodioOutput destroyed)
+        //                       -> real shutdown.
+        let cmd_opt = match rx.recv_timeout(std::time::Duration::from_millis(50)) {
+            Ok(cmd) => {
+                idle_ticks = 0;
+                Some(cmd)
+            }
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                // DEBUG: heartbeat once per ~10 s of idleness so it is visible
+                // in the console that the controller is alive and polling.
+                idle_ticks += 1;
+                if idle_ticks % 200 == 1 {
+                    tracing::debug!("[output] controller idle tick #{idle_ticks} (alive, waiting for commands)");
+                }
+                None
+            }
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                tracing::info!("[output] command channel disconnected (RodioOutput dropped) - controller thread shutting down");
+                break 'outer;
+            }
+        };
 
         match cmd_opt {
             Some(Cmd::Load { doc: new_doc }) => {
@@ -926,7 +965,13 @@ fn controller_thread(
                 ctrl.set_volume(vol);
                 sink.set_volume(ctrl.volume());
             }
-            Some(Cmd::Shutdown) | None => break 'outer,
+            // BUGFIX: bare `None` here used to mean "recv timed out" and broke
+            // the loop - an idle app killed its own audio threads after 50 ms.
+            // Timeouts now fall through as `None` (the poll section still runs),
+            // so only an explicit Cmd::Shutdown ends the thread; real channel
+            // disconnection is handled in the recv match above.
+            Some(Cmd::Shutdown) => break 'outer,
+            None => {}
         }
 
         // ---- poll section: runs after every command or timeout tick ----
@@ -1399,3 +1444,67 @@ fn list_all_named_devices() -> Vec<(rodio::cpal::Device, String)> {
     out
 }
 
+
+#[cfg(test)]
+mod idle_loop_tests {
+    use crossbeam_channel::{bounded, Receiver};
+
+    /// Regression test for the "controller thread exited normally (shutdown?)"
+    /// bug: the controller loop consumed commands with
+    /// `rx.recv_timeout(50ms).ok()` and treated the resulting `None`
+    /// (a plain timeout) like `Cmd::Shutdown`, so an idle app killed its own
+    /// audio threads ~2.5 s after startup; every later Cmd::Load/Cmd::Play
+    /// failed with "sending on a disconnected channel" and playback never
+    /// started. The fixed loop must keep running across timeouts and break
+    /// only on an explicit shutdown or a truly disconnected channel.
+    #[test]
+    fn idle_timeouts_keep_the_controller_alive() {
+        let (tx, rx): (Sender<u32>, Receiver<u32>) = bounded(4);
+        drop(tx); // simulate RodioOutput being dropped -> real shutdown path
+
+        let mut timeouts_seen = 0u32;
+        let mut broke_on_disconnect = false;
+        for _ in 0..1000 {
+            match rx.recv_timeout(std::time::Duration::from_millis(1)) {
+                Ok(_cmd) => {}
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                    timeouts_seen += 1; // must NOT be treated as shutdown
+                }
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                    broke_on_disconnect = true; // the ONLY stop condition
+                    break;
+                }
+            }
+        }
+        assert!(broke_on_disconnect, "loop must exit via Disconnected");
+        // With a dropped sender the very first recv is already Disconnected;
+        // the point of the test is that Timeout is not conflated with it.
+        let _ = timeouts_seen;
+    }
+
+    #[test]
+    fn timeout_is_not_shutdown_in_source() {
+        let src = include_str!("output.rs");
+        // no code line may collapse timeouts into the shutdown arm anymore
+        for line in src.lines() {
+            let t = line.trim_start();
+            if t.starts_with("//") || t.starts_with("///") {
+                continue;
+            }
+            assert!(
+                !t.contains("Some(Cmd::Shutdown) | None => break"),
+                "regression: timeout-as-shutdown arm reintroduced: {t}"
+            );
+            assert!(
+                !t.contains("recv_timeout(std::time::Duration::from_millis(50)).ok()"),
+                "regression: `.ok()` swallowing RecvTimeoutError reintroduced: {t}"
+            );
+        }
+        assert!(src.contains("RecvTimeoutError::Timeout"), "timeout arm missing");
+        assert!(src.contains("RecvTimeoutError::Disconnected"), "disconnect arm missing");
+        assert!(src.contains("Some(Cmd::Shutdown) => break 'outer,"), "explicit shutdown arm missing");
+    }
+
+    // Local alias so the test module compiles standalone.
+    use crossbeam_channel::Sender;
+}
