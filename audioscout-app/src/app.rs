@@ -87,9 +87,6 @@ pub struct AudioScoutApp {
     /// 50 ms playhead poll bookkeeping (§1.2/§5.3): last time the transport
     /// was polled while playing.
     last_playhead_poll: std::time::Instant,
-    /// Peak-hold state for the instantaneous loudness meters (§3.5.1):
-    /// per-bar held peak and when it was reached.
-    meter_hold: [Option<(f32, std::time::Instant)>; 2],
 }
 
 impl AudioScoutApp {
@@ -178,7 +175,6 @@ impl AudioScoutApp {
             view_spectro_key: None,
             document_generation: 0,
             last_playhead_poll: std::time::Instant::now(),
-            meter_hold: [None, None],
         };
 
         // Restore the two independent Waveform/Spectrogram toggles from the
@@ -744,7 +740,12 @@ impl AudioScoutApp {
             // peak-hold marker line
             if self.config_store.config().meter_hold_enabled {
                 let hy = base - h * hold_peak.clamp(0.0, 1.0);
-                painter.line_segment([egui::pos2(x, hy), egui::pos2(x + bar_w, hy)], 1.5, egui::Color32::YELLOW);
+                // egui 0.29: `line_segment` takes [Pos2; 2] and a single
+                // `impl Into<PathStroke>` — width+color go in as one tuple.
+                painter.line_segment(
+                    [egui::pos2(x, hy), egui::pos2(x + bar_w, hy)],
+                    (1.5_f32, egui::Color32::YELLOW),
+                );
             }
             if vis_channels == 2 {
                 painter.text(egui::pos2(x + bar_w, base + 0.0 - 2.0), egui::Align2::CENTER_BOTTOM, if c == 0 { "L" } else { "R" },

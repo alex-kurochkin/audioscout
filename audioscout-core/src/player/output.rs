@@ -161,6 +161,13 @@ impl RodioOutput {
     pub fn set_volume(&self, vol: f32) {
         let _ = self.tx.send(Cmd::SetVolume(vol));
     }
+
+    /// Snapshot of the shared UI-facing transport state machine (§5.3). The
+    /// output thread mirrors its progress into this `Controller`; the UI reads
+    /// it here or through the same `Arc` it passed to `RodioOutput::new`.
+    pub fn controller_state(&self) -> TransportState {
+        self.controller.lock().unwrap_or_else(|p| p.into_inner()).state()
+    }
 }
 
 impl Drop for RodioOutput {
