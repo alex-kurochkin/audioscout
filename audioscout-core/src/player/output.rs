@@ -712,8 +712,10 @@ fn list_output_devices() -> Vec<(rodio::cpal::Device, String)> {
         for device in devices {
             let name: String = device.name().unwrap_or_else(|_| "<unnamed>".to_string());
             // Keep only devices that actually expose an output stream config.
+            // `Devices::supported_output_configs` returns an iterator by value, but
+            // `Iterator::next` still needs a mutable binding for the receiver.
             let outputs = match device.supported_output_configs() {
-                Ok(cfgs) => cfgs.next().is_some(),
+                Ok(mut cfgs) => cfgs.next().is_some(),
                 Err(_) => false,
             };
             if outputs {
