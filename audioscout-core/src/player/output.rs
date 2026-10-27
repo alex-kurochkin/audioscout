@@ -102,6 +102,17 @@ enum Cmd {
 pub struct OutputStreamHolder {
     _stream: rodio::OutputStream,
     _handle: rodio::OutputStreamHandle,
+    /// BUGFIX (playback freezes ~0.5 s after start): the sample rate the cpal
+    /// stream was actually opened with. Every source is resampled to this
+    /// rate before being appended (`slice_to_buffer`), because rodio 0.19's
+    /// dynamic mixer consumes samples at the *hardware* clock and never
+    /// resamples `Sink::append`ed sources itself — a 22050 Hz source on a
+    /// 48 kHz device drains its buffer ~2× faster than the audible window it
+    /// represents and the queue goes silent right after the pre-buffered
+    /// chunk (~0.5 s of sound, then freeze — exactly the reported symptom).
+    pub stream_sample_rate: u32,
+    /// Channel count of the opened config; sources are up/down mixed to it.
+    pub stream_channels: u16,
 }
 
 /// Output-side player: spawns the controller thread on creation and talks to
@@ -138,8 +149,27 @@ impl RodioOutput {
         // `rodio::OutputStream` is `#[deprecated]` in 0.19 (module-level), so
         // this fn opts out of the deprecation warning while keeping the
         // existing, already-working stream lifecycle code intact.
-        #[allow(deprecated)]
-        let mut chosen: Option<(rodio::OutputStream, rodio::OutputStreamHandle)> = None;
+        // BUGFIX (playback freezes ~0.5 s after start): the ALSA/Pulse device
+        // is opened through `rodio::OutputStream::try_from_device`, which
+        // always picks the FIRST supported config of the device. On Debian
+        // with the "pulse" pseudo-device that config can be e.g. 192 kHz
+        // while the file is 44.1/22.05 kHz — the sink then feeds a trickle of
+        // underrun-glued samples and playback appears to freeze right after
+        // starting. To make the real device format visible in the debug log
+        // we probe it here (lazily, once, only for the chosen device).
+        fn log_device_config(device: &rodio::cpal::Device) {
+            // cpal 0.15: `DeviceTrait` lives in `cpal::traits`, not at the
+            // crate root — importing it from the root is E0432.
+            use rodio::cpal::traits::DeviceTrait;
+            match device.default_output_config() {
+                Ok(cfg) => tracing::info!(
+                    "[output] device config: {} ch @ {} Hz",
+                    cfg.channels(),
+                    cfg.sample_rate().0
+                ),
+                Err(e) => tracing::warn!("[output] default_output_config failed: {e}"),
+            }
+        }
         // BUGFIX (silent playback on Debian/ALSA, part 2): the previous
         // strategy preferred the ALSA virtual device named "default". That is
         // WRONG on a typical desktop Debian: cpal's ALSA backend only lists
@@ -164,18 +194,66 @@ impl RodioOutput {
             tracing::debug!("[output] device enumerated: \"{name}\"");
             let _ = &device;
         }
+        // BUGFIX (playback freezes ~0.5 s after start): the ALSA/Pulse device
+        // was opened through `try_from_device`, which always picks the
+        // device's FIRST supported config. When that config's sample format
+        // is not f32 (e.g. S16 on some ALSA PCMs), rodio 0.19 feeds the cpal
+        // callback raw f32 samples reinterpreted as the hardware format —
+        // the stream plays garbage for the pre-buffered window (~0.5 s) and
+        // then stalls, exactly matching the observed symptom. Fix: probe the
+        // device's supported configs once at startup and prefer an f32
+        // config (native rate first, then any f32 range containing it),
+        // opening via `try_from_device_config`. If the device exposes no f32
+        // format at all, fall back to plain `try_from_device` (rodio will
+        // convert internally for its own decoders; our MeteredSource keeps
+        // emitting f32, so the fallback path may misbehave — logged loudly).
+        #[allow(deprecated)]
+        let mut chosen: Option<(rodio::OutputStream, rodio::OutputStreamHandle)> = None;
+        // Sample rate / channel count the stream must be opened with so the
+        // controller thread can resample every appended source to match.
+        let mut stream_format: (u32, u16) = (44100, 2);
         let target: Option<(rodio::cpal::Device, String)> = pick_output_device();
-        if let Some((device, name)) = target {
-            match rodio::OutputStream::try_from_device(&device) {
-                Ok((stream, handle)) => {
-                    tracing::info!("[output] opened audio device \"{name}\"");
-                    chosen = Some((stream, handle));
+        if let Some((device, name)) = &target {
+            log_device_config(device);
+            match select_f32_output_config(device) {
+                Some(cfg) => {
+                    tracing::info!(
+                        "[output] opening \"{name}\" with f32 config {} ch @ {} Hz",
+                        cfg.channels(),
+                        cfg.sample_rate().0
+                    );
+                    // BUGFIX (compilation): rodio 0.19's
+                    // `try_from_device_config(&Device, SupportedStreamConfig)`
+                    // takes a *reference* to the device and a *concrete*
+                    // `SupportedStreamConfig` — not `device.clone()` and not
+                    // `cfg.config()` (that returns the generic `StreamConfig`,
+                    // E0308). `cfg` here is already `SupportedStreamConfig`.
+                    stream_format = (cfg.sample_rate().0, cfg.channels());
+                    #[allow(deprecated)]
+                    match rodio::OutputStream::try_from_device_config(device, cfg) {
+                        Ok((stream, handle)) => {
+                            tracing::info!("[output] opened audio device \"{name}\" (explicit config)");
+                            chosen = Some((stream, handle));
+                        }
+                        Err(e) => tracing::warn!("[output] try_from_device_config(\"{name}\") FAILED: {e} — trying try_from_device"),
+                    }
                 }
-                Err(e) => tracing::warn!("[output] try_from_device(\"{name}\") FAILED: {e} — falling back to system default device"),
+                None => tracing::warn!("[output] no f32 output config on \"{name}\" — falling back to device default format"),
+            }
+            if chosen.is_none() {
+                #[allow(deprecated)]
+                match rodio::OutputStream::try_from_device(device) {
+                    Ok((stream, handle)) => {
+                        tracing::info!("[output] opened audio device \"{name}\" (default config)");
+                        chosen = Some((stream, handle));
+                    }
+                    Err(e) => tracing::warn!("[output] try_from_device(\"{name}\") FAILED: {e} — falling back to system default device"),
+                }
             }
         } else {
             tracing::debug!("[output] no explicit device selected — using system default device");
         }
+        #[allow(deprecated)]
         let (stream, handle) = match chosen {
             Some(pair) => pair,
             None => match rodio::OutputStream::try_default() {
@@ -207,6 +285,8 @@ impl RodioOutput {
         let holder = Arc::new(OutputStreamHolder {
             _stream: stream,
             _handle: handle.clone(),
+            stream_sample_rate: stream_format.0,
+            stream_channels: stream_format.1.max(1),
         });
 
         let join = std::thread::Builder::new()
@@ -214,7 +294,7 @@ impl RodioOutput {
             .spawn({
                 let shared = shared.clone();
                 let controller = controller.clone();
-                move || controller_thread(sink, rx, controller, shared, event_tx)
+                move || controller_thread(sink, rx, controller, shared, event_tx, stream_format)
             });
         match join {
             Ok(_) => tracing::info!("[output] controller thread spawned OK"),
@@ -280,13 +360,49 @@ impl Drop for RodioOutput {
 /// rodio 0.19: `SamplesBuffer<S>` requires `S: Sample`, i.e. the element type
 /// itself (`f32`) — NOT an iterator. The data argument is `D: Into<Vec<S>>`,
 /// so we move the plain `Vec<f32>` in directly.
-fn slice_to_buffer(doc: &Document, start_frame: u64, end_frame: u64) -> rodio::buffer::SamplesBuffer<f32> {
+fn slice_to_buffer(
+    doc: &Document,
+    start_frame: u64,
+    end_frame: u64,
+    stream_format: (u32, u16),
+) -> rodio::buffer::SamplesBuffer<f32> {
     let ch = doc.channels.max(1) as usize;
     let total = doc.total_frames();
     let s = start_frame.min(total) as usize;
     let e = end_frame.clamp(s as u64 + 1, total) as usize;
-    let data: Vec<f32> = doc.samples[s * ch..e * ch].to_vec();
-    rodio::buffer::SamplesBuffer::new(ch as u16, doc.sample_rate, data)
+    let src_rate = doc.sample_rate.max(1);
+    let (dst_rate, dst_ch) = (stream_format.0.max(1), stream_format.1.max(1) as usize);
+    let frames = e - s;
+
+    // BUGFIX (playback freezes ~0.5 s after start): resample the slice to the
+    // device's stream rate and mix to its channel count. rodio 0.19 consumes
+    // appended sources at the hardware clock without resampling, so a file
+    // whose rate differs from the opened config drains N× too fast/slow —
+    // with the observed "half a second of sound, then everything stops".
+    // Linear interpolation per channel; mono/stereo up/down-mix only.
+    let out_frames = ((frames as u64 * dst_rate as u64) / src_rate as u64).max(1) as usize;
+    let mut data: Vec<f32> = Vec::with_capacity(out_frames * dst_ch);
+    let ratio = src_rate as f64 / dst_rate as f64;
+    for i in 0..out_frames {
+        let pos = (i as f64) * ratio;
+        let i0 = (pos as usize).min(frames - 1);
+        let i1 = (i0 + 1).min(frames - 1);
+        let frac = (pos - i0 as f64) as f32;
+        let a = &doc.samples[s * ch + i0 * ch..s * ch + i0 * ch + ch];
+        let b = &doc.samples[s * ch + i1 * ch..s * ch + i1 * ch + ch];
+        if dst_ch == 1 {
+            // down-mix both interpolated frames to mono
+            let l = a[0] + (b[0] - a[0]) * frac;
+            let r = if ch > 1 { a[ch - 1] + (b[ch - 1] - a[ch - 1]) * frac } else { l };
+            data.push((l + r) * 0.5);
+        } else {
+            for c in 0..dst_ch {
+                let sc = c.min(ch - 1); // mono → duplicate, extra ch → last ch
+                data.push(a[sc] + (b[sc] - a[sc]) * frac);
+            }
+        }
+    }
+    rodio::buffer::SamplesBuffer::new(dst_ch as u16, dst_rate, data)
 }
 
 /// Wraps a `SamplesBuffer` and taps every sample for the volume-meter
@@ -364,6 +480,9 @@ fn controller_thread(
     controller: Arc<Mutex<Controller>>,
     shared: Arc<SharedOutput>,
     event_tx: Sender<UiEvent>,
+    // (sample_rate, channels) the OutputStream was opened with — every slice
+    // is resampled/mixed to this format before append (see slice_to_buffer).
+    stream_format: (u32, u16),
 ) {
     // Document currently loaded into the player. Kept as Arc so slices can be
     // copied cheaply when a new source is appended.
@@ -401,13 +520,13 @@ fn controller_thread(
                     // one increment per sample — for stereo this made every
                     // position readout half of the true frame index, and any
                     // later unit mismatch pinned the cursor at 0.
-                    shared.consumed_samples.store(s * d.channels.max(1) as u64, Ordering::Relaxed);
+                    shared.consumed_samples.store(stream_sample_at(d, s, stream_format), Ordering::Relaxed);
                     shared.pos_offset.store(s, Ordering::Relaxed);
                     shared.session_start_frame.store(s, Ordering::Relaxed);
                     sel_start = s;
                     sel_end = e;
                     let src = MeteredSource {
-                        inner: slice_to_buffer(d, s, e),
+                        inner: slice_to_buffer(d, s, e, stream_format),
                         channels: d.channels.max(1),
                         shared: shared.clone(),
                         rms_sum_l: 0.0,
@@ -491,7 +610,14 @@ fn controller_thread(
                 // resume point), then overwrite with the measured audio-clock
                 // position (§5.3 pause freezes position and in-flight PCM).
                 ctrl.pause();
-                ctrl.freeze_resume_at(shared.current_frame(channels_of(&doc)));
+                {
+                    let ch = channels_of(&doc);
+                    // consumed_samples now counts STREAM samples; convert the
+                    // raw counter back to a file-frame index for the state
+                    // machine (see stream_frame_of).
+                    let f = stream_frame_of(&shared.consumed_samples.load(Ordering::Relaxed), doc.as_deref(), ch, stream_format);
+                    ctrl.freeze_resume_at(f);
+                }
             }
             Some(Cmd::Stop) => {
                 pending_play = None; // ... or Stop (§5.3 stop = silence)
@@ -499,8 +625,12 @@ fn controller_thread(
                 shared.source_active.store(false, Ordering::Relaxed);
                 let start = shared.session_start_frame.load(Ordering::Relaxed);
                 let mut ctrl = controller.lock().unwrap_or_else(|p| p.into_inner());
-                let ch = channels_of(&doc);
-                shared.consumed_samples.store(start * ch as u64, Ordering::Relaxed);
+                // Seed the playhead clock in stream-sample units when a
+                // document is loaded; without one fall back to file units.
+                match &doc {
+                    Some(d) => shared.consumed_samples.store(stream_sample_at(d, start, stream_format), Ordering::Relaxed),
+                    None => shared.consumed_samples.store(start * channels_of(&doc) as u64, Ordering::Relaxed),
+                }
                 ctrl.stop_at_session_start(start);
             }
             Some(Cmd::Seek { frame, source: _source }) => {
@@ -511,7 +641,7 @@ fn controller_thread(
                     let target = if sel_end > sel_start { frame.clamp(sel_start, sel_end.saturating_sub(1)) } else { frame };
                     let target = target.min(d.total_frames());
                     sink.stop(); // drop the current source BEFORE appending the new slice
-                    shared.consumed_samples.store(target * ch as u64, Ordering::Relaxed);
+                    shared.consumed_samples.store(frame_to_stream_samples(target, d.sample_rate, stream_format), Ordering::Relaxed);
                     shared.pos_offset.store(target, Ordering::Relaxed);
                     {
                         let mut ctrl = controller.lock().unwrap_or_else(|p| p.into_inner());
@@ -519,7 +649,7 @@ fn controller_thread(
                         if ctrl.is_playing() {
                             let (s, e) = (target, if sel_end > sel_start { sel_end } else { d.total_frames() });
                             let src = MeteredSource {
-                                inner: slice_to_buffer(d, s, e),
+                                inner: slice_to_buffer(d, s, e, stream_format),
                                 channels: ch,
                                 shared: shared.clone(),
                                 rms_sum_l: 0.0,
@@ -547,10 +677,10 @@ fn controller_thread(
                     if let Some(d) = &doc {
                         let ch = d.channels.max(1);
                         sink.stop();
-                        shared.consumed_samples.store(sel_start * ch as u64, Ordering::Relaxed);
+                        shared.consumed_samples.store(frame_to_stream_samples(sel_start, d.sample_rate, stream_format), Ordering::Relaxed);
                         shared.pos_offset.store(sel_start, Ordering::Relaxed);
                         let src = MeteredSource {
-                            inner: slice_to_buffer(d, sel_start, sel_end),
+                            inner: slice_to_buffer(d, sel_start, sel_end, stream_format),
                             channels: ch,
                             shared: shared.clone(),
                             rms_sum_l: 0.0,
@@ -653,10 +783,10 @@ fn controller_thread(
                 // приходит только на ошибках").
                 if let Some(d) = &doc {
                     let ch = d.channels.max(1);
-                    shared.consumed_samples.store(sel_start * ch as u64, Ordering::Relaxed);
+                    shared.consumed_samples.store(frame_to_stream_samples(sel_start, d.sample_rate, stream_format), Ordering::Relaxed);
                     shared.pos_offset.store(sel_start, Ordering::Relaxed);
                     let src = MeteredSource {
-                        inner: slice_to_buffer(d, sel_start, sel_end),
+                        inner: slice_to_buffer(d, sel_start, sel_end, stream_format),
                         channels: ch,
                         shared: shared.clone(),
                         rms_sum_l: 0.0,
@@ -669,8 +799,10 @@ fn controller_thread(
                 // Natural end of a non-loop session: rewind the playhead to
                 // the session start point (§5.3).
                 let start = shared.session_start_frame.load(Ordering::Relaxed);
-                let ch = channels_of(&doc);
-                shared.consumed_samples.store(start * ch as u64, Ordering::Relaxed);
+                match &doc {
+                    Some(d) => shared.consumed_samples.store(stream_sample_at(d, start, stream_format), Ordering::Relaxed),
+                    None => shared.consumed_samples.store(start * channels_of(&doc) as u64, Ordering::Relaxed),
+                }
                 shared.pos_offset.store(start, Ordering::Relaxed);
                 shared.source_active.store(false, Ordering::Relaxed);
                 {
@@ -685,6 +817,45 @@ fn controller_thread(
 
 fn channels_of(doc: &Option<Arc<Document>>) -> u16 {
     doc.as_ref().map(|d| d.channels.max(1)).unwrap_or(2)
+}
+
+/// File-frame → position in the `consumed_samples` clock. The clock counts
+/// one increment per sample emitted by MeteredSource — i.e. samples of the
+/// RESAMPLED stream slice (stream rate × stream channels), not of the source
+/// document. Seeding it with file units (`frame * file_channels`) while the
+/// meter advances in stream units skews the playhead whenever the two differ
+/// (e.g. 22050 Hz file on a 48 kHz device).
+fn stream_sample_at(doc: &Document, frame: u64, stream_format: (u32, u16)) -> u64 {
+    let src_rate = doc.sample_rate.max(1) as u64;
+    let dst_rate = stream_format.0.max(1) as u64;
+    let dst_ch = stream_format.1.max(1) as u64;
+    (frame * dst_rate / src_rate) * dst_ch
+}
+
+/// Inverse of `stream_sample_at`: raw counter → file-frame index. Falls back
+/// to the legacy `counter / file_channels` formula when no document is known.
+fn stream_frame_of(counter: &u64, doc: Option<&Document>, file_channels: u16, stream_format: (u32, u16)) -> u64 {
+    match doc {
+        Some(d) => {
+            let src_rate = d.sample_rate.max(1) as u64;
+            let dst_rate = stream_format.0.max(1) as u64;
+            let dst_ch = stream_format.1.max(1) as u64;
+            (*counter / dst_ch) * src_rate / dst_rate
+        }
+        None => *counter / file_channels.max(1) as u64,
+    }
+}
+
+/// File-frame → position in the `consumed_samples` clock for call sites that
+/// don't have a `Document` at hand (Seek / loop-restart in the controller
+/// thread). The file's own sample rate is passed explicitly; all other math
+/// is identical to `stream_sample_at`. Without this helper the three seek
+/// paths referenced a non-existent function (E0425).
+fn frame_to_stream_samples(frame: u64, file_sample_rate: u32, stream_format: (u32, u16)) -> u64 {
+    let src_rate = file_sample_rate.max(1) as u64;
+    let dst_rate = stream_format.0.max(1) as u64;
+    let dst_ch = stream_format.1.max(1) as u64;
+    (frame * dst_rate / src_rate) * dst_ch
 }
 
 /// Enumerate all devices through **cpal's public host API** (re-exported
@@ -709,6 +880,57 @@ fn device_has_output(device: &rodio::cpal::Device) -> bool {
         Ok(mut cfgs) => cfgs.next().is_some(),
         Err(_) => false,
     }
+}
+
+/// BUGFIX (playback freezes ~0.5 s after start): pick a stream config for the
+/// chosen device that matches what our sources actually emit — `f32` samples.
+/// Probed ONCE at startup for the single selected device only (never during
+/// enumeration, so no dmix/JACK error spam). Strategy:
+///   1. the device's default config when its sample format is f32 (keeps the
+///      desktop's own rate/format choice — Pulse resamples transparently);
+///   2. otherwise the first supported config with `sample_format() == F32`
+///      whose channel count is 1 or 2 (preferring 2);
+///   3. `None` → caller falls back to `try_from_device`.
+fn select_f32_output_config(device: &rodio::cpal::Device) -> Option<rodio::cpal::SupportedStreamConfig> {
+    use rodio::cpal::traits::DeviceTrait;
+    if let Ok(cfg) = device.default_output_config() {
+        if cfg.sample_format() == rodio::cpal::SampleFormat::F32 {
+            return Some(cfg);
+        }
+        tracing::debug!(
+            "[output] default config format {:?} != F32 — scanning supported configs",
+            cfg.sample_format()
+        );
+    }
+    let cfgs = match device.supported_output_configs() {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!("[output] supported_output_configs failed: {e}");
+            return None;
+        }
+    };
+    let mut fallback: Option<rodio::cpal::SupportedStreamConfig> = None;
+    for sc in cfgs {
+        if sc.min_sample_rate() > sc.max_sample_rate() {
+            continue;
+        }
+        if sc.channels() < 1 || sc.channels() > 2 {
+            continue;
+        }
+        // SupportedStreamConfigBuf -> concrete SupportedStreamConfig at the
+        // device's native rate (min == max for most ALSA/Pulse PCMs; for
+        // range devices min_sample_rate is always supported).
+        let concrete = sc.with_max_sample_rate();
+        if concrete.sample_format() == rodio::cpal::SampleFormat::F32 {
+            if concrete.channels() == 2 {
+                return Some(concrete);
+            }
+            if fallback.is_none() {
+                fallback = Some(concrete);
+            }
+        }
+    }
+    fallback
 }
 
 /// Choose the output device, in order of preference:
