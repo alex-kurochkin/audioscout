@@ -140,21 +140,13 @@ impl RodioOutput {
         // existing, already-working stream lifecycle code intact.
         #[allow(deprecated)]
         let mut chosen: Option<(rodio::OutputStream, rodio::OutputStreamHandle)> = None;
-        // DEBUG: dump every output device cpal sees, and mark which one the
-        // ALSA-'default' preference picks vs what try_default() would use.
-        match rodio::OutputStream::enumerate_devices() {
-            Ok(devices) => {
-                for d in devices {
-                    let n = d.name().unwrap_or_else(|_| "<unnamed>".to_string());
-                    tracing::info!("[output] device enumerated: \"{n}\"");
-                }
-            }
-            Err(e) => tracing::warn!("[output] device enumeration failed: {e}"),
-        }
-        if let Some(default_name) = rodio::OutputStream::default_output_device()
-            .and_then(|d| d.name().ok())
-        {
-            tracing::info!("[output] cpal system default output would be \"{default_name}\"");
+        // DEBUG: dump every output device cpal sees (via its own host API —
+        // rodio 0.19 re-exports cpal as `rodio::cpal` but exposes no
+        // enumeration helpers of its own), and mark which one the
+        // ALSA-'default' preference picks.
+        for (device, name) in list_cpal_output_devices() {
+            tracing::info!("[output] device enumerated: \"{name}\"");
+            let _ = &device;
         }
         if let Some((device, name)) = find_alsa_default_device() {
             match rodio::OutputStream::try_from_device(&device) {
@@ -678,6 +670,45 @@ fn channels_of(doc: &Option<Arc<Document>>) -> u16 {
     doc.as_ref().map(|d| d.channels.max(1)).unwrap_or(2)
 }
 
+/// Enumerate all output-capable cpal devices across all hosts.
+///
+/// rodio 0.19 does not re-export device-enumeration helpers on
+/// `OutputStream` (neither `enumerate_devices()` nor
+/// `default_output_device()` exist), so this goes through the cpal host API
+/// directly via `rodio::cpal` — a re-export pinned to the exact cpal version
+/// rodio was built against, which guarantees ABI-compatible `Device` handles
+/// for `OutputStream::try_from_device`.
+fn list_cpal_output_devices() -> Vec<(rodio::cpal::Device, String)> {
+    let mut out = Vec::new();
+    for host in rodio::cpal::host_ids() {
+        let devices = match host.devices() {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::debug!("[output] cpal host devices() failed: {e}");
+                continue;
+            }
+        };
+        for device in devices {
+            // A name/config lookup failure on one device must not abort the
+            // whole scan.
+            let name = match device.name() {
+                Ok(n) => n,
+                Err(_) => continue,
+            };
+            let supports_output = device
+                .supported_output_configs()
+                .map(|mut configs: rodio::cpal::SupportedOutputConfigs<'_, '_>| {
+                    Iterator::next(&mut configs).is_some()
+                })
+                .unwrap_or(false);
+            if supports_output {
+                out.push((device, name));
+            }
+        }
+    }
+    out
+}
+
 /// Find the ALSA "default" output device among cpal's enumerated hosts.
 ///
 /// On Linux/cpal 0.15 every ALSA PCM name is exposed as a separate device and
@@ -686,34 +717,12 @@ fn channels_of(doc: &Option<Arc<Document>>) -> u16 {
 /// configuration) is identifiable by its name. Returns the first match;
 /// `None` on non-ALSA backends or enumeration failure (the caller then falls
 /// back to `OutputStream::try_default`).
-fn find_alsa_default_device() -> Option<(cpal::Device, String)> {
-    let hosts = cpal::host_ids();
-    tracing::debug!("[output] cpal hosts: {hosts:?}");
-    for host in hosts {
-        let devices = match host.devices() {
-            Ok(d) => d,
-            Err(_) => continue,
-        };
-        for device in devices {
-            // A name lookup failure on one device must not abort the whole
-            // scan (previously `?` returned None from the entire function).
-            let name = match device.name() {
-                Ok(n) => n,
-                Err(_) => continue,
-            };
-            // Only consider output-capable devices, then match the ALSA
-            // virtual default (names "default", or "...:dmix..." variants).
-            let supports_output = device
-                .supported_output_configs()
-                .map(|mut c| c.next().is_some())
-                .unwrap_or(false);
-            if !supports_output {
-                continue;
-            }
-            let lname = name.to_lowercase();
-            if lname == "default" || lname.contains("dmix") {
-                return Some((device, name));
-            }
+fn find_alsa_default_device() -> Option<(rodio::cpal::Device, String)> {
+    for (device, name) in list_cpal_output_devices() {
+        let lname = name.to_lowercase();
+        // Match the ALSA virtual default ("default") and dmix-mapped variants.
+        if lname == "default" || lname.contains("dmix") {
+            return Some((device, name));
         }
     }
     None
