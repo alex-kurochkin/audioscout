@@ -275,6 +275,44 @@ fn controller_thread(
     let mut sel_end: u64 = 0;
     let mut loop_enabled = false;
     let mut last_pos_secs: f64 = -1.0;
+    // BUGFIX (play never starts): a Play that arrives before any document is
+    // loaded is parked here and applied by the next Load (§5.1/§5.3).
+    let mut pending_play: Option<(u64, u64)> = None;
+
+    // Append the [start,end) slice of the current document to the sink and
+    // mirror the new session into the shared state (§5.3). Shared by the
+    // Play arm and by the deferred play applied on Load.
+    macro_rules! apply_play {
+        ($start:expr, $end:expr) => {{
+            if let Some(d) = &doc {
+                let total = d.total_frames();
+                // end<=start ⇒ play to EOF (§5.3).
+                let (s, e) = if $end > $start { ($start.min(total), $end.min(total)) } else { ($start.min(total), total) };
+                if e > s {
+                    sink.stop();
+                    shared.consumed_samples.store(s * d.channels.max(1) as u64, Ordering::Relaxed);
+                    shared.pos_offset.store(s, Ordering::Relaxed);
+                    shared.session_start_frame.store(s, Ordering::Relaxed);
+                    sel_start = s;
+                    sel_end = e;
+                    let src = MeteredSource {
+                        inner: slice_to_buffer(d, s, e),
+                        channels: d.channels.max(1),
+                        shared: shared.clone(),
+                        rms_sum_l: 0.0,
+                        rms_sum_r: 0.0,
+                        rms_count: 0,
+                    };
+                    sink.append(src);
+                    shared.source_active.store(true, Ordering::Relaxed);
+                    let mut ctrl = controller.lock().unwrap_or_else(|p| p.into_inner());
+                    ctrl.mark_playing(s, e);
+                    sink.set_volume(ctrl.volume());
+                    loop_enabled = ctrl.is_looping();
+                }
+            }
+        }};
+    }
 
     'outer: loop {
         // Block until something happens: a command, or the current source
@@ -288,6 +326,9 @@ fn controller_thread(
         match cmd_opt {
             Some(Cmd::Load { doc: new_doc }) => {
                 sink.stop(); // drop the current source BEFORE loading (§5.3)
+                // A Play deferred while no document existed is applied to the
+                // freshly loaded buffer now (BUGFIX: play never started).
+                let deferred = pending_play.take();
                 doc = Some(new_doc);
                 sel_start = 0;
                 sel_end = 0;
@@ -297,37 +338,27 @@ fn controller_thread(
                 ctrl.reset();
                 sink.set_volume(ctrl.volume());
                 loop_enabled = ctrl.is_looping();
+                drop(ctrl);
+                if let Some((ps, pe)) = deferred {
+                    apply_play!(ps, pe);
+                }
             }
             Some(Cmd::Play { start, end }) => {
-                if let Some(d) = &doc {
-                    let total = d.total_frames();
-                    // end<=start ⇒ play to EOF (§5.3).
-                    let (s, e) = if end > start { (start.min(total), end.min(total)) } else { (start.min(total), total) };
-                    if e > s {
-                        sink.stop();
-                        shared.consumed_samples.store(s * d.channels.max(1) as u64, Ordering::Relaxed);
-                        shared.pos_offset.store(s, Ordering::Relaxed);
-                        shared.session_start_frame.store(s, Ordering::Relaxed);
-                        sel_start = s;
-                        sel_end = e;
-                        let src = MeteredSource {
-                            inner: slice_to_buffer(d, s, e),
-                            channels: d.channels.max(1),
-                            shared: shared.clone(),
-                            rms_sum_l: 0.0,
-                            rms_sum_r: 0.0,
-                            rms_count: 0,
-                        };
-                        sink.append(src);
-                        shared.source_active.store(true, Ordering::Relaxed);
-                        let mut ctrl = controller.lock().unwrap_or_else(|p| p.into_inner());
-                        ctrl.mark_playing(s, e);
-                        sink.set_volume(ctrl.volume());
-                        loop_enabled = ctrl.is_looping();
-                    }
+                // BUGFIX (play never starts): a Play sent before any document
+                // was loaded used to be silently dropped here — the UI had
+                // already switched its state machine to Playing, so the file
+                // appeared frozen with no audio. Keep the command pending and
+                // apply it as soon as Load delivers the PCM buffer (§5.1:
+                // "stop предыдущего вывода + сброс resume point" happen in
+                // the Load arm below).
+                if doc.is_none() {
+                    pending_play = Some((start, end));
+                } else {
+                    apply_play!(start, end);
                 }
             }
             Some(Cmd::Pause) => {
+                pending_play = None; // a parked Play must not survive Pause
                 sink.stop();
                 shared.source_active.store(false, Ordering::Relaxed);
                 let mut ctrl = controller.lock().unwrap_or_else(|p| p.into_inner());
@@ -338,6 +369,7 @@ fn controller_thread(
                 ctrl.freeze_resume_at(shared.current_frame(channels_of(&doc)));
             }
             Some(Cmd::Stop) => {
+                pending_play = None; // ... or Stop (§5.3 stop = silence)
                 sink.stop();
                 shared.source_active.store(false, Ordering::Relaxed);
                 let start = shared.session_start_frame.load(Ordering::Relaxed);

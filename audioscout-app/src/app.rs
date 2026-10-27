@@ -655,7 +655,11 @@ impl AudioScoutApp {
             let start = sel.map(|(a, _)| a).unwrap_or_else(|| {
                 self.player.lock().unwrap_or_else(|p| p.into_inner()).resume_frame()
             });
-            let end = sel.map(|(_, b)| b).unwrap_or(0);
+            // BUGFIX (play never starts): with no selection the session must
+            // run to EOF. Passing 0 here made Cmd::Play compute `e > s` as
+            // false for every start==0 file and silently drop the append —
+            // the button toggled but nothing played.
+            let end = sel.map(|(_, b)| b).unwrap_or(self.document.total_frames());
             if let Some(out) = &self.output {
                 out.play(start, end);
             }

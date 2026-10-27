@@ -93,7 +93,14 @@ impl AudioView {
     }
     pub fn set_selection(&mut self, start: u64, end: u64) { self.selection = Some(Selection::new(start, end)); }
     pub fn clear_selection(&mut self) { self.selection = None; }
-    pub fn selection_range(&self) -> Option<(u64, u64)> { self.selection.map(|s| (s.start_frame, s.end_frame)) }
+    /// Playable selection range. A degenerate (empty) selection is NOT a
+    /// playback range: reporting it as `Some((a, a))` made the UI pass
+    /// end == start to the transport, which silently dropped every Play —
+    /// "кнопка нажимается, но воспроизведение не стартует" (§5.3). Empty
+    /// selections must degrade to None ("play from the resume point to EOF").
+    pub fn selection_range(&self) -> Option<(u64, u64)> {
+        self.selection.and_then(|s| if s.is_empty() { None } else { Some((s.start_frame, s.end_frame)) })
+    }
     pub fn frame_to_x(&self, frame: u64, widget_width: u32) -> f32 {
         let view_len = self.view_range.len() as f32;
         if view_len == 0.0 { return 0.0; }
@@ -112,3 +119,23 @@ impl AudioView {
     }
     fn view_center(&self) -> u64 { (self.view_range.start_frame + self.view_range.end_frame) / 2 }
 }
+
+#[cfg(test)]
+mod play_start_tests {
+    use super::*;
+
+    /// Regression: an empty (degenerate) selection must not masquerade as a
+    /// playback range — it used to send end == start to the transport and
+    /// every Play was silently dropped ("воспроизведение не стартует").
+    #[test]
+    fn empty_selection_is_not_a_playable_range() {
+        let mut v = AudioView::new(1000);
+        v.set_selection(500, 500); // zero-length drag/click selection
+        assert_eq!(v.selection_range(), None);
+        v.set_selection(200, 600);
+        assert_eq!(v.selection_range(), Some((200, 600)));
+        v.clear_selection();
+        assert_eq!(v.selection_range(), None);
+    }
+}
+
