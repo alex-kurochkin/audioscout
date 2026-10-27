@@ -1,6 +1,7 @@
 use audioscout_core::config::ConfigStore;
 use audioscout_core::player::controller::Controller;
-use audioscout_core::player::{PlayheadState, TransportState};
+use audioscout_core::player::output::RodioOutput;
+use audioscout_core::player::{MeterData, PlayheadState, TransportState};
 use audioscout_core::scanner::Scanner;
 use audioscout_core::table::{Column, ColumnLayout, FileRow};
 use audioscout_core::audio_view::{AudioView, AudioViewMode};
@@ -32,7 +33,17 @@ pub struct AudioScoutApp {
     filter_text: String,
     document: Document,
     active_file: Option<PathBuf>,
-    player: Controller,
+    player: Arc<Mutex<Controller>>,
+    /// Real audio output (rodio/cpal, tz §5.2). `None` when no audio device
+    /// could be opened — transport stays usable for browsing/editing.
+    output: Option<RodioOutput>,
+    /// Volume-meter display state (§3.5.1): live values + peak-hold timer.
+    meter_live: MeterData,
+    meter_hold: MeterData,
+    meter_hold_until: f64,
+    /// Wall-clock of the previous UI frame — drives the ~300 ms meter
+    /// decay after pause/stop (§3.5.1 "При паузе/стопе шкалы гаснут до нуля").
+    last_frame_time: f64,
     audio_view: AudioView,
     undo_stack: UndoStack,
     show_settings: bool,
@@ -126,7 +137,11 @@ impl AudioScoutApp {
         let channel = EventChannel::new();
         let event_tx = channel.sender.clone();
         let event_rx = channel.receiver;
-        let player = Controller::new(Arc::new(PlayheadState::new()));
+        let player = Arc::new(Mutex::new(Controller::new(Arc::new(PlayheadState::new()))));
+        // Single application-wide OutputStream, created once at startup and
+        // kept alive for the whole session (tz §5.2). Without an audio device
+        // RodioOutput::new returns None and playback is silently unavailable.
+        let output = RodioOutput::new(player.clone(), event_tx.clone());
         let undo_dir = config_dir.join("undo");
         let undo_stack = UndoStack::new(undo_dir, config_store.config().undo_depth, config_store.config().undo_disk_limit_mb);
         let preview_worker = PreviewWorker::new(event_tx.clone());
@@ -141,7 +156,9 @@ impl AudioScoutApp {
             scanner, preview_worker,
             current_dir: None, file_rows: Vec::new(), scan_generation: 0,
             column_layout: ColumnLayout::new(), selected_row: None, filter_text: String::new(),
-            document: Document::new(), active_file: None, player,
+            document: Document::new(), active_file: None, player, output,
+            meter_live: MeterData::default(), meter_hold: MeterData::default(),
+            meter_hold_until: 0.0, last_frame_time: 0.0,
             audio_view: AudioView::new(0), undo_stack,
             preview_mode,
             preview_cache_wave: HashMap::new(),
@@ -341,11 +358,39 @@ impl AudioScoutApp {
                 }
                 UiEvent::PlayheadUpdate { position_secs } => {
                     let frame = (position_secs * self.document.sample_rate as f64) as u64;
+                    // The output thread owns the audio clock while playing —
+                    // mirror it into the UI state machine as a playback-side
+                    // move (never a user seek, so the resume point stays put;
+                    // tz §5.3 CursorSource::Playback).
+                    if self.output.is_some() && self.player_state() == TransportState::Playing {
+                        let mut ctrl = self.player.lock().unwrap_or_else(|p| p.into_inner());
+                        ctrl.freeze_resume_at(frame);
+                    }
                     self.audio_view.set_cursor(frame);
                     self.audio_view.auto_scroll_to_cursor();
                 }
                 UiEvent::PlaybackFinished => { self.status_message = "Playback finished".to_string(); }
-                UiEvent::VolumeMeterUpdate { .. } => {}
+                UiEvent::VolumeMeterUpdate { peak_l, peak_r, rms_l, rms_r } => {
+                    // Volume meter (§3.5.1): instantaneous scale with optional
+                    // peak-hold; RMS scale is always live.
+                    let cfg = self.config_store.config();
+                    let now = ctx.input(|i| i.time);
+                    self.meter_live = MeterData { peak_l, peak_r, rms_l, rms_r };
+                    let hold = cfg.meter_hold_enabled;
+                    let secs = cfg.meter_hold_seconds.max(0.2).min(5.0);
+                    if hold {
+                        if peak_l >= self.meter_hold.peak_l || now >= self.meter_hold_until {
+                            self.meter_hold.peak_l = peak_l;
+                        }
+                        if peak_r >= self.meter_hold.peak_r || now >= self.meter_hold_until {
+                            self.meter_hold.peak_r = peak_r;
+                        }
+                        if peak_l.max(peak_r) > 0.0 { self.meter_hold_until = now + secs; }
+                    } else {
+                        self.meter_hold = self.meter_live;
+                        self.meter_hold_until = now;
+                    }
+                }
                 UiEvent::DisksChanged { disks } => {
                     self.disks = disks;
                 }
@@ -355,8 +400,8 @@ impl AudioScoutApp {
 
     fn load_file(&mut self, path: &Path) {
         if !is_editable_file(path) { self.status_message = "File format not editable".to_string(); return; }
-        self.player.stop();
-        self.player.reset();
+        self.transport_stop();
+        self.player.lock().unwrap_or_else(|p| p.into_inner()).reset();
         match audioscout_core::audio_io::load_audio(path) {
             Ok((samples, sr, ch, st)) => {
                 self.document = Document {
@@ -370,6 +415,11 @@ impl AudioScoutApp {
                 }
                 self.audio_view = AudioView::new(self.document.total_frames());
                 self.active_file = Some(path.to_path_buf());
+                // Hand the fresh PCM buffer to the output thread (§5.1: stop
+                // of previous output + resume-point reset happen there).
+                if let Some(out) = &self.output {
+                    out.load_document(Arc::new(self.document.clone()));
+                }
                 self.undo_stack.clear();
                 let _ = self.db.save_session("lastFile", &path.to_string_lossy());
                 let _ = self.db.save_session("lastPos", "0");
@@ -582,6 +632,120 @@ impl AudioScoutApp {
         }
     }
 
+    /// Transport play/pause routed through the real audio output when one is
+    /// available; without a device it degrades to state-machine-only mode so
+    /// the UI never hangs on missing audio (§1.2 "раньше времени не падают").
+    fn transport_play_pause(&mut self) {
+        let sel = self.audio_view.selection_range();
+        let state = self.player_state();
+        if state == TransportState::Playing {
+            // Pause: freeze position + in-flight PCM (§5.3). Without a real
+            // output device the state machine alone carries the semantics.
+            if let Some(out) = &self.output { out.pause(); }
+            let mut ctrl = self.player.lock().unwrap_or_else(|p| p.into_inner());
+            ctrl.pause();
+        } else {
+            // Play: selection wins over the resume point (§3.5/§5.3).
+            let start = sel.map(|(a, _)| a).unwrap_or_else(|| {
+                self.player.lock().unwrap_or_else(|p| p.into_inner()).resume_frame()
+            });
+            let end = sel.map(|(_, b)| b).unwrap_or(0);
+            if let Some(out) = &self.output {
+                out.play(start, end);
+            }
+            let mut ctrl = self.player.lock().unwrap_or_else(|p| p.into_inner());
+            if self.output.is_some() {
+                // With a live output the state machine must not advance on its
+                // own clock — the real playhead arrives via PlayheadUpdate.
+                ctrl.mark_playing(start, if end > start { end } else { self.document.total_frames() });
+            } else {
+                ctrl.play(&self.document, sel);
+            }
+        }
+    }
+
+    fn transport_stop(&mut self) {
+        if let Some(out) = &self.output { out.stop(); }
+        let mut ctrl = self.player.lock().unwrap_or_else(|p| p.into_inner());
+        ctrl.stop();
+    }
+
+    fn transport_seek(&mut self, frame: u64, source: audioscout_core::player::CursorSource) {
+        if let Some(out) = &self.output { out.seek(frame, source); }
+        let mut ctrl = self.player.lock().unwrap_or_else(|p| p.into_inner());
+        ctrl.seek(frame, &self.document, source);
+    }
+
+    fn transport_toggle_loop(&mut self) {
+        let enabled = {
+            let ctrl = self.player.lock().unwrap_or_else(|p| p.into_inner());
+            !ctrl.is_looping()
+        };
+        if let Some(out) = &self.output { out.set_loop(enabled); }
+        let mut ctrl = self.player.lock().unwrap_or_else(|p| p.into_inner());
+        ctrl.set_loop(enabled);
+    }
+
+    fn transport_set_volume(&mut self, vol: f32) {
+        if let Some(out) = &self.output { out.set_volume(vol); }
+        let mut ctrl = self.player.lock().unwrap_or_else(|p| p.into_inner());
+        ctrl.set_volume(vol);
+    }
+
+    fn player_state(&self) -> TransportState {
+        self.player.lock().unwrap_or_else(|p| p.into_inner()).state()
+    }
+
+    fn player_current_secs(&self) -> f64 {
+        let ctrl = self.player.lock().unwrap_or_else(|p| p.into_inner());
+        ctrl.current_secs(self.document.sample_rate)
+    }
+
+    /// Two vertical scales per channel — instantaneous peak (+hold marker)
+    /// and RMS — drawn at the right side of the player window (§3.5.1).
+    fn draw_volume_meter(&self, ui: &egui::Ui, rect: egui::Rect) {
+        let painter = ui.painter();
+        let ch = self.document.channels.max(1);
+        let vis_channels = if ch == 1 { 1usize } else { 2usize };
+        let bar_w = ((rect.width() - 8.0 * vis_channels as f32) / vis_channels as f32 * 0.5).max(6.0);
+        let gap = 8.0f32;
+        let mut x = rect.min.x;
+        for c in 0..vis_channels {
+            let (live_peak, live_rms, hold_peak) = if c == 0 {
+                (self.meter_live.peak_l, self.meter_live.rms_l, self.meter_hold.peak_l)
+            } else {
+                (self.meter_live.peak_r, self.meter_live.rms_r, self.meter_hold.peak_r)
+            };
+            let h = rect.height();
+            let base = rect.max.y;
+            // background troughs
+            for dx in [0.0f32, bar_w + 2.0] {
+                painter.rect_filled(
+                    egui::Rect::from_min_max(egui::pos2(x + dx, base - h), egui::pos2(x + dx + bar_w, base)),
+                    2.0,
+                    egui::Color32::from_gray(40),
+                );
+            }
+            let peak_y = base - h * live_peak.clamp(0.0, 1.0);
+            let rms_y = base - h * live_rms.clamp(0.0, 1.0);
+            // instantaneous scale (green→red by level)
+            let peak_col = if live_peak > 0.95 { egui::Color32::RED } else { egui::Color32::from_rgb(80, 220, 80) };
+            painter.rect_filled(egui::Rect::from_min_max(egui::pos2(x, peak_y), egui::pos2(x + bar_w, base)), 1.0, peak_col);
+            // RMS scale (blue)
+            painter.rect_filled(egui::Rect::from_min_max(egui::pos2(x + bar_w + 2.0, rms_y), egui::pos2(x + 2.0 * bar_w + 2.0, base)), 1.0, egui::Color32::LIGHT_BLUE);
+            // peak-hold marker line
+            if self.config_store.config().meter_hold_enabled {
+                let hy = base - h * hold_peak.clamp(0.0, 1.0);
+                painter.line_segment([egui::pos2(x, hy), egui::pos2(x + bar_w, hy)], 1.5, egui::Color32::YELLOW);
+            }
+            if vis_channels == 2 {
+                painter.text(egui::pos2(x + bar_w, base + 0.0 - 2.0), egui::Align2::CENTER_BOTTOM, if c == 0 { "L" } else { "R" },
+                    egui::FontId::proportional(9.0), ui.visuals().text_color());
+            }
+            x += 2.0 * bar_w + gap + 2.0;
+        }
+    }
+
     fn navigate_file(&mut self, direction: i32) {
         if self.file_rows.is_empty() { return; }
         let current_idx = self.selected_row.unwrap_or(0) as i32;
@@ -687,7 +851,7 @@ impl AudioScoutApp {
                         let mod_match = binding.ctrl == modifiers.ctrl && binding.shift == modifiers.shift && binding.alt == modifiers.alt;
                         if key_match && mod_match {
                             match action.as_str() {
-                                "playpause" => { let sel = self.audio_view.selection_range(); self.player.play_pause(&self.document, sel); }
+                                "playpause" => self.transport_play_pause(),
                                 "mute" => self.mute_selection(),
                                 "normalize" => self.normalize_selection(),
                                 "undo" => self.undo(),
@@ -700,16 +864,21 @@ impl AudioScoutApp {
                                 "zoomReset" => self.audio_view.zoom_reset(),
                                 "prev" => self.navigate_file(-1),
                                 "next" => self.navigate_file(1),
-                                "gotoStart" => { self.audio_view.set_cursor(0); self.player.seek(0, &self.document, audioscout_core::player::CursorSource::User); }
+                                "gotoStart" => { self.audio_view.set_cursor(0); self.transport_seek(0, audioscout_core::player::CursorSource::User); }
                                 _ => {}
                             }
                         }
                     }
                     if *key == egui::Key::ArrowLeft || *key == egui::Key::ArrowRight {
                         let direction = if *key == egui::Key::ArrowRight { 1 } else { -1 };
-                        if self.player.state() == TransportState::Playing {
-                            self.player.skip(&self.document, direction * config.skip_seconds as i32);
-                            let frame = self.player.current_frame();
+                        if self.player_state() == TransportState::Playing {
+                            let target = {
+                                let mut ctrl = self.player.lock().unwrap_or_else(|p| p.into_inner());
+                                ctrl.skip(&self.document, direction * config.skip_seconds as i32);
+                                ctrl.current_frame()
+                            };
+                            self.transport_seek(target, audioscout_core::player::CursorSource::User);
+                            let frame = target;
                             self.audio_view.set_cursor(frame);
                         } else {
                             let step = if self.audio_view.view_range.len() > 100 { self.audio_view.view_range.len() / 100 } else { 1 };
@@ -725,9 +894,24 @@ impl AudioScoutApp {
 
 impl eframe::App for AudioScoutApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Meter decay when nothing new arrives (pause/stop): exponential-ish
+        // fade to zero over ~300 ms (§3.5.1). While playing, fresh
+        // VolumeMeterUpdate events overwrite these values every poll tick.
+        {
+            let now = ctx.input(|i| i.time);
+            let dt = (now - self.last_frame_time).clamp(0.0, 0.1) as f32;
+            self.last_frame_time = now;
+            if self.player_state() != TransportState::Playing {
+                const DECAY: f32 = 10.0; // ~1/e per 100 ms → silent in ~300 ms
+                let k = (1.0 - DECAY * dt).max(0.0);
+                self.meter_live.peak_l *= k; self.meter_live.peak_r *= k;
+                self.meter_live.rms_l *= k; self.meter_live.rms_r *= k;
+                self.meter_hold.peak_l *= k; self.meter_hold.peak_r *= k;
+            }
+        }
         self.process_events(ctx);
         self.handle_keyboard(ctx);
-        if self.player.state() == TransportState::Playing { ctx.request_repaint_after(std::time::Duration::from_millis(50)); }
+        if self.player_state() == TransportState::Playing { ctx.request_repaint_after(std::time::Duration::from_millis(50)); }
 
         // Preview pump: while any thumbnail is still missing, keep draining
         // events and repainting on a fixed cadence. Without this, egui's
@@ -992,7 +1176,7 @@ impl eframe::App for AudioScoutApp {
                     let x_ratio = (pos.x - rect.left()) / rect.width();
                     let frame = self.audio_view.x_to_frame(x_ratio * rect.width(), rect.width() as u32);
                     self.audio_view.set_cursor(frame);
-                    self.player.seek(frame, &self.document, audioscout_core::player::CursorSource::User);
+                    self.transport_seek(frame, audioscout_core::player::CursorSource::User);
                 }
             }
 
@@ -1009,21 +1193,37 @@ impl eframe::App for AudioScoutApp {
         // i.e. docked *above* it and directly under the file-actions panel
         // (bug #1: Play/Stop must sit above the audio-content view).
         egui::TopBottomPanel::bottom("player").default_height(80.0).show(ctx, |ui| {
+            // §3.5.1: transport controls on the left, the volume meter is
+            // docked to the right edge of the same window (controls are laid
+            // out inside the reduced rect so nothing overlaps).
+            let panel_rect = ui.max_rect();
+            let meter_w = 90.0f32;
+            let meter_rect = egui::Rect::from_min_max(
+                egui::pos2(panel_rect.right() - meter_w, panel_rect.min.y + 4.0),
+                egui::pos2(panel_rect.right() - 4.0, panel_rect.max.y - 4.0),
+            );
+            // Reserve the right strip for the meter; everything else lays
+            // out in a child UI confined to the remaining area.
+            ui.allocate_ui(egui::vec2(meter_rect.min.x - 6.0 - panel_rect.min.x, panel_rect.height()), |ui| {
             ui.horizontal(|ui| {
                 if ui.button("|<").clicked() { self.navigate_file(-1); }
-                let play_text = match self.player.state() { TransportState::Playing => "⏸", _ => "▶" };
-                if ui.button(play_text).clicked() { let sel = self.audio_view.selection_range(); self.player.play_pause(&self.document, sel); }
-                if ui.button("⏹").clicked() { self.player.stop(); }
+                let play_text = match self.player_state() { TransportState::Playing => "⏸", _ => "▶" };
+                if ui.button(play_text).clicked() { self.transport_play_pause(); }
+                if ui.button("⏹").clicked() { self.transport_stop(); }
                 if ui.button(">|").clicked() { self.navigate_file(1); }
-                let loop_color = if self.player.is_looping() && self.player.state() == TransportState::Playing { egui::Color32::YELLOW } else if self.player.is_looping() { egui::Color32::GREEN } else { ui.visuals().text_color() };
-                if ui.colored_label(loop_color, "🔁").clicked() { self.player.toggle_loop(); }
+                let (looping, playing_now) = {
+                    let ctrl = self.player.lock().unwrap_or_else(|p| p.into_inner());
+                    (ctrl.is_looping(), ctrl.state() == TransportState::Playing)
+                };
+                let loop_color = if looping && playing_now { egui::Color32::YELLOW } else if looping { egui::Color32::GREEN } else { ui.visuals().text_color() };
+                if ui.colored_label(loop_color, "🔁").clicked() { self.transport_toggle_loop(); }
                 ui.separator();
                 if ui.button("+").clicked() { self.audio_view.zoom_in(); }
                 if ui.button("−").clicked() { self.audio_view.zoom_out(); }
                 ui.separator();
                 ui.label("Vol:");
-                let mut vol = self.player.volume() * 100.0;
-                if ui.add(egui::Slider::new(&mut vol, 0.0..=100.0)).changed() { self.player.set_volume(vol / 100.0); }
+                let mut vol = self.player.lock().unwrap_or_else(|p| p.into_inner()).volume() * 100.0;
+                if ui.add(egui::Slider::new(&mut vol, 0.0..=100.0)).changed() { self.transport_set_volume(vol / 100.0); }
                 ui.separator();
                 let save_color = if self.document.dirty { egui::Color32::YELLOW } else { ui.visuals().text_color() };
                 let save_label = if self.document.dirty { "Save*" } else { "Save" };
@@ -1042,11 +1242,13 @@ impl eframe::App for AudioScoutApp {
             });
             ui.horizontal(|ui| {
                 let duration = self.document.duration_secs();
-                let current_pos = self.player.current_secs(self.document.sample_rate);
+                let current_pos = self.player_current_secs();
                 let time_str = if duration < 60.0 { format!("{:.1}s / {:.1}s", current_pos, duration) } else { format!("{} / {}", format_time_hms(current_pos), format_time_hms(duration)) };
                 ui.label(time_str);
                 if duration > 0.0 { let progress = (current_pos / duration) as f32; ui.add(egui::ProgressBar::new(progress).desired_width(ui.available_width())); }
             });
+            });
+            self.draw_volume_meter(ui, meter_rect);
         });
 
         // File-actions panel (Mute / Normalize / Apply …) — declared after
@@ -1440,7 +1642,7 @@ impl eframe::App for AudioScoutApp {
 
             if let Some(skip) = skip_seconds_changed {
                 self.config_store.config_mut().skip_seconds = skip;
-                self.player.set_skip_seconds(skip);
+                self.player.lock().unwrap_or_else(|p| p.into_inner()).set_skip_seconds(skip);
                 let _ = self.config_store.save();
             }
 
@@ -1510,7 +1712,7 @@ impl eframe::App for AudioScoutApp {
         if let Some(dir) = &self.current_dir { let _ = self.db.save_session("lastDir", &dir.to_string_lossy()); }
         if let Some(file) = &self.active_file {
             let _ = self.db.save_session("lastFile", &file.to_string_lossy());
-            let pos = self.player.current_secs(self.document.sample_rate);
+            let pos = self.player_current_secs();
             let _ = self.db.save_session("lastPos", &pos.to_string());
         }
         let _ = self.config_store.save();

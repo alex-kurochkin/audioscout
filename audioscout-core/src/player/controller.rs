@@ -47,6 +47,9 @@ impl Controller {
             TransportState::Paused => self.play(doc, selection),
         }
     }
+    /// True when a playback session is active (state Playing). Used by the
+    /// output thread to decide whether a Seek must re-append audio (§5.3).
+    pub fn is_playing(&self) -> bool { self.state == TransportState::Playing }
     pub fn seek(&mut self, frame: u64, doc: &Document, source: CursorSource) {
         let max_frame = doc.total_frames();
         let target = frame.min(max_frame);
@@ -72,6 +75,31 @@ impl Controller {
         }
         self.playhead.set_position_samples(self.current_frame);
         false
+    }
+    /// Output-thread hooks (§5.2/§5.3): the real audio clock lives in
+    /// `player::output`; these keep the UI-facing state machine consistent.
+    /// Mark a new playing session [start,end) started by the output thread.
+    pub fn mark_playing(&mut self, start: u64, end: u64) {
+        self.start_frame = start; self.end_frame = end; self.current_frame = start;
+        self.resume_frame = start;
+        self.state = TransportState::Playing; self.playhead.set_playing(true);
+        self.playhead.set_position_samples(start);
+    }
+    /// Freeze the resume point at an externally measured position (pause).
+    pub fn freeze_resume_at(&mut self, frame: u64) {
+        self.current_frame = frame; self.resume_frame = frame;
+        self.playhead.set_position_samples(frame);
+    }
+    /// Stop with the playhead rewound to the session start point (§5.3).
+    pub fn stop_at_session_start(&mut self, start: u64) {
+        self.state = TransportState::Stopped;
+        self.current_frame = start; self.resume_frame = start;
+        self.playhead.set_position_samples(start); self.playhead.set_playing(false);
+        self.meter.reset();
+    }
+    /// Natural end of a non-loop session: stopped, car back at session start.
+    pub fn finish_session_at(&mut self, start: u64) {
+        self.stop_at_session_start(start);
     }
     pub fn current_frame(&self) -> u64 { self.current_frame }
     pub fn current_secs(&self, sample_rate: u32) -> f64 { self.current_frame as f64 / sample_rate as f64 }

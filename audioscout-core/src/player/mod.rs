@@ -1,4 +1,5 @@
 pub mod controller;
+pub mod output;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
