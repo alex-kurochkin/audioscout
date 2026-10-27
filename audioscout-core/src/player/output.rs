@@ -10,7 +10,7 @@
 //! through atomics / a mutex and polled by the UI every 50 ms (§1.2, §5.3).
 
 use std::sync::{
-    atomic::{AtomicBool, AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     Arc, Mutex,
 };
 
@@ -124,8 +124,13 @@ struct PumpState {
     session: Mutex<Option<(u64, u64)>>,
     /// File frame the pump must feed next (only meaningful while Some above).
     cursor_frame: AtomicU64,
-    /// Live Sink reference, published once when the controller thread starts.
-    sink: Mutex<Option<rodio::Sink>>,
+    /// BUGFIX (E0599 `rodio::Sink` is not `Clone`): rodio 0.19's `Sink` has no
+    /// `clone()` — the old design published a *copy* of the Sink into this
+    /// slot for the pump thread, which never compiled. Instead the pump now
+    /// appends through an Arc-wrapped handle created ONCE in `RodioOutput::new`
+    /// (an `Arc<Sink>` can be cloned freely; every clone drives the same
+    /// hardware stream), so this field simply keeps that shared handle alive.
+    sink: Arc<Mutex<Option<Arc<rodio::Sink>>>>,
     /// The document currently loaded — owned by the controller thread and
     /// cloned into here on every `Cmd::Load` so the pump can slice it without
     /// reaching back into the controller's locals (§5.2: single writer).
@@ -301,8 +306,12 @@ impl RodioOutput {
         // `Sink::try_new(&OutputStreamHandle)` (the error variant can only
         // happen if the stream died between calls; fall back to silence then).
         // NOTE: 0.19 has no `set_speed_of_playback` — playback rate stays 1.0.
+        // BUGFIX (E0599): `rodio::Sink` is NOT `Clone`, but the pump thread
+        // must append alongside the controller thread. Wrap it in an Arc —
+        // every Arc clone drives the same hardware queue, so both threads can
+        // hold a handle without cloning the Sink itself.
         let sink = match rodio::Sink::try_new(&handle) {
-            Ok(s) => s,
+            Ok(s) => Arc::new(s),
             Err(e) => {
                 tracing::error!("[output] Sink::try_new FAILED: {e} — playback will never start");
                 return None;
@@ -510,6 +519,10 @@ struct MeteredSource {
     inner: rodio::buffer::SamplesBuffer<f32>,
     channels: u16,
     shared: Arc<SharedOutput>,
+    // BUGFIX (playback dies ~0.5 s after start): the pump paces itself by
+    // this counter — it is incremented on `append` and decremented here when
+    // the chunk runs dry, so the queue never grows past ~1 s of audio.
+    chunks: Arc<AtomicUsize>,
     // Local mirror of the global `consumed_samples` clock. Incremented in
     // `next()` and flushed into the atomic only every 512 samples — see the
     // BUGFIX note below (atomic-per-sample starved the cpal callback).
@@ -558,10 +571,12 @@ impl Iterator for MeteredSource {
             }
             None => {
                 // Source exhausted — flush whatever remains in the window so
-                // the final partial block still reaches the meter/clock.
+                // the final partial block still reaches the meter/clock, and
+                // release this chunk's slot in the pump's queue budget.
                 if self.rms_count > 0 {
                     self.publish();
                 }
+                self.chunks.fetch_sub(1, Ordering::AcqRel);
                 None
             }
         }
@@ -612,7 +627,7 @@ impl rodio::Source for MeteredSource {
 /// transport mutations (§5.3: "stop→append последовательно в одном потоке
 /// контроллера").
 fn controller_thread(
-    sink: rodio::Sink,
+    sink: Arc<rodio::Sink>,
     rx: Receiver<Cmd>,
     controller: Arc<Mutex<Controller>>,
     shared: Arc<SharedOutput>,
@@ -625,10 +640,10 @@ fn controller_thread(
     // hardware clock instead of in one giant `slice_to_buffer` allocation.
     pump: Arc<PumpState>,
 ) {
-    // Publish the Sink and spawn the pump thread (§5.2: "поток вывода один",
-    // pacing lives next to it). The pump holds its OWN copy of the currently
-    // loaded document (single writer: the Load arm below) and appends small
-    // chunks into the Sink as the hardware clock consumes them.
+    // Publish the shared Sink handle and spawn the pump thread (§5.2: "поток
+    // вывода один", pacing lives next to it). `rodio::Sink` is not `Clone`
+    // (E0599 fix): both threads drive the SAME `Arc<Sink>` — every `append`
+    // from either side queues into the one hardware stream.
     *pump.sink.lock().unwrap_or_else(|p| p.into_inner()) = Some(sink.clone());
     {
         let pump = pump.clone();
@@ -875,8 +890,11 @@ fn controller_thread(
             let active = shared.source_active.load(Ordering::Relaxed);
             let pumped_done = {
                 let sess = pump.session.lock().unwrap_or_else(|p| p.into_inner());
-                match &*sess {
-                    Some(&(s, e)) => pump.cursor_frame.load(Ordering::Relaxed) >= e && s < e,
+                match *sess {
+                    // `sess` is an Option<(u64, u64)> guard; destructuring the
+                    // Copy tuple through `Some(&(s,e))` fails E0308 — match on
+                    // the value directly.
+                    Some((s, e)) => s < e && pump.cursor_frame.load(Ordering::Relaxed) >= e,
                     None => false,
                 }
             };
@@ -1002,6 +1020,12 @@ fn pump_thread(pump: Arc<PumpState>, stream_format: (u32, u16)) {
     const CHUNK_SECONDS: f64 = 0.5;
     const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(25);
 
+    // BUGFIX (playback dies ~0.5 s after start): number of chunks currently
+    // sitting in the Sink queue. Shared with every MeteredSource so a chunk
+    // decrements it when the cpal callback drains it to exhaustion — the pump
+    // then tops the queue back up instead of racing ahead or sleeping blindly.
+    let queued_chunks = Arc::new(AtomicUsize::new(0));
+
     loop {
         if pump.quit.load(Ordering::Relaxed) {
             break;
@@ -1014,20 +1038,23 @@ fn pump_thread(pump: Arc<PumpState>, stream_format: (u32, u16)) {
                 continue;
             }
         };
-        let doc = pump.doc.lock().unwrap_or_else(|p| p.into_inner()).clone();
-        let sink_guard = pump.sink.lock().unwrap_or_else(|p| p.into_inner());
-        let sink = match sink_guard.as_ref() {
-            Some(s) => s.clone(),
-            None => {
-                drop(sink_guard);
-                std::thread::sleep(POLL_INTERVAL);
-                continue;
+        // BUGFIX (E0505/E0599): the Sink is not `Clone` — take an Arc clone of
+        // the shared handle and release the mutex immediately, so no borrow of
+        // `sink_guard` outlives its scope.
+        let sink: Arc<rodio::Sink> = {
+            let guard = pump.sink.lock().unwrap_or_else(|p| p.into_inner());
+            match guard.as_ref() {
+                Some(s) => s.clone(),
+                None => {
+                    drop(guard);
+                    std::thread::sleep(POLL_INTERVAL);
+                    continue;
+                }
             }
         };
-        let d = match doc {
+        let d = match pump.doc.lock().unwrap_or_else(|p| p.into_inner()).clone() {
             Some(d) => d,
             None => {
-                drop(sink_guard);
                 std::thread::sleep(POLL_INTERVAL);
                 continue;
             }
@@ -1042,7 +1069,18 @@ fn pump_thread(pump: Arc<PumpState>, stream_format: (u32, u16)) {
         if cursor >= s_end.min(total) {
             // Everything audible has been handed to the Sink; wait for the
             // controller to detect drain-completion or issue a new session.
-            drop(sink_guard);
+            std::thread::sleep(POLL_INTERVAL);
+            continue;
+        }
+
+        // BUGFIX (playback dies ~0.5 s after start): pace by the sink queue,
+        // not by wall-clock sleeps. `s_start` is intentionally unused here —
+        // the pump always resumes at `cursor_frame`, which the controller
+        // resets to the session start on Play/Seek (§5.3).
+        let _ = s_start;
+        const QUEUE_SECONDS: f64 = 1.0;
+        let max_queued_chunks = ((QUEUE_SECONDS / CHUNK_SECONDS) as usize).max(2);
+        if queued_chunks.load(Ordering::Acquire) >= max_queued_chunks {
             std::thread::sleep(POLL_INTERVAL);
             continue;
         }
@@ -1055,19 +1093,17 @@ fn pump_thread(pump: Arc<PumpState>, stream_format: (u32, u16)) {
         let file_frames_in_chunk = ((frames_per_chunk as u64 * src_rate) / dst_rate.max(1)).max(1);
         let next_end = cursor.saturating_add(file_frames_in_chunk).min(s_end).min(total);
         if next_end <= cursor {
-            drop(sink_guard);
             std::thread::sleep(POLL_INTERVAL);
             continue;
         }
 
         let ch_file = d.channels.max(1);
-        // Clone the shared clock BEFORE taking the sink lock so MeteredSource
-        // publishes into the same atomics the controller/UI poll reads.
+        // The pump publishes into the same SharedOutput clock that the
+        // controller thread and the UI poll read (wired up in RodioOutput::new).
         let shared_for_chunk = match pump.shared.as_ref() {
             Some(s) => s.clone(),
             None => Arc::new(SharedOutput::default()),
         };
-        drop(sink_guard); // release the mutex before any potentially slow work
         let buffer = slice_to_buffer(&d, cursor, next_end, stream_format);
         let metered = MeteredSource {
             inner: buffer,
@@ -1079,12 +1115,13 @@ fn pump_thread(pump: Arc<PumpState>, stream_format: (u32, u16)) {
             rms_count: 0,
             peak_l: 0.0,
             peak_r: 0.0,
+            chunks: queued_chunks.clone(),
         };
-        let sink_clone = sink.clone();
-        sink_clone.append(metered);
+        // `sink` is an Arc clone taken above — append directly (rodio::Sink is
+        // not Clone, so there is no second `clone()` to do).
+        sink.append(metered);
+        queued_chunks.fetch_add(1, Ordering::AcqRel);
         pump.cursor_frame.store(next_end, Ordering::Relaxed);
-        // Yield briefly so we don't spin faster than the hardware consumes.
-        std::thread::sleep(std::time::Duration::from_millis(10));
     }
 }
 
@@ -1220,7 +1257,11 @@ fn select_f32_output_config(device: &rodio::cpal::Device) -> Option<rodio::cpal:
 ///      the ALSA host instead).
 ///   4. `None` → caller falls back to `OutputStream::try_default()`.
 fn pick_output_device() -> Option<(rodio::cpal::Device, String)> {
-    use rodio::cpal::traits::{DeviceTrait, HostTrait};
+    // BUGFIX (unused-import warning): `DeviceTrait` is used only via the
+    // fully-qualified call below (`traits::DeviceTrait::name(&device)`), and
+    // `HostTrait` methods resolve on the concrete cpal host type without the
+    // trait in scope — importing either here produced an unused-import warning.
+    use rodio::cpal::traits::HostTrait;
 
     let all = list_all_named_devices();
 

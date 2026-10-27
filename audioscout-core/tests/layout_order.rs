@@ -477,7 +477,19 @@ fn device_enumeration_uses_cpal_015_host_api_via_rodio_reexport() {
     assert!(!code.contains("host_ids()"), "leftover pre-0.13 cpal API host_ids()");
     assert!(!code.contains("Host::from_id"), "nonexistent cpal API Host::from_id");
     assert!(!code.contains("supported_output_devices()"), "nonexistent rodio 0.19 API supported_output_devices");
-    assert!(code.contains("use rodio::cpal::traits::{DeviceTrait, HostTrait};"), "trait imports required for devices()/name()/supported_output_configs()");
+    // Trait imports live per-function next to the code that needs them (the
+    // device picker deliberately imports ONLY HostTrait because DeviceTrait
+    // methods there are called fully-qualified — a combined import there is
+    // an unused-import warning). Assert each function's own import line.
+    assert "fn list_all_named_devices" in code and \
+        "use rodio::cpal::traits::{DeviceTrait, HostTrait};" in code.split("fn list_all_named_devices")[1], \
+        "list_all_named_devices must import both cpal traits for devices()/name()"
+    assert "fn device_has_output" in code and \
+        "use rodio::cpal::traits::DeviceTrait;" in code.split("fn device_has_output")[1].split("\nfn ")[0], \
+        "device_has_output must import DeviceTrait for supported_output_configs()"
+    assert "fn pick_output_device" in code and \
+        "use rodio::cpal::traits::HostTrait;" in code.split("fn pick_output_device")[1].split("\n\n", 1)[0], \
+        "pick_output_device must import HostTrait for default_output_device()"
 
     // Output-capability filtering and device typing. Probing must be LAZY
     // (per candidate in pick_output_device), never eager for every device —
@@ -493,9 +505,71 @@ fn device_enumeration_uses_cpal_015_host_api_via_rodio_reexport() {
     // cpal's ALSA backend does not enumerate it on typical Debian setups.
     assert_eq!(code.matches("fn pick_output_device").count(), 1);
     assert!(code.contains("AUDIOSCOUT_ALSA_DEVICE"), "manual device override via env must exist");
-    assert!(code.contains("\"pulse\"") && code.contains("host_id.as_str().contains(\"pulse\")"), "PulseAudio host must be preferred over raw ALSA PCMs");
+    // cpal 0.15 HostId has no as_str(); the Pulse route is detected through
+    // the *device name* of each host's default_output_device(), plus the
+    // ALSA-host virtual plugins ("pulse"/"default"/"dmix") preference list.
+    assert (
+        code.contains("\"pulse\"")
+        and code.contains("lname.contains(\"pulse\") || lname.contains(\"pipewire\")")
+        and 'const PREFERRED: [&str; 3] = ["pulse", "default", "dmix"];' in code
+    ), "PulseAudio routing must be preferred over raw ALSA PCMs (by device name)"
     assert!(!code.contains("fn find_alsa_default_device"), "old exact-\"default\" scanner removed");
-    assert!(code.contains("OutputStream::try_from_device(&device)"), "chosen device must be opened via try_from_device");
+    assert!(
+        code.contains("rodio::OutputStream::try_from_device_config(device, cfg)")
+        and code.contains("fn select_f32_output_config(device: &rodio::cpal::Device) -> Option<rodio::cpal::SupportedStreamConfig>"),
+        "chosen device must be opened with an explicit f32 SupportedStreamConfig (try_from_device_config)"
+    );
     assert!(code.contains("OutputStream::try_default()"), "fallback to the system default device must remain");
 }
 
+
+#[test]
+fn playback_is_paced_by_a_sink_queue_budget_not_wall_clock_sleeps() {
+    // Regression over the "0.5 s of sound then freeze" family of bugs:
+    //   * rodio 0.19 `Sink` is NOT `Clone` — the controller/pump used to call
+    //     `sink.clone()` (E0599) and hold MutexGuard borrows across it
+    //     (E0505); the shared handle must be an `Arc<Sink>` instead;
+    //   * feeding must be paced by how many chunks are still queued in the
+    //     Sink (MeteredSource decrements on exhaustion), not by blind
+    //     wall-clock sleeps — otherwise the pump either races ahead (disk
+    //     hammering, giant allocations) or starves the queue (~0.5 s of
+    //     audio, then silence);
+    //   * `session` is an `Option<(u64,u64)>` Copy tuple guard — matching it
+    //     as `Some(&(s,e))` fails E0308.
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/src/player/output.rs");
+    let code: String = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("cannot read {}: {}", path, e))
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    // Shared sink handle: Arc-wrapped, never cloned via Clone.
+    assert!(code.contains("Arc<Mutex<Option<Arc<rodio::Sink>>>>"), "pump slot must hold an Arc<Sink>, not a non-Clone Sink copy");
+    let flat: Vec<&str> = code.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+    let flat = flat.join(" ");
+    assert!(flat.contains("let sink = match rodio::Sink::try_new(&handle) { Ok(s) => Arc::new(s)"), "Sink must be wrapped in Arc right after try_new");
+    // `Arc<Sink>` clones ARE allowed (`Some(s) => s.clone()`); a bare
+    // `sink_clone` binding or an append through one was the old broken shape.
+    assert!("let sink_clone" not in flat and "sink_clone.append" not in flat, "no rodio::Sink::clone into a local — Sink is not Clone in rodio 0.19");
+    assert!(flat.contains("fn controller_thread( sink: Arc<rodio::Sink>,"), "controller thread takes the Arc<Sink> handle");
+
+    // Pump pacing by queue budget.
+    assert_eq!(code.matches("fn pump_thread").count(), 1);
+    let pump_body = code.split("fn pump_thread").nth(1).unwrap();
+    let pump_body = pump_body.split("\nfn ").next().unwrap();
+    assert!(pump_body.contains("let queued_chunks = Arc::new(AtomicUsize::new(0));"), "pump must track queued chunk count locally");
+    assert!(pump_body.contains("queued_chunks.load(Ordering::Acquire) >= max_queued_chunks"), "pump must wait when the sink queue is full");
+    assert!(pump_body.contains("queued_chunks.fetch_add(1"), "each appended chunk reserves a queue slot");
+    assert!(pump_body.contains("chunks: queued_chunks.clone(),"), "the chunk carries its queue-slot guard into MeteredSource");
+    assert!(pump_body.contains("sink.append(metered);"), "pump appends through the Arc<Sink> directly");
+
+    // MeteredSource releases the slot exactly once, when exhausted.
+    let metered = code.split("impl Iterator for MeteredSource").nth(1).unwrap().split("impl ").next().unwrap();
+    assert!(metered.contains("self.chunks.fetch_sub(1, Ordering::AcqRel);"), "exhausted chunk must release its queue slot");
+    assert!(code.contains("chunks: Arc<AtomicUsize>,"), "MeteredSource holds the shared queue counter");
+
+    // Session guard destructuring must avoid the reference pattern.
+    assert!(!code.contains("Some(&(s, e))"), "Option<(u64,u64)> Copy tuple must be matched by value (E0308)");
+    assert!(flat.contains("Some((s, e)) => s < e && pump.cursor_frame.load(Ordering::Relaxed) >= e"), "completion check reads the pump cursor vs session end");
+}
