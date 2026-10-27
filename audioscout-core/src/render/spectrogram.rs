@@ -214,6 +214,106 @@ pub fn render_spectrogram_preview(samples: &[f32], channels: u16, width: u32, he
     img
 }
 
+/// Render a full-resolution spectrogram of an **interleaved** sample slice.
+///
+/// Unlike [`render_spectrogram_preview`] (a fixed 340-px thumbnail that spans
+/// the whole file), this is the live audio-view renderer: `samples` covers
+/// exactly the visible frame range and `width`/`height` match the widget size,
+/// so the picture is recomputed at widget resolution on every view-range or
+/// resize change (spec §3.6 — no upscaling of a cropped bitmap).
+///
+/// Mono → one track fills the canvas; stereo/multichannel → first two tracks
+/// stacked vertically with a separator, mirroring the waveform layout.
+pub fn render_view_spectrogram(
+    samples: &[f32],
+    channels: u16,
+    width: u32,
+    height: u32,
+) -> RgbaImage {
+    const FFT_SIZE: usize = 512;
+
+    let ch = (channels.max(1) as usize).min(2);
+    if width == 0 || height == 0 || samples.is_empty() {
+        return RgbaImage::from_pixel(width.max(1), height.max(1), Rgba([10, 10, 14, 255]));
+    }
+
+    // Deinterleave the visible slice into per-track buffers.
+    let planar = crate::render::waveform::deinterleave(samples, ch);
+    let frames = planar.first().map(|p| p.len()).unwrap_or(0);
+    let track_height = (height as usize) / ch;
+    let bins = track_height.max(1);
+
+    let mut img = RgbaImage::from_pixel(width, height, Rgba([10, 10, 14, 255]));
+    if frames < FFT_SIZE / 2 {
+        return img;
+    }
+
+    // Hann window (periodic).
+    let hann: Vec<f32> = (0..FFT_SIZE)
+        .map(|i| 0.5 - 0.5 * (core::f32::consts::TAU * i as f32 / FFT_SIZE as f32).cos())
+        .collect();
+    let bin_fracs = log_bin_fractions(bins);
+
+    // One FFT column per horizontal pixel; hop derived from the visible
+    // range so the picture always spans it fully (bounded below by the
+    // classic half-window hop when zoomed in deeply).
+    let cols = width as usize;
+    let hop = (frames / cols).max(FFT_SIZE / 4);
+    let last_start = frames - FFT_SIZE;
+
+    // Pass 1: per-track magnitude maps + global max for normalisation.
+    let mut track_maps: Vec<Vec<f32>> = Vec::with_capacity(ch);
+    let mut global_max = 1e-9f32;
+    for track in 0..ch.min(planar.len()) {
+        let data = &planar[track];
+        let mut map = vec![0.0f32; cols * bins];
+        let mut re = vec![0.0f32; FFT_SIZE];
+        let mut im = vec![0.0f32; FFT_SIZE];
+        for col in 0..cols {
+            let start = (col * hop).min(last_start);
+            for i in 0..FFT_SIZE {
+                re[i] = data[start + i] * hann[i];
+                im[i] = 0.0;
+            }
+            fft_radix2(&mut re, &mut im);
+            let nyq_bin = FFT_SIZE / 2;
+            for (bi, frac) in bin_fracs.iter().enumerate() {
+                let bin = ((*frac * (nyq_bin - 1) as f32).round() as usize).min(nyq_bin - 1);
+                let mag = (re[bin] * re[bin] + im[bin] * im[bin]).sqrt();
+                map[col * bins + bi] = mag;
+                if mag > global_max {
+                    global_max = mag;
+                }
+            }
+        }
+        track_maps.push(map);
+    }
+
+    // Pass 2: paint (log-ish scaling, −60 dB floor → [0,1]).
+    for (track, map) in track_maps.iter().enumerate() {
+        let top_row = track * track_height;
+        for col in 0..cols {
+            for bi in 0..bins {
+                let v = map[col * bins + bi] / global_max;
+                let v = (v.ln().max(-6.0) + 6.0) / 6.0;
+                // Row 0 = highest frequency → top of the track.
+                let y = (top_row + bi).min((height as usize) - 1);
+                img.put_pixel(col as u32, y, heat(v));
+            }
+        }
+    }
+
+    // Track separator (matches the waveform style).
+    if ch > 1 && height > 2 {
+        let sep = track_height as u32;
+        for x in 0..width {
+            img.put_pixel(x, sep, Rgba([60, 60, 65, 255]));
+        }
+    }
+
+    img
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

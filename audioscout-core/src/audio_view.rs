@@ -21,14 +21,35 @@ impl Selection {
     pub fn contains(&self, frame: u64) -> bool { frame >= self.start_frame && frame < self.end_frame }
 }
 
+/// Visualization style of the player's audio-view area.
+///
+/// Independent from the file-list thumbnail mode (`PreviewMode` in the crate
+/// root): the spec (§3.1 / §3.5) requires two separate toggles — one on the
+/// top toolbar for the table previews, one on the player panel for the big
+/// visualization.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AudioViewMode {
+    Waveform,
+    Spectrogram,
+}
+
 pub struct AudioView {
     pub view_range: ViewRange, pub total_frames: u64, pub cursor_frame: u64,
     pub selection: Option<Selection>, pub active_marker: Option<usize>, pub auto_scroll: bool,
+    /// Current display mode of the visualization area (Waveform/Spectrogram).
+    pub mode: AudioViewMode,
 }
 
 impl AudioView {
     pub fn new(total_frames: u64) -> Self {
-        Self { view_range: ViewRange::new(0, total_frames), total_frames, cursor_frame: 0, selection: None, active_marker: None, auto_scroll: true }
+        Self { view_range: ViewRange::new(0, total_frames), total_frames, cursor_frame: 0, selection: None, active_marker: None, auto_scroll: true, mode: AudioViewMode::Waveform }
+    }
+    /// Flip between the waveform and spectrogram visualizations.
+    pub fn toggle_mode(&mut self) {
+        self.mode = match self.mode {
+            AudioViewMode::Waveform => AudioViewMode::Spectrogram,
+            AudioViewMode::Spectrogram => AudioViewMode::Waveform,
+        };
     }
     pub fn set_total_frames(&mut self, frames: u64) {
         self.total_frames = frames;

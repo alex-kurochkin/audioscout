@@ -3,7 +3,7 @@ use audioscout_core::player::controller::Controller;
 use audioscout_core::player::{PlayheadState, TransportState};
 use audioscout_core::scanner::Scanner;
 use audioscout_core::table::{Column, ColumnLayout, FileRow};
-use audioscout_core::audio_view::AudioView;
+use audioscout_core::audio_view::{AudioView, AudioViewMode};
 use audioscout_core::undo::Stack as UndoStack;
 use audioscout_core::db::Database;
 use audioscout_core::audio_io::PcmFile;
@@ -60,6 +60,19 @@ pub struct AudioScoutApp {
     // Cached peaks tree for fast waveform rendering
     // cached_channels: Vec of (channel_data, peaks_tree) for each visible channel (1 for mono, 2 for stereo/multichannel)
     cached_channels: Vec<(Vec<f32>, audioscout_core::peaks_tree::Peaks)>,
+    /// Texture of the live spectrogram image in the audio view. Re-rendered
+    /// (at widget resolution) whenever the view range / document / panel size
+    /// changes while `AudioView::mode` is Spectrogram — see
+    /// `refresh_view_spectrogram`.
+    view_spectro_texture: Option<egui::TextureHandle>,
+    /// Key identifying the last rendered spectrogram image:
+    /// (view start, view end, width, height, document generation). When it
+    /// differs from the current state the picture is recomputed.
+    view_spectro_key: Option<(u64, u64, u32, u32, u64)>,
+    /// Bumped on every event that invalidates the spectrogram image (file
+    /// load, edits/undo/redo, mode switch) so a re-render is triggered even
+    /// when the numeric view key stays the same.
+    document_generation: u64,
 }
 
 impl AudioScoutApp {
@@ -138,6 +151,9 @@ impl AudioScoutApp {
             normalize_dbfs: -1.0, expanded_dirs: HashMap::new(),
             disks: Vec::new(),
             cached_channels: Vec::new(),
+            view_spectro_texture: None,
+            view_spectro_key: None,
+            document_generation: 0,
         };
 
         if let Some(dir_str) = app.db.load_session("lastDir") {
@@ -351,6 +367,45 @@ impl AudioScoutApp {
             let peaks = audioscout_core::peaks_tree::Peaks::build(&channel_data);
             self.cached_channels.push((channel_data, peaks));
         }
+
+        // Any structural change to the document invalidates the live
+        // spectrogram image; force a re-render on the next audio-view frame.
+        self.document_generation += 1;
+    }
+
+    /// Rebuild the interleaved PCM slice covering the current view range and
+    /// render it as a full-resolution spectrogram texture (audio-view mode
+    /// switch, §3.6). Cheap no-op when nothing relevant changed since the
+    /// last render — the hot `ui()` path stays idempotent.
+    fn refresh_view_spectrogram(&mut self, ui: &egui::Ui, rect: egui::Rect) {
+        let width = (rect.width().max(1.0)) as u32;
+        let height = (rect.height().max(1.0)) as u32;
+        let start = self.audio_view.view_range.start_frame;
+        let end = self.audio_view.view_range.end_frame.min(self.document.total_frames());
+        let key = (start, end, width, height, self.document_generation);
+        if self.view_spectro_key == Some(key) && self.view_spectro_texture.is_some() {
+            return;
+        }
+
+        let ch = self.document.channels.max(1) as usize;
+        let a = (start as usize * ch).min(self.document.samples.len());
+        let b = (end as usize * ch).min(self.document.samples.len());
+        let rgba = audioscout_core::render::spectrogram::render_view_spectrogram(
+            &self.document.samples[a..b],
+            self.document.channels,
+            width,
+            height,
+        );
+        let color_image = egui::ColorImage::from_rgba_unmultiplied(
+            [rgba.width() as usize, rgba.height() as usize],
+            rgba.as_flat_samples().as_slice(),
+        );
+        self.view_spectro_texture = Some(ui.ctx().load_texture(
+            "view_spectrogram",
+            color_image,
+            egui::TextureOptions::LINEAR,
+        ));
+        self.view_spectro_key = Some(key);
     }
 
     fn save_file(&mut self) {
@@ -1032,16 +1087,27 @@ impl eframe::App for AudioScoutApp {
             });
         });
 
-        // Audio view panel (above player)
+        // Audio view panel (visualization area — declared before the player
+        // so it ends up *above* the player controls in the bottom stack)
         egui::TopBottomPanel::bottom("audio_view").default_height(200.0).resizable(true).show(ctx, |ui| {
             let (rect, response) = ui.allocate_exact_size(ui.available_size(), egui::Sense::click_and_drag());
             ui.painter().rect_filled(rect, 0.0, egui::Color32::from_rgb(25, 25, 30));
 
             if !self.document.samples.is_empty() {
+                // Spectrogram mode: draw the pre-rendered widget-resolution
+                // image first; markers/selection/cursor overlay on top of it.
+                if self.audio_view.mode == AudioViewMode::Spectrogram {
+                    self.refresh_view_spectrogram(ui, rect);
+                    if let Some(tex) = &self.view_spectro_texture {
+                        ui.put(rect, egui::Image::new(tex).fit_to_exact_size(rect.size()));
+                    }
+                }
+
                 let num_tracks = self.cached_channels.len();
                 // Draw center line only for mono (1 track)
                 // For stereo/multichannel, separator lines are drawn in the waveform rendering loop
-                if num_tracks == 1 {
+                // (In spectrogram mode the image already contains them.)
+                if self.audio_view.mode == AudioViewMode::Waveform && num_tracks == 1 {
                     let mid_y = rect.center().y;
                     ui.painter().line_segment([egui::pos2(rect.left(), mid_y), egui::pos2(rect.right(), mid_y)], egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(60, 60, 65)));
                 }
