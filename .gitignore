@@ -1,1 +1,4 @@
-(empty content)
+*.sh
+*.lock
+info/
+target/
