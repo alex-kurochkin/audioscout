@@ -745,17 +745,29 @@ fn pick_output_device() -> Option<(rodio::cpal::Device, String)> {
         }
     }
 
-    // 2) PulseAudio host default device
+    // 2) PulseAudio host default output device.
+    //    cpal 0.15: `HostId` is an opaque enum without `as_str()`; compare it
+    //    against the `PULSE` constant, which only exists when cpal's "pulse"
+    //    feature is enabled (it is, via rodio on Linux).
     for host_id in rodio::cpal::available_hosts() {
-        if !host_id.as_str().contains("pulse") {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        let is_pulse = host_id == rodio::cpal::HostId::Pulse;
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        let is_pulse = false;
+        if !is_pulse {
             continue;
         }
         let host = match rodio::cpal::host_from_id(host_id) {
             Ok(h) => h,
             Err(_) => continue,
         };
-        if let Ok(device) = host.default_device() {
-            let name = device.name().unwrap_or_else(|_| "pulse".to_string());
+        // HostTrait exposes `default_output_device()` (there is no plain
+        // `default_device()` in cpal 0.15).
+        if let Ok(device) = host.default_output_device() {
+            // `Host::default_output_device()` returns cpal's concrete device
+            // type; bind it explicitly so `.name()` (DeviceTrait) infers.
+            let name: String = rodio::cpal::traits::DeviceTrait::name(&device)
+                .unwrap_or_else(|_| "pulse".to_string());
             if device_has_output(&device) {
                 tracing::info!("[output] auto-picked PulseAudio host device \"{name}\"");
                 return Some((device, name));
