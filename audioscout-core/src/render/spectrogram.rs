@@ -8,6 +8,17 @@
 
 use image::{Rgba, RgbaImage};
 
+/// Test-only wrapper around the in-place FFT working on real input, so the
+/// transform can be checked against an independent implementation (rustfft)
+/// from integration tests without exposing the hot-loop internals.
+#[doc(hidden)]
+pub fn fft_radix2_naive(input: &[f32]) -> Vec<(f32, f32)> {
+    let mut re = input.to_vec();
+    let mut im = vec![0.0f32; input.len()];
+    fft_radix2(&mut re, &mut im);
+    re.into_iter().zip(im).collect()
+}
+
 /// In-place iterative radix-2 Cooley–Tukey FFT.
 ///
 /// `re`/`im` must have power-of-two length; bit-reversal permutation is

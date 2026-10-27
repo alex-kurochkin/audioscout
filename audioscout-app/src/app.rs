@@ -767,6 +767,18 @@ impl eframe::App for AudioScoutApp {
                 if ui.add(preview_btn).on_hover_text("Toggle table previews between waveform and spectrogram").clicked() {
                     self.toggle_preview_mode();
                 }
+                // Visualization-area toggle (§3.5): lives on the *top* panel
+                // next to the preview toggle (bug #3). The button reflects the
+                // live `AudioView::mode` state — which is restored from
+                // config.json on startup — and flips it atomically.
+                let view_spectro = self.audio_view.mode == AudioViewMode::Spectrogram;
+                let view_btn = egui::SelectableLabel::new(
+                    view_spectro,
+                    if view_spectro { "Spectrogram" } else { "Waveform" },
+                );
+                if ui.add(view_btn).on_hover_text("Toggle the visualization between waveform and spectrogram").clicked() {
+                    self.toggle_audio_view_mode();
+                }
                 ui.separator();
                 if ui.button("Settings").clicked() { self.show_settings = true; }
             });
@@ -869,11 +881,83 @@ impl eframe::App for AudioScoutApp {
             self.expanded_dirs.remove(&dir);
         }
 
-        // Status bar (bottom-most)
-        egui::TopBottomPanel::bottom("status").default_height(20.0).show(ctx, |ui| {
-            ui.label(&self.status_message);
-        });
-        // Audio view panel (visualization area — declared between the status
+        // Bottom stack — declaration order matters: in egui the FIRST declared
+        // bottom panel docks to the very bottom edge of the window and each
+        // subsequent one is placed above the previous. So this order gives
+        // the visual stack (top → bottom): file actions (Mute/Apply…) →
+        // player controls (Play/Stop…) → visualization window → status bar.
+        // The transport panel therefore now sits *above* the file-content
+        // view, directly under the file-actions panel (bug #1). All four
+        // panels are declared before the CentralPanel below, so the central
+        // area's `available_height()` already accounts for their real,
+        // measured sizes — the visualization window is resizable, its height
+        // changes at runtime, and the file list shrinks/grows with it instead
+        // of rendering underneath the player windows (bug #2).
+        // File-actions panel (Mute / Normalize / Apply …)
+        egui::TopBottomPanel::bottom("actions").default_height(40.0).show(ctx, |ui| {
+            // Fallback measurement of the bottom stack for the very first
+            // frame (before egui has reserved anything). This panel is
+            // declared first, so it docks to the bottom edge and nothing
+            // below it exists yet: `screen_rect().height() - available_height()`
+            // at entry equals its own reserved height plus margins. From the
+            // second frame on all four bottom panels are already reserved
+            // when the CentralPanel is shown, so the file list uses
+            // `available_height()` there directly.
+            let stack_height_at_entry = ui.ctx().screen_rect().height() - ui.available_height();
+            ui.horizontal(|ui| {
+                if ui.button("Mute").clicked() { self.mute_selection(); }
+                ui.label("Normalize:");
+                ui.add(egui::DragValue::new(&mut self.normalize_dbfs).range(-60.0..=0.0).suffix(" dBFS"));
+                if ui.button("Apply").clicked() { self.normalize_selection(); }
+                ui.separator();
+                if ui.button("Delete all markers").clicked() { self.document.markers.clear(); }
+                if let Some(path) = &self.active_file {
+                    ui.separator();
+                    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                    ui.strong(name);
+                }
+            });
+            if (stack_height_at_entry - self.bottom_panels_height).abs() > 1.0 {
+                self.bottom_panels_height = stack_height_at_entry;
+                // Re-layout once so the table height catches up immediately
+                // after the user drags the audio-view separator.
+                ui.ctx().request_repaint();
+            }
+        }
+
+                // Player panel (transport controls) — sits above the visualization
+        // area and below the actions panel in the bottom stack.
+        egui::TopBottomPanel::bottom("player").default_height(80.0).show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                if ui.button("|<").clicked() { self.navigate_file(-1); }
+                let play_text = match self.player.state() { TransportState::Playing => "⏸", _ => "▶" };
+                if ui.button(play_text).clicked() { let sel = self.audio_view.selection_range(); self.player.play_pause(&self.document, sel); }
+                if ui.button("⏹").clicked() { self.player.stop(); }
+                if ui.button(">|").clicked() { self.navigate_file(1); }
+                let loop_color = if self.player.is_looping() && self.player.state() == TransportState::Playing { egui::Color32::YELLOW } else if self.player.is_looping() { egui::Color32::GREEN } else { ui.visuals().text_color() };
+                if ui.colored_label(loop_color, "🔁").clicked() { self.player.toggle_loop(); }
+                ui.separator();
+                if ui.button("+").clicked() { self.audio_view.zoom_in(); }
+                if ui.button("−").clicked() { self.audio_view.zoom_out(); }
+                ui.separator();
+                ui.label("Vol:");
+                let mut vol = self.player.volume() * 100.0;
+                if ui.add(egui::Slider::new(&mut vol, 0.0..=100.0)).changed() { self.player.set_volume(vol / 100.0); }
+                ui.separator();
+                let save_color = if self.document.dirty { egui::Color32::YELLOW } else { ui.visuals().text_color() };
+                let save_label = if self.document.dirty { "Save*" } else { "Save" };
+                if ui.colored_label(save_color, save_label).clicked() { self.save_file(); }
+            });
+            ui.horizontal(|ui| {
+                let duration = self.document.duration_secs();
+                let current_pos = self.player.current_secs(self.document.sample_rate);
+                let time_str = if duration < 60.0 { format!("{:.1}s / {:.1}s", current_pos, duration) } else { format!("{} / {}", format_time_hms(current_pos), format_time_hms(duration)) };
+                ui.label(time_str);
+                if duration > 0.0 { let progress = (current_pos / duration) as f32; ui.add(egui::ProgressBar::new(progress).desired_width(ui.available_width())); }
+            });
+        }
+
+                // Audio view panel (visualization area — declared between the status
         // bar and the player so the player controls sit *above* it)
         egui::TopBottomPanel::bottom("audio_view").default_height(200.0).resizable(true).show(ctx, |ui| {
             let (rect, response) = ui.allocate_exact_size(ui.available_size(), egui::Sense::click_and_drag());
@@ -987,76 +1071,11 @@ impl eframe::App for AudioScoutApp {
                     else if scroll.y < 0.0 { if let Some(pos) = i.pointer.hover_pos() { let x_ratio = ((pos.x - rect.left()) / rect.width()).clamp(0.0, 1.0); self.audio_view.zoom_at_x(1.0 / 1.25, x_ratio as f64); } }
                 } else if scroll.y != 0.0 { self.audio_view.scroll_horizontal(-scroll.y as f64 * 0.01); }
             });
-        });
-        // Player panel (transport controls) — sits above the visualization
-        // area and below the actions panel in the bottom stack.
-        egui::TopBottomPanel::bottom("player").default_height(80.0).show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                if ui.button("|<").clicked() { self.navigate_file(-1); }
-                let play_text = match self.player.state() { TransportState::Playing => "⏸", _ => "▶" };
-                if ui.button(play_text).clicked() { let sel = self.audio_view.selection_range(); self.player.play_pause(&self.document, sel); }
-                if ui.button("⏹").clicked() { self.player.stop(); }
-                if ui.button(">|").clicked() { self.navigate_file(1); }
-                let loop_color = if self.player.is_looping() && self.player.state() == TransportState::Playing { egui::Color32::YELLOW } else if self.player.is_looping() { egui::Color32::GREEN } else { ui.visuals().text_color() };
-                if ui.colored_label(loop_color, "🔁").clicked() { self.player.toggle_loop(); }
-                ui.separator();
-                if ui.button("+").clicked() { self.audio_view.zoom_in(); }
-                if ui.button("−").clicked() { self.audio_view.zoom_out(); }
-                ui.separator();
-                ui.label("Vol:");
-                let mut vol = self.player.volume() * 100.0;
-                if ui.add(egui::Slider::new(&mut vol, 0.0..=100.0)).changed() { self.player.set_volume(vol / 100.0); }
-                ui.separator();
-                // Visualization-area toggle (§3.5), independent from the
-                // table-preview mode on the top panel.
-                let view_spectro = self.audio_view.mode == AudioViewMode::Spectrogram;
-                let view_btn = egui::SelectableLabel::new(
-                    view_spectro,
-                    if view_spectro { "Spectrogram" } else { "Waveform" },
-                );
-                if ui.add(view_btn).on_hover_text("Toggle the visualization between waveform and spectrogram").clicked() {
-                    self.toggle_audio_view_mode();
-                }
-                ui.separator();
-                let save_color = if self.document.dirty { egui::Color32::YELLOW } else { ui.visuals().text_color() };
-                let save_label = if self.document.dirty { "Save*" } else { "Save" };
-                if ui.colored_label(save_color, save_label).clicked() { self.save_file(); }
-            });
-            ui.horizontal(|ui| {
-                let duration = self.document.duration_secs();
-                let current_pos = self.player.current_secs(self.document.sample_rate);
-                let time_str = if duration < 60.0 { format!("{:.1}s / {:.1}s", current_pos, duration) } else { format!("{} / {}", format_time_hms(current_pos), format_time_hms(duration)) };
-                ui.label(time_str);
-                if duration > 0.0 { let progress = (current_pos / duration) as f32; ui.add(egui::ProgressBar::new(progress).desired_width(ui.available_width())); }
-            });
-        });
-        // Actions panel
-        egui::TopBottomPanel::bottom("actions").default_height(40.0).show(ctx, |ui| {
-            // Measure the bottom stack for the next frame's first-frame
-            // guard. At this point every sibling panel above us has been
-            // laid out; `available_height()` is what remains *below* the
-            // CentralPanel region, i.e. exactly the combined height of the
-            // four bottom windows (incl. resize separators/margins).
-            let stack_height_at_entry = ui.ctx().screen_rect().height() - ui.available_height();
-            ui.horizontal(|ui| {
-                if ui.button("Mute").clicked() { self.mute_selection(); }
-                ui.label("Normalize:");
-                ui.add(egui::DragValue::new(&mut self.normalize_dbfs).range(-60.0..=0.0).suffix(" dBFS"));
-                if ui.button("Apply").clicked() { self.normalize_selection(); }
-                ui.separator();
-                if ui.button("Delete all markers").clicked() { self.document.markers.clear(); }
-                if let Some(path) = &self.active_file {
-                    ui.separator();
-                    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                    ui.strong(name);
-                }
-            });
-            if (stack_height_at_entry - self.bottom_panels_height).abs() > 1.0 {
-                self.bottom_panels_height = stack_height_at_entry;
-                // Re-layout once so the table height catches up immediately
-                // after the user drags the audio-view separator.
-                ui.ctx().request_repaint();
-            }
+        }
+
+                // Status bar (bottom-most)
+        egui::TopBottomPanel::bottom("status").default_height(20.0).show(ctx, |ui| {
+            ui.label(&self.status_message);
         });
 
         egui::CentralPanel::default().show(ctx, |ui| {
