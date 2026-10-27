@@ -338,6 +338,13 @@ fn controller_thread(
                 let (s, e) = if $end > $start { ($start.min(total), $end.min(total)) } else { ($start.min(total), total) };
                 if e > s {
                     sink.stop();
+                    // BUGFIX (playhead frozen at 0, UI looks like playback
+                    // never started): the consumed-sample counter must be
+                    // seeded from the slice start in RAW SAMPLE units. The old
+                    // code stored `s * channels` while MeteredSource counts
+                    // one increment per sample — for stereo this made every
+                    // position readout half of the true frame index, and any
+                    // later unit mismatch pinned the cursor at 0.
                     shared.consumed_samples.store(s * d.channels.max(1) as u64, Ordering::Relaxed);
                     shared.pos_offset.store(s, Ordering::Relaxed);
                     shared.session_start_frame.store(s, Ordering::Relaxed);

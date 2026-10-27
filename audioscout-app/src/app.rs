@@ -740,7 +740,7 @@ impl AudioScoutApp {
     /// machine advances on its own clock via `Controller::tick`) and simply
     /// refreshes the cursor from the controller otherwise. `last_playhead_poll`
     /// throttles the work to one poll per 50 ms tick.
-    fn poll_playhead(&mut self) {
+    fn poll_playhead(&mut self, ctx: &egui::Context) {
         if self.player_state() != TransportState::Playing {
             return;
         }
@@ -748,17 +748,34 @@ impl AudioScoutApp {
         if now.duration_since(self.last_playhead_poll) < std::time::Duration::from_millis(50) {
             return;
         }
-        let first_poll = self.last_playhead_poll.elapsed() > std::time::Duration::from_secs(1);
         self.last_playhead_poll = now;
         if self.output.is_some() {
-            // Real playback position arrives through PlayheadUpdate events —
-            // nothing to advance here, the event handler owns the cursor.
-            // DEBUG: if the state machine says Playing but the cursor never
-            // moves, no PlayheadUpdate is coming from the output thread; log
-            // once per second so this stall is visible in the console.
-            if first_poll && self.audio_view.cursor_frame == self.player.lock().unwrap_or_else(|p| p.into_inner()).start_frame() {
-                tracing::warn!("[poll] state=Playing but playhead not advancing (no PlayheadUpdate from output thread?)");
+            // BUGFIX (playback "never starts", frozen cursor, sink.stop() on
+            // every button press): `PlayheadUpdate` events are NOT the only
+            // position source we need. The output thread emits them at most
+            // every ~30 ms and only while its 50 ms command-poll loop runs;
+            // egui also throttles redraws when the window is idle, so relying
+            // on events alone left the cursor stuck at frame 0 and made live
+            // playback look like a hang. Read the real audio clock directly
+            // from SharedOutput every poll tick (tz §5.3: пул позиции ±50 мс)
+            // and drive the cursor + auto-scroll from it. Events stay as an
+            // additional fresher update path.
+            let shared = self.output.as_ref().expect("output present").shared.clone();
+            let ch = self.document.channels.max(1);
+            let frame = shared.current_frame(ch);
+            // BUGFIX (Play/Pause restarts from 0): the state machine's
+            // current_frame must follow the real audio clock, otherwise
+            // Pause freezes resume_frame at a stale value and every repeated
+            // Play re-appends the slice from the session start.
+            {
+                let mut ctrl = self.player.lock().unwrap_or_else(|p| p.into_inner());
+                ctrl.sync_playback_position(frame);
             }
+            self.audio_view.set_cursor(frame);
+            self.audio_view.auto_scroll_to_cursor();
+            // Keep the 50 ms poll cadence alive even when egui would idle the
+            // window (no input events during hands-free playback).
+            ctx.request_repaint_after(std::time::Duration::from_millis(50));
             return;
         }
         // Device-less degradation: advance the state machine's simulated
@@ -995,7 +1012,7 @@ impl eframe::App for AudioScoutApp {
         // 50 ms playhead poll (§1.2/§5.3): with a live output the position
         // arrives via PlayheadUpdate events; without one this fallback tick
         // advances the state machine's clock so the cursor still moves.
-        self.poll_playhead();
+        self.poll_playhead(ctx);
         if self.player_state() == TransportState::Playing { ctx.request_repaint_after(std::time::Duration::from_millis(50)); }
 
         // Preview pump: while any thumbnail is still missing, keep draining

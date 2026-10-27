@@ -396,3 +396,51 @@ fn output_holder_keeps_stream_handle_alive() {
     // And the construction site must actually clone the handle into it.
     assert!(code.contains("_handle: handle.clone()"), "handle is not cloned into the holder at construction");
 }
+
+#[test]
+fn ui_poll_reads_audio_clock_directly_and_syncs_controller() {
+    // Regression: playback DID run (disk write on Play, stop on Stop) but the
+    // UI showed nothing moving — poll_playhead relied solely on PlayheadUpdate
+    // events and never advanced the state machine. The 50 ms poll must read
+    // SharedOutput.current_frame directly, mirror it into the Controller
+    // (sync_playback_position), drive the cursor, and keep egui repainting.
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../audioscout-app/src/app.rs");
+    let code: String = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("cannot read {}: {}", path, e))
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    // poll_playhead takes the egui context so it can schedule repaints itself.
+    assert!(code.contains("fn poll_playhead(&mut self, ctx: &egui::Context)"), "poll_playhead lost its ctx parameter");
+    assert!(code.contains("self.poll_playhead(ctx);"), "update() does not pass ctx to poll_playhead");
+    // The real audio clock is polled from SharedOutput every tick...
+    assert!(code.contains("shared.current_frame(ch)"), "poll no longer reads the audio clock via current_frame");
+    // ...mirrored into the transport state machine (fixes Play-after-Pause
+    // restarting from 0)...
+    assert!(code.contains("ctrl.sync_playback_position(frame)"), "poll does not sync the controller position");
+    // ...and drives the waveform cursor + auto-scroll.
+    assert!(code.contains("self.audio_view.set_cursor(frame);"), "poll does not move the cursor");
+    // Repaint cadence keeps the poll alive while playing.
+    assert!(code.contains("ctx.request_repaint_after(std::time::Duration::from_millis(50));"), "poll lost its repaint scheduling");
+}
+
+#[test]
+fn controller_exposes_playback_position_sync() {
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/src/player/controller.rs");
+    let code: String = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("cannot read {}: {}", path, e))
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert_eq!(code.matches("pub fn sync_playback_position(").count(), 1, "sync_playback_position missing/duplicated");
+    // It must be a playback-side update: never touch resume_frame (§5.3
+    // CursorSource::Playback semantics — Pause resumes from the real clock).
+    let body = code.split("pub fn sync_playback_position(").nth(1).unwrap();
+    let body = body.split("pub fn ").next().unwrap();
+    assert!(!body.contains("resume_frame"), "playback sync must not overwrite the resume point");
+    assert!(body.contains("self.state != TransportState::Playing"), "playback sync must no-op outside Playing");
+}

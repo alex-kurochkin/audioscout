@@ -176,6 +176,19 @@ impl Controller {
         self.playhead.set_position_samples(frame);
     }
 
+    /// Playback-clock mirror (§5.3 CursorSource::Playback): advance the
+    /// state machine to an externally measured position (audio clock of the
+    /// output thread or the UI poll) WITHOUT moving the resume point — so a
+    /// later Pause still resumes where playback actually is, and Play/Pause
+    /// keeps its "resume from current position" semantics.
+    pub fn sync_playback_position(&mut self, frame: u64) {
+        if self.state != TransportState::Playing {
+            return;
+        }
+        self.current_frame = frame;
+        self.playhead.set_position_samples(frame);
+    }
+
     /// Output-thread hooks (§5.2/§5.3): the real audio clock lives in
     /// `player::output`; these keep the UI-facing state machine consistent.
     /// Mark a new playing session [start,end) started by the output thread.
