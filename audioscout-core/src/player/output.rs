@@ -123,12 +123,59 @@ impl RodioOutput {
     pub fn new(controller: Arc<Mutex<Controller>>, event_tx: Sender<UiEvent>) -> Option<Self> {
         // DEBUG (playback diagnostics): every early return below is a hard
         // reason why playback can never start — log which stage failed.
-        let (stream, handle) = match rodio::OutputStream::try_default() {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::error!("[output] OutputStream::try_default FAILED: {e} — audio device unavailable, playback will never start");
-                return None;
+        //
+        // BUGFIX (silent playback on Debian/ALSA): cpal enumerates every ALSA
+        // card and `default_output_device()` picks the first *usable* one —
+        // typically the HDMI output of a graphics card ("built-in Audio
+        // Digital Stereo (HDMI)"), which is wired to no speakers. The stream
+        // then runs perfectly (samples consumed, playhead advancing) but the
+        // user hears nothing. Prefer the ALSA "default" device explicitly:
+        // its cpal DeviceName is exactly "default", and it routes through
+        // /usr/share/alsa alsa-lib → dmix/default.pcm — i.e. the card the
+        // desktop sound settings point at. Fall back to the system default
+        // when no such device exists (non-ALSA backends).
+        //
+        // `rodio::OutputStream` is `#[deprecated]` in 0.19 (module-level), so
+        // this fn opts out of the deprecation warning while keeping the
+        // existing, already-working stream lifecycle code intact.
+        #[allow(deprecated)]
+        let mut chosen: Option<(rodio::OutputStream, rodio::OutputStreamHandle)> = None;
+        // DEBUG: dump every output device cpal sees, and mark which one the
+        // ALSA-'default' preference picks vs what try_default() would use.
+        match rodio::OutputStream::enumerate_devices() {
+            Ok(devices) => {
+                for d in devices {
+                    let n = d.name().unwrap_or_else(|_| "<unnamed>".to_string());
+                    tracing::info!("[output] device enumerated: \"{n}\"");
+                }
             }
+            Err(e) => tracing::warn!("[output] device enumeration failed: {e}"),
+        }
+        if let Some(default_name) = rodio::OutputStream::default_output_device()
+            .and_then(|d| d.name().ok())
+        {
+            tracing::info!("[output] cpal system default output would be \"{default_name}\"");
+        }
+        if let Some((device, name)) = find_alsa_default_device() {
+            match rodio::OutputStream::try_from_device(&device) {
+                Ok((stream, handle)) => {
+                    tracing::info!("[output] opening ALSA 'default' device \"{name}\"");
+                    chosen = Some((stream, handle));
+                }
+                Err(e) => tracing::warn!("[output] try_from_device(\"{name}\") FAILED: {e} — falling back to system default device"),
+            }
+        } else {
+            tracing::debug!("[output] no ALSA 'default' device among host outputs — using system default device");
+        }
+        let (stream, handle) = match chosen {
+            Some(pair) => pair,
+            None => match rodio::OutputStream::try_default() {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::error!("[output] OutputStream::try_default FAILED: {e} — audio device unavailable, playback will never start");
+                    return None;
+                }
+            },
         };
         // rodio 0.19 API: `Sink::connect_new` does not exist — construct via
         // `Sink::try_new(&OutputStreamHandle)` (the error variant can only
@@ -629,5 +676,46 @@ fn controller_thread(
 
 fn channels_of(doc: &Option<Arc<Document>>) -> u16 {
     doc.as_ref().map(|d| d.channels.max(1)).unwrap_or(2)
+}
+
+/// Find the ALSA "default" output device among cpal's enumerated hosts.
+///
+/// On Linux/cpal 0.15 every ALSA PCM name is exposed as a separate device and
+/// `Device::name()` returns exactly that alsa-lib identifier — so the virtual
+/// "default" device (which follows the user's desktop sound card / dmix
+/// configuration) is identifiable by its name. Returns the first match;
+/// `None` on non-ALSA backends or enumeration failure (the caller then falls
+/// back to `OutputStream::try_default`).
+fn find_alsa_default_device() -> Option<(cpal::Device, String)> {
+    let hosts = cpal::host_ids();
+    tracing::debug!("[output] cpal hosts: {hosts:?}");
+    for host in hosts {
+        let devices = match host.devices() {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+        for device in devices {
+            // A name lookup failure on one device must not abort the whole
+            // scan (previously `?` returned None from the entire function).
+            let name = match device.name() {
+                Ok(n) => n,
+                Err(_) => continue,
+            };
+            // Only consider output-capable devices, then match the ALSA
+            // virtual default (names "default", or "...:dmix..." variants).
+            let supports_output = device
+                .supported_output_configs()
+                .map(|mut c| c.next().is_some())
+                .unwrap_or(false);
+            if !supports_output {
+                continue;
+            }
+            let lname = name.to_lowercase();
+            if lname == "default" || lname.contains("dmix") {
+                return Some((device, name));
+            }
+        }
+    }
+    None
 }
 
