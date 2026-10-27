@@ -1,15 +1,20 @@
-//! Transport controller (TZ §1.3 / §5): play/pause/stop/seek/loop on top of
-//! the rodio output ([`AudioOutput`]). Owns the resume point and the
-//! [`TransportState`] that the UI buttons derive from ("Pause не залипает").
+//! UI-facing transport state machine (TZ §1.3 / §5): play/pause/stop/seek/
+//! loop bookkeeping shared between the egui frame loop and the audio output
+//! thread (`player::output`) through an `Arc<Mutex<Controller>>`. The real
+//! audio clock lives in that thread; these methods only mirror it so the
+//! transport buttons never stick ("Pause не залипает").
 //!
 //! All public methods are safe to call before a document is loaded — they
 //! degrade to no-ops (TZ §1.2: "нажатия раньше времени не падают").
 
-use super::output::AudioOutput;
-use super::{CursorSource, MeterData, PlayheadState, TransportState};
+use super::{CursorSource, PlayheadState, TransportState};
 use crate::Document;
 use std::sync::Arc;
 
+/// UI-facing transport state machine. The real audio clock lives in the
+/// output controller thread (`player::output`); this struct mirrors it and
+/// is shared between the UI frame loop and that thread through an
+/// `Arc<Mutex<Controller>>`.
 pub struct Controller {
     state: TransportState,
     loop_enabled: bool,
@@ -19,19 +24,12 @@ pub struct Controller {
     current_frame: u64,
     resume_frame: u64,
     playhead: Arc<PlayheadState>,
-    output: AudioOutput,
     space_is_stop: bool,
     skip_seconds: u32,
 }
 
 impl Controller {
     pub fn new(playhead: Arc<PlayheadState>) -> Self {
-        Self::with_output(playhead, AudioOutput::new())
-    }
-
-    /// Testable constructor: inject a pre-built output (e.g. the simulated
-    /// one used by unit tests) instead of opening the default device.
-    pub fn with_output(playhead: Arc<PlayheadState>, output: AudioOutput) -> Self {
         Self {
             state: TransportState::Stopped,
             loop_enabled: false,
@@ -41,7 +39,6 @@ impl Controller {
             current_frame: 0,
             resume_frame: 0,
             playhead,
-            output,
             space_is_stop: true,
             skip_seconds: 5,
         }
@@ -62,10 +59,10 @@ impl Controller {
     pub fn volume(&self) -> f32 {
         self.volume
     }
-    /// Live volume change without restarting playback (§3.5).
+    /// Live volume change without restarting playback (§3.5). The output
+    /// thread picks the new gain up on its next command/volume sync.
     pub fn set_volume(&mut self, vol: f32) {
         self.volume = vol.clamp(0.0, 1.0);
-        self.output.set_volume(self.volume);
     }
     pub fn set_space_behavior(&mut self, is_stop: bool) {
         self.space_is_stop = is_stop;
@@ -96,17 +93,15 @@ impl Controller {
         self.state = TransportState::Playing;
         self.playhead.set_playing(true);
         self.playhead.set_position_samples(start);
-        self.output.play_slice(&doc.samples, doc.channels, doc.sample_rate, start, end);
     }
 
-    /// Freeze position and in-flight PCM (§5.3 pause).
+    /// Freeze position and in-flight PCM (§5.3 pause). The output thread
+    /// performs the actual silence via `Cmd::Pause` before calling this.
     pub fn pause(&mut self) {
         if self.state == TransportState::Playing {
             self.state = TransportState::Paused;
             self.playhead.set_playing(false);
-            self.sync_from_output(None);
             self.resume_frame = self.current_frame;
-            self.output.pause();
         }
     }
 
@@ -115,14 +110,12 @@ impl Controller {
         if self.state == TransportState::Paused {
             self.state = TransportState::Playing;
             self.playhead.set_playing(true);
-            self.output.resume();
         }
     }
 
     /// Immediate silence + rewind the cursor to the start of the last
     /// session (§3.5/§5.3 stop).
     pub fn stop(&mut self) {
-        self.output.stop();
         self.state = TransportState::Stopped;
         self.current_frame = self.start_frame;
         self.resume_frame = self.start_frame;
@@ -157,7 +150,6 @@ impl Controller {
             target = target.clamp(self.start_frame, self.end_frame);
             self.current_frame = target;
             self.playhead.set_position_samples(target);
-            self.output.play_slice(&doc.samples, doc.channels, doc.sample_rate, target, self.end_frame);
         } else {
             self.current_frame = target;
             self.playhead.set_position_samples(target);
@@ -176,34 +168,14 @@ impl Controller {
         self.seek(target, doc, CursorSource::User);
     }
 
-    /// Pull the audio thread's counters into the controller state. Called
-    /// from the 50 ms playhead poll (§1.2/§5.3). Returns true when a
-    /// transport transition happened this tick.
-    pub fn poll(&mut self, doc: &Document) -> bool {
-        if self.state != TransportState::Playing {
-            return false;
-        }
-        self.sync_from_output(Some(doc));
-        if self.output.take_finished() {
-            if self.loop_enabled {
-                // Live retarget: re-append the same [start,end) slice
-                // without recreating the stream — no glitch restart (§3.5).
-                self.current_frame = self.start_frame;
-                self.playhead.set_position_samples(self.current_frame);
-                self.output.play_slice(&doc.samples, doc.channels, doc.sample_rate, self.start_frame, self.end_frame);
-                return true;
-            }
-            // Natural end of a non-loop session: rewind to the session
-            // start point (§5.3).
-            self.state = TransportState::Stopped;
-            self.current_frame = self.start_frame;
-            self.resume_frame = self.start_frame;
-            self.playhead.set_position_samples(self.current_frame);
-            self.playhead.set_playing(false);
-            return true;
-        }
-        false
+    /// Output-thread hook: the thread already clamped the target into the
+    /// active session range and re-appended audio from it; mirror the move
+    /// into the UI-facing state machine without touching the resume point.
+    pub fn mark_seek(&mut self, frame: u64) {
+        self.current_frame = frame;
+        self.playhead.set_position_samples(frame);
     }
+
     /// Output-thread hooks (§5.2/§5.3): the real audio clock lives in
     /// `player::output`; these keep the UI-facing state machine consistent.
     /// Mark a new playing session [start,end) started by the output thread.
@@ -223,21 +195,11 @@ impl Controller {
         self.state = TransportState::Stopped;
         self.current_frame = start; self.resume_frame = start;
         self.playhead.set_position_samples(start); self.playhead.set_playing(false);
-        self.meter.reset();
     }
     /// Natural end of a non-loop session: stopped, car back at session start.
     pub fn finish_session_at(&mut self, start: u64) {
         self.stop_at_session_start(start);
     }
-    pub fn current_frame(&self) -> u64 { self.current_frame }
-    pub fn current_secs(&self, sample_rate: u32) -> f64 { self.current_frame as f64 / sample_rate as f64 }
-    pub fn resume_frame(&self) -> u64 { self.resume_frame }
-    pub fn reset(&mut self) {
-        self.state = TransportState::Stopped; self.start_frame = 0; self.end_frame = 0;
-        self.current_frame = 0; self.resume_frame = 0; self.playhead.set_position_samples(0);
-        self.playhead.set_playing(false); self.meter.reset();
-    }
-
     pub fn current_frame(&self) -> u64 {
         self.current_frame
     }
@@ -254,10 +216,10 @@ impl Controller {
         self.end_frame
     }
 
-    /// Full reset for loading a different file (§5.1): stop output, clear
-    /// the resume point and session bounds.
+    /// Full reset for loading a different file (§5.1): clear the resume
+    /// point and session bounds. The output thread stops its own sink when
+    /// it processes the accompanying `Cmd::Load`.
     pub fn reset(&mut self) {
-        self.output.stop();
         self.state = TransportState::Stopped;
         self.start_frame = 0;
         self.end_frame = 0;
@@ -266,17 +228,8 @@ impl Controller {
         self.playhead.set_position_samples(0);
         self.playhead.set_playing(false);
     }
-
-    /// Consume the latest metering block from the audio path (§3.5.1).
-    pub fn take_meter_data(&self) -> MeterData {
-        self.output.take_meter_data()
-    }
-
-    #[cfg(test)]
-    pub fn output_mut(&mut self) -> &mut AudioOutput {
-        &mut self.output
-    }
 }
+
 
 #[cfg(test)]
 mod tests {
@@ -285,7 +238,9 @@ mod tests {
     use crate::{Document, SampleType};
     use std::path::PathBuf;
 
-    /// Deterministic controller wired to the simulated output (no device).
+    /// Deterministic state machine for the tests below. The real audio
+    /// clock lives in `player::output`; these tests exercise the UI-facing
+    /// bookkeeping only.
     fn controller_with_doc(frames: usize, channels: u16) -> (Controller, Document) {
         let doc = Document {
             samples: vec![0.25f32; frames * channels as usize],
@@ -297,7 +252,7 @@ mod tests {
             dirty: false,
             sample_type: SampleType::Float32,
         };
-        let c = Controller::with_output(std::sync::Arc::new(PlayheadState::new()), AudioOutput::new());
+        let c = Controller::new(std::sync::Arc::new(PlayheadState::new()));
         (c, doc)
     }
 
@@ -305,13 +260,12 @@ mod tests {
     fn calls_before_load_are_safe_noops() {
         // TZ §1.2: "нажатия раньше времени не падают".
         let empty = Document::new();
-        let mut c = Controller::with_output(std::sync::Arc::new(PlayheadState::new()), AudioOutput::new());
+        let mut c = Controller::new(std::sync::Arc::new(PlayheadState::new()));
         c.play(&empty, None);
         assert_eq!(c.state(), TransportState::Stopped);
         c.pause();
         c.seek(100, &empty, CursorSource::User);
         c.skip(&empty, 5);
-        assert!(!c.poll(&empty));
         c.stop();
         c.reset();
     }
@@ -341,30 +295,24 @@ mod tests {
     }
 
     #[test]
-    fn pause_freezes_position_and_unpause_resumes_it() {
+    fn pause_freezes_resume_point_and_unpause_resumes_it() {
         let (mut c, doc) = controller_with_doc(1000, 1);
         c.play(&doc, None);
-        c.output_mut().advance(150);
+        // The output thread mirrors the measured audio-clock position here.
+        c.freeze_resume_at(150);
         c.pause();
         assert_eq!(c.state(), TransportState::Paused);
-        let frozen = c.current_frame();
-        assert_eq!(frozen, 150);
-        // Frozen in-flight PCM does not advance while paused.
-        assert_eq!(c.output_mut().advance(100), 0);
-        assert_eq!(c.current_frame(), frozen);
+        assert_eq!(c.current_frame(), 150);
+        assert_eq!(c.resume_frame(), 150);
         c.unpause();
         assert_eq!(c.state(), TransportState::Playing);
-        c.output_mut().advance(50);
-        c.poll(&doc);
-        assert_eq!(c.current_frame(), 200);
     }
 
     #[test]
     fn stop_rewinds_to_session_start() {
         let (mut c, doc) = controller_with_doc(1000, 1);
         c.play(&doc, Some((200, 800)));
-        c.output_mut().advance(300);
-        c.poll(&doc);
+        c.freeze_resume_at(500);
         c.stop();
         assert_eq!(c.state(), TransportState::Stopped);
         assert_eq!(c.current_frame(), 200);
@@ -375,32 +323,27 @@ mod tests {
     fn natural_end_of_non_loop_session_rewinds_and_stops() {
         let (mut c, doc) = controller_with_doc(1000, 1);
         c.play(&doc, Some((0, 500)));
-        assert!(c.output_mut().advance(500) > 0);
-        assert!(c.poll(&doc));
+        c.freeze_resume_at(500);
+        // Output-thread hook: natural completion rewinds to session start.
+        c.finish_session_at(c.start_frame());
         assert_eq!(c.state(), TransportState::Stopped);
         assert_eq!(c.current_frame(), 0); // rewind to session start (§5.3)
     }
 
     #[test]
-    fn loop_restarts_slice_without_state_change() {
-        let (mut c, doc) = controller_with_doc(1000, 1);
-        c.set_loop(true);
-        c.play(&doc, Some((100, 300)));
-        c.output_mut().advance(200);
-        assert!(c.poll(&doc)); // finished event consumed
-        assert_eq!(c.state(), TransportState::Playing); // still playing
-        assert_eq!(c.current_frame(), 100); // live retarget to loop start
-        assert_eq!(c.start_frame(), 100);
-        assert_eq!(c.end_frame(), 300);
-        // The re-appended slice plays on.
-        assert!(c.output_mut().advance(50) > 0);
+    fn loop_flag_round_trip() {
+        let (mut c, _doc) = controller_with_doc(1000, 1);
+        assert!(!c.is_looping());
+        c.toggle_loop();
+        assert!(c.is_looping());
+        c.set_loop(false);
+        assert!(!c.is_looping());
     }
 
     #[test]
     fn seek_during_playback_clamps_into_active_range() {
         let (mut c, doc) = controller_with_doc(1000, 1);
         c.play(&doc, Some((200, 400)));
-        c.output_mut().advance(50);
         // Click-to-seek outside the selection must not extend it (§5.3).
         c.seek(900, &doc, CursorSource::User);
         assert_eq!(c.current_frame(), 400);
@@ -436,7 +379,7 @@ mod tests {
         assert_eq!(c.volume(), 1.0);
         c.set_volume(-1.0);
         assert_eq!(c.volume(), 0.0);
-        c.set_volume(0.5); // no panic without an active sink
+        c.set_volume(0.5);
         assert_eq!(c.volume(), 0.5);
     }
 
@@ -456,42 +399,10 @@ mod tests {
     }
 
     #[test]
-    fn meter_data_reports_peaks_and_rms_per_channel() {
-        // Simulated stereo playback: L loud, R quiet.
-        let frames = 4;
-        let mut samples = Vec::new();
-        for i in 0..frames {
-            samples.push(if i % 2 == 0 { 0.8 } else { -0.6 }); // L
-            samples.push(0.1); // R
-        }
-        let doc = Document {
-            samples,
-            sample_rate: 1000,
-            channels: 2,
-            markers: Vec::new(),
-            source_path: PathBuf::from("m.wav"),
-            temp_path: None,
-            dirty: false,
-            sample_type: SampleType::Float32,
-        };
-        let mut c = Controller::with_output(std::sync::Arc::new(PlayheadState::new()), AudioOutput::new());
-        c.play(&doc, None);
-        c.output_mut().advance(frames);
-        let m = c.take_meter_data();
-        assert!((m.peak_l - 0.8).abs() < 1e-6);
-        assert!((m.peak_r - 0.1).abs() < 1e-6);
-        assert!(m.rms_l > 0.0 && m.rms_l <= m.peak_l);
-        // Snapshot-and-clear: a second read with no new audio is silent.
-        let m2 = c.take_meter_data();
-        assert_eq!(m2.peak_l, 0.0);
-        assert_eq!(m2.rms_l, 0.0);
-    }
-
-    #[test]
     fn reset_clears_session_for_file_switch() {
         let (mut c, doc) = controller_with_doc(1000, 1);
         c.play(&doc, Some((100, 900)));
-        c.output_mut().advance(50);
+        c.freeze_resume_at(150);
         c.reset();
         assert_eq!(c.state(), TransportState::Stopped);
         assert_eq!(c.current_frame(), 0);

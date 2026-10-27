@@ -9,8 +9,7 @@
 //! §5.3). The playhead position and the volume-meter statistics are exported
 //! through atomics / a mutex and polled by the UI every 50 ms (§1.2, §5.3).
 
-use std::sync::
-{
+use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
     Arc, Mutex,
 };
@@ -38,6 +37,9 @@ pub struct SharedOutput {
     /// Volume-meter snapshot produced by `MeteringSource` before samples
     /// reach the Sink (§3.5.1). Read (and reset) once per UI poll tick.
     pub meter: Mutex<MeterData>,
+    /// Frame offset where the currently appended slice started — added to
+    /// the Sink's relative get_pos() clock to obtain an absolute frame.
+    pub pos_offset: AtomicU64,
 }
 
 impl Default for SharedOutput {
@@ -47,6 +49,7 @@ impl Default for SharedOutput {
             session_start_frame: AtomicU64::new(0),
             source_active: AtomicBool::new(false),
             meter: Mutex::new(MeterData::default()),
+            pos_offset: AtomicU64::new(0),
         }
     }
 }
@@ -112,8 +115,8 @@ impl RodioOutput {
         // rodio 0.19 API: `Sink::connect_new` does not exist — construct via
         // `Sink::try_new(&OutputStreamHandle)` (the error variant can only
         // happen if the stream died between calls; fall back to silence then).
+        // NOTE: 0.19 has no `set_speed_of_playback` — playback rate stays 1.0.
         let sink = rodio::Sink::try_new(&handle).ok()?;
-        sink.set_speed_of_playback(1.0);
 
         let shared = Arc::new(SharedOutput::default());
         let (tx, rx) = bounded::<Cmd>(16);
@@ -168,24 +171,30 @@ impl Drop for RodioOutput {
 
 /// Interleaved PCM slice [start_frame, end_frame) × channels, taken from the
 /// document buffer (§5.2: "SamplesBuffer<f32> ... срез [start,end) × каналов").
-fn slice_to_buffer(doc: &Document, start_frame: u64, end_frame: u64) -> rodio::buffer::SamplesBuffer<Vec<f32>> {
+/// rodio 0.19: `SamplesBuffer<I::IntoIter>` — build it by moving a `Vec<f32>`
+/// iterator in, so the concrete type is just `SamplesBuffer<std::vec::IntoIter<f32>>`.
+fn slice_to_buffer(doc: &Document, start_frame: u64, end_frame: u64) -> rodio::buffer::SamplesBuffer<std::vec::IntoIter<f32>> {
     let ch = doc.channels.max(1) as usize;
     let total = doc.total_frames();
     let s = start_frame.min(total) as usize;
     let e = end_frame.clamp(s as u64 + 1, total) as usize;
-    let data = doc.samples[s * ch..e * ch].to_vec();
-    rodio::buffer::SamplesBuffer::new(ch as u16, doc.sample_rate, data)
+    let data: Vec<f32> = doc.samples[s * ch..e * ch].to_vec();
+    rodio::buffer::SamplesBuffer::new(ch as u16, doc.sample_rate, data.into_iter())
 }
 
-/// Wraps a `SamplesBuffer` and taps every block of samples for the
-/// volume-meter *before* forwarding them to the Sink (§3.5.1: "собственный
-/// rodio Source, оборачивающий SamplesBuffer ... снимает статистику блоков
-/// до Sink и прокидывает сэмплы дальше"). Also publishes the consumed-sample
-/// counter used for playhead polling.
+/// Wraps a `SamplesBuffer` and taps every sample for the volume-meter
+/// *before* forwarding them to the Sink (§3.5.1: "собственный rodio Source,
+/// оборачивающий SamplesBuffer ... снимает статистику блоков до Sink и
+/// прокидывает сэмплы дальше"). Also publishes the consumed-sample counter
+/// used for playhead polling.
 struct MeteredSource {
-    inner: rodio::buffer::SamplesBuffer<Vec<f32>>,
+    inner: rodio::buffer::SamplesBuffer<std::vec::IntoIter<f32>>,
     channels: u16,
     shared: Arc<SharedOutput>,
+    // Per-channel RMS accumulators (f64 over the current meter window).
+    rms_sum_l: f64,
+    rms_sum_r: f64,
+    rms_count: usize,
 }
 
 impl Iterator for MeteredSource {
@@ -194,20 +203,32 @@ impl Iterator for MeteredSource {
     fn next(&mut self) -> Option<f32> {
         match self.inner.next() {
             Some(v) => {
-                // Per-sample absolute max keeps the meter responsive at frame
-                // granularity; RMS is accumulated over the same window.
-                let mut meter = self.shared.meter.lock().unwrap_or_else(|p| p.into_inner());
-                let av = v.abs();
-                if self.channels < 2 {
-                    if av > meter.peak_l { meter.peak_l = av; }
-                    if av > meter.peak_r { meter.peak_r = av; }
-                } else if self.shared.consumed_samples.load(Ordering::Relaxed) % 2 == 0 {
-                    if av > meter.peak_l { meter.peak_l = av; }
-                } else if av > meter.peak_r {
-                    meter.peak_r = av;
+                // Absolute peak per channel + running RMS sums, updated on
+                // every sample so the UI poll sees a fresh window (§3.5.1).
+                let idx = self.shared.consumed_samples.fetch_add(1, Ordering::Relaxed);
+                let av: f32 = v.abs();
+                let is_left = self.channels < 2 || (idx % self.channels as u64) == 0;
+                {
+                    let mut meter = self.shared.meter.lock().unwrap_or_else(|p| p.into_inner());
+                    if is_left {
+                        if av > meter.peak_l { meter.peak_l = av; }
+                        self.rms_sum_l += (v as f64).powi(2);
+                    } else {
+                        if av > meter.peak_r { meter.peak_r = av; }
+                        self.rms_sum_r += (v as f64).powi(2);
+                    }
                 }
-                drop(meter);
-                self.shared.consumed_samples.fetch_add(1, Ordering::Relaxed);
+                self.rms_count += 1;
+                if self.rms_count >= 512 {
+                    // Publish the RMS block stats and reset the window.
+                    let mut meter = self.shared.meter.lock().unwrap_or_else(|p| p.into_inner());
+                    let n = self.rms_count.max(1) as f64;
+                    meter.rms_l = (self.rms_sum_l / n).sqrt() as f32;
+                    meter.rms_r = (self.rms_sum_r / n).sqrt() as f32;
+                    self.rms_sum_l = 0.0;
+                    self.rms_sum_r = 0.0;
+                    self.rms_count = 0;
+                }
                 Some(v)
             }
             None => None,
@@ -217,7 +238,7 @@ impl Iterator for MeteredSource {
 
 impl rodio::Source for MeteredSource {
     fn current_frame_len(&self) -> Option<usize> { self.inner.current_frame_len() }
-    fn channels(&self) -> u16 { self.channels }
+    fn channels(&self) -> u16 { self.inner.channels() }
     fn sample_rate(&self) -> u32 { self.inner.sample_rate() }
     fn total_duration(&self) -> Option<std::time::Duration> { self.inner.total_duration() }
 }
@@ -272,6 +293,7 @@ fn controller_thread(
                     if e > s {
                         sink.stop();
                         shared.consumed_samples.store(s * d.channels.max(1) as u64, Ordering::Relaxed);
+                        shared.pos_offset.store(s, Ordering::Relaxed);
                         shared.session_start_frame.store(s, Ordering::Relaxed);
                         sel_start = s;
                         sel_end = e;
@@ -279,6 +301,9 @@ fn controller_thread(
                             inner: slice_to_buffer(d, s, e),
                             channels: d.channels.max(1),
                             shared: shared.clone(),
+                            rms_sum_l: 0.0,
+                            rms_sum_r: 0.0,
+                            rms_count: 0,
                         };
                         sink.append(src);
                         shared.source_active.store(true, Ordering::Relaxed);
@@ -293,8 +318,11 @@ fn controller_thread(
                 sink.stop();
                 shared.source_active.store(false, Ordering::Relaxed);
                 let mut ctrl = controller.lock().unwrap_or_else(|p| p.into_inner());
-                ctrl.freeze_resume_at(shared.current_frame(channels_of(&doc)));
+                // Transition the state machine FIRST (it snapshots the frozen
+                // resume point), then overwrite with the measured audio-clock
+                // position (§5.3 pause freezes position and in-flight PCM).
                 ctrl.pause();
+                ctrl.freeze_resume_at(shared.current_frame(channels_of(&doc)));
             }
             Some(Cmd::Stop) => {
                 sink.stop();
@@ -305,7 +333,7 @@ fn controller_thread(
                 shared.consumed_samples.store(start * ch as u64, Ordering::Relaxed);
                 ctrl.stop_at_session_start(start);
             }
-            Some(Cmd::Seek { frame, source }) => {
+            Some(Cmd::Seek { frame, source: _source }) => {
                 if let Some(d) = &doc {
                     let ch = d.channels.max(1);
                     // Click-to-seek outside a selection never extends it; the
@@ -314,15 +342,19 @@ fn controller_thread(
                     let target = target.min(d.total_frames());
                     sink.stop(); // drop the current source BEFORE appending the new slice
                     shared.consumed_samples.store(target * ch as u64, Ordering::Relaxed);
+                    shared.pos_offset.store(target, Ordering::Relaxed);
                     {
                         let mut ctrl = controller.lock().unwrap_or_else(|p| p.into_inner());
-                        ctrl.seek(target, d.as_ref(), source);
+                        ctrl.mark_seek(target);
                         if ctrl.is_playing() {
                             let (s, e) = (target, if sel_end > sel_start { sel_end } else { d.total_frames() });
                             let src = MeteredSource {
                                 inner: slice_to_buffer(d, s, e),
                                 channels: ch,
                                 shared: shared.clone(),
+                                rms_sum_l: 0.0,
+                                rms_sum_r: 0.0,
+                                rms_count: 0,
                             };
                             sink.append(src);
                             shared.source_active.store(true, Ordering::Relaxed);
@@ -346,10 +378,14 @@ fn controller_thread(
                         let ch = d.channels.max(1);
                         sink.stop();
                         shared.consumed_samples.store(sel_start * ch as u64, Ordering::Relaxed);
+                        shared.pos_offset.store(sel_start, Ordering::Relaxed);
                         let src = MeteredSource {
                             inner: slice_to_buffer(d, sel_start, sel_end),
                             channels: ch,
                             shared: shared.clone(),
+                            rms_sum_l: 0.0,
+                            rms_sum_r: 0.0,
+                            rms_count: 0,
                         };
                         sink.append(src);
                     }
@@ -367,8 +403,13 @@ fn controller_thread(
         // ---- poll section: runs after every command or timeout tick ----
         let (pos_frame, finished) = {
             let ctrl = controller.lock().unwrap_or_else(|p| p.into_inner());
-            let ch = channels_of(&doc);
-            let pos = sink.get_pos() / ch.max(1) as u64;
+            // rodio 0.19: Sink::get_pos() returns the elapsed playback
+            // Duration of the current source (§5.3 playhead polling);
+            // convert it to a frame index via the sample rate and add the
+            // offset where the appended slice started.
+            let sr = doc.as_ref().map(|d| d.sample_rate.max(1) as f64).unwrap_or(44100.0);
+            let pos_secs = sink.get_pos().as_secs_f64();
+            let pos = (pos_secs * sr) as u64 + shared.pos_offset.load(Ordering::Relaxed);
             let playing = ctrl.state() == TransportState::Playing;
             let active = shared.source_active.load(Ordering::Relaxed);
             (pos, playing && active && sink.empty())
@@ -409,10 +450,14 @@ fn controller_thread(
                 if let Some(d) = &doc {
                     let ch = d.channels.max(1);
                     shared.consumed_samples.store(sel_start * ch as u64, Ordering::Relaxed);
+                    shared.pos_offset.store(sel_start, Ordering::Relaxed);
                     let src = MeteredSource {
                         inner: slice_to_buffer(d, sel_start, sel_end),
                         channels: ch,
                         shared: shared.clone(),
+                        rms_sum_l: 0.0,
+                        rms_sum_r: 0.0,
+                        rms_count: 0,
                     };
                     sink.append(src);
                 }
@@ -422,6 +467,7 @@ fn controller_thread(
                 let start = shared.session_start_frame.load(Ordering::Relaxed);
                 let ch = channels_of(&doc);
                 shared.consumed_samples.store(start * ch as u64, Ordering::Relaxed);
+                shared.pos_offset.store(start, Ordering::Relaxed);
                 shared.source_active.store(false, Ordering::Relaxed);
                 {
                     let mut ctrl = controller.lock().unwrap_or_else(|p| p.into_inner());
