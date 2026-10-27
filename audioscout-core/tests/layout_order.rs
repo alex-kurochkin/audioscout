@@ -176,3 +176,70 @@ fn file_list_height_uses_only_eguis_available_height() {
         "the file-list ScrollArea must use the computed height"
     );
 }
+
+/// Regression test for the files-window grid bug: the column-header cells
+/// used to live in a SECOND `egui::Grid` ("file_table_header") separate from
+/// the data rows' grid ("file_table_body"). Two independent grids never share
+/// a real cell mesh — their column offsets come from separately allocated
+/// rects (e.g. the vertical scrollbar eats width only inside the scroll area
+/// that hosts the body grid), so the header drifted against the body rows.
+/// The fix: exactly ONE grid ("file_table") whose FIRST ROW contains the
+/// header cells, followed by all data rows — titles and cells are then cells
+/// of one and the same grid by construction.
+#[test]
+fn file_table_has_one_grid_with_header_as_first_row() {
+    // Comment-insensitive view of the source again: BUGFIX comments may
+    // mention the removed grid ids, only real code references matter.
+    let code: String = app_source()
+        .lines()
+        .map(|l| {
+            let t = l.trim_start();
+            if t.starts_with("//") {
+                ""
+            } else {
+                match l.find("//") {
+                    Some(i) => &l[..i],
+                    None => l,
+                }
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    // The two-grid layout is gone…
+    assert!(
+        !code.contains("file_table_header") && !code.contains("file_table_body"),
+        "header and body must not be rendered as two separate grids"
+    );
+
+    // …and there is exactly one table grid in the files window.
+    let grid_id = "egui::Grid::new(\"file_table\")";
+    let occurrences = code.matches(grid_id).count();
+    assert_eq!(
+        occurrences, 1,
+        "the files window must build exactly one egui Grid named \"file_table\""
+    );
+
+    // Inside that single grid's closure: the header row is emitted first
+    // (its end_row precedes the data-row loop), and the data rows close the
+    // same grid.show call.
+    let grid_pos = code.find(grid_id).unwrap();
+    let after_grid = &code[grid_pos..];
+    let header_end_row = after_grid
+        .find("ui.end_row();")
+        .expect("header row must end with ui.end_row() before the data rows");
+    let data_loop = after_grid
+        .find("for (idx, row) in file_rows.iter().enumerate()")
+        .expect("data rows must be rendered in the same grid closure");
+    assert!(
+        header_end_row < data_loop,
+        "the header cells must be the FIRST ROW of the single file_table grid"
+    );
+    let grid_close = after_grid
+        .rfind("});")
+        .expect("grid.show closure must be closed");
+    assert!(
+        grid_close > data_loop,
+        "the data rows must live inside the same grid.show closure as the header"
+    );
+}

@@ -1086,10 +1086,9 @@ impl eframe::App for AudioScoutApp {
             // --- Table layout ------------------------------------------------------
             // BUGFIX (column headers): the header row used to be emitted
             // *after* the ScrollArea, i.e. at the BOTTOM of the files window.
-            // It now renders first, pinned above the list, built with an
-            // eframe table whose header cells and body cells share one column
-            // model (`TableBuilder::columns`), so header widths and positions
-            // are guaranteed to line up with the data underneath.
+            // It now renders as the FIRST ROW of the very same Grid that
+            // holds every data row, so titles and cells share one grid by
+            // construction (see "one single grid" below).
             //
             // The table's own vertical ScrollArea is sized exactly to the
             // remaining space (`auto_shrink([false, false])` + `max_height`)
@@ -1126,28 +1125,32 @@ impl eframe::App for AudioScoutApp {
                 };
                 let selected_row = &mut self.selected_row;
                 let filter_text = self.filter_text.to_lowercase();
-                // Column headers now live at the TOP of the files window.
-                // Previously the header row was emitted *after* the ScrollArea
-                // (i.e. under the list) and its widths were laid out by a
-                // separate horizontal pass, so they drifted from the body's
-                // Grid columns. Both header and body are now rendered through
-                // one shared column model (`column_widths` below) using two
-                // egui Grids with identical spacing/num_columns: Grid column
-                // slots are positioned purely from the stored per-column
-                // widths, so titles and cells line up exactly, and the first
-                // frame is measured invisibly (like egui's own Grid trick) to
-                // avoid width glitches when the layout changes.
+                // BUGFIX (table grid): the header used to be emitted *after*
+                // the ScrollArea (i.e. under the list), then it was moved on
+                // top but rendered as a SECOND, separate `Grid`
+                // ("file_table_header") while the data rows lived in another
+                // one ("file_table_body"). Two independent grids never share
+                // a real cell mesh: their column offsets come from separately
+                // allocated rects, so any difference in the surrounding
+                // context (e.g. the vertical scrollbar eating width inside
+                // the body's grid only, or differing outer margins) shifted
+                // the whole header against the body — the header cells were
+                // not part of the same grid as the row cells.
+                // Now the header row is the FIRST ROW of the single
+                // `file_table` grid shown inside the ScrollArea: every title
+                // cell and every data cell occupies a slot of one and the
+                // same grid, so columns line up by construction.
                 let column_widths: Vec<f32> = visible_cols
                     .iter()
                     .map(|c| column_layout.width(c))
                     .collect();
-                let num_columns = visible_cols.len();
 
                 // Shared cell painter: draws one table cell into `cell_ui`
                 // constrained to the exact column width. Used by BOTH the
-                // header grid and the body grid so geometry is identical.
-                // Returns the child Ui's min_rect (in parent coordinates),
-                // which doubles as the cell's click-response rect.
+                // header row and the data rows of the single table grid, so
+                // geometry is identical. Returns the child Ui's min_rect (in
+                // parent coordinates), which doubles as the cell's
+                // click-response rect.
                 fn draw_cell(
                     cell_ui: &mut egui::Ui,
                     width: f32,
@@ -1165,64 +1168,23 @@ impl eframe::App for AudioScoutApp {
                     inner.inner
                 }
 
-                // --- Header grid (top of the files window, pinned) ---
+                // Sort indicator state for the header row, read *before* the
+                // immutable borrows used inside the grid closure below.
+                let sort_column = self.column_layout.sort_column;
+                let sort_ascending = self.column_layout.sort_ascending;
+
+                // --- The files table: ONE grid holding the header row and
+                // all data rows (scrollable) ---
+                // `file_rows` is borrowed here — no other code mutates
+                // `self.file_rows`/`self.column_layout` while the closure is
+                // open; a clicked column title only records the request, and
+                // the actual re-sort happens after the panel closure.
+                let file_rows = &self.file_rows;
                 // Clicks on sortable titles are recorded here and applied
                 // after the whole CentralPanel closure (the layout is only
                 // borrowed immutably inside).
                 let mut sort_request: Option<Column> = None;
-                {
-                    let sort_column = self.column_layout.sort_column;
-                    let sort_ascending = self.column_layout.sort_ascending;
-                    let header_grid = egui::Grid::new("file_table_header")
-                        .num_columns(num_columns)
-                        .spacing([10.0, 4.0])
-                        .striped(true);
-                    header_grid.show(ui, |ui| {
-                        for (ci, col) in visible_cols.iter().enumerate() {
-                            let width = column_widths[ci];
-                            let label = col.title();
-                            let indicator = if sort_column == Some(*col) {
-                                if sort_ascending { " ▲" } else { " ▼" }
-                            } else {
-                                ""
-                            };
-                            let sortable = col.sortable();
-                            let col_copy = *col;
-                            draw_cell(ui, width, 24.0, |ui| {
-                                let response = if sortable {
-                                    ui.add_sized(
-                                        [width, 24.0],
-                                        egui::Button::new(format!("{}{}", label, indicator)),
-                                    )
-                                } else {
-                                    ui.add_sized(
-                                        [width, 24.0],
-                                        egui::Label::new(egui::RichText::new(label).strong()),
-                                    )
-                                };
-                                if sortable && response.clicked() {
-                                    sort_request = Some(col_copy);
-                                }
-                            });
-                        }
-                        ui.end_row();
-                    });
-                }
-                if let Some(col) = sort_request {
-                    if self.column_layout.sort_column == Some(col) {
-                        self.column_layout.sort_ascending = !self.column_layout.sort_ascending;
-                    } else {
-                        self.column_layout.sort_column = Some(col);
-                        self.column_layout.sort_ascending = true;
-                    }
-                    self.column_layout.sort_rows(&mut self.file_rows);
-                }
 
-                // --- Body grid (scrollable list under the header) ---
-                // `file_rows` is borrowed *here* — after the sort block above
-                // has finished mutating `self.column_layout`/`self.file_rows`,
-                // so the immutable borrow no longer conflicts with it.
-                let file_rows = &self.file_rows;
                 egui::ScrollArea::vertical()
                     .id_salt("file_list")
                     .auto_shrink([false, false])
@@ -1233,12 +1195,45 @@ impl eframe::App for AudioScoutApp {
                         // `paths_to_load` after the closure returns.
                         let mut local_paths_to_load: Vec<PathBuf> = Vec::new();
 
-                        let grid = egui::Grid::new("file_table_body")
-                            .num_columns(num_columns)
+                        let grid = egui::Grid::new("file_table")
+                            .num_columns(visible_cols.len())
                             .spacing([10.0, 4.0])
                             .striped(true);
 
                         grid.show(ui, |ui| {
+                            // --- Header row: first row OF THE SAME GRID, so
+                            // its cells share the column mesh with every data
+                            // row underneath. ---
+                            for (ci, col) in visible_cols.iter().enumerate() {
+                                let width = column_widths[ci];
+                                let label = col.title();
+                                let indicator = if sort_column == Some(*col) {
+                                    if sort_ascending { " ▲" } else { " ▼" }
+                                } else {
+                                    ""
+                                };
+                                let sortable = col.sortable();
+                                let col_copy = *col;
+                                draw_cell(ui, width, 24.0, |ui| {
+                                    let response = if sortable {
+                                        ui.add_sized(
+                                            [width, 24.0],
+                                            egui::Button::new(format!("{}{}", label, indicator)),
+                                        )
+                                    } else {
+                                        ui.add_sized(
+                                            [width, 24.0],
+                                            egui::Label::new(egui::RichText::new(label).strong()),
+                                        )
+                                    };
+                                    if sortable && response.clicked() {
+                                        sort_request = Some(col_copy);
+                                    }
+                                });
+                            }
+                            ui.end_row();
+
+                            // --- Data rows ---
                             for (idx, row) in file_rows.iter().enumerate() {
                                 if !filter_text.is_empty() && !row.name.to_lowercase().contains(&filter_text) {
                                     continue;
@@ -1375,6 +1370,20 @@ impl eframe::App for AudioScoutApp {
                         // outer `paths_to_load` (loaded after CentralPanel).
                         paths_to_load.append(&mut local_paths_to_load);
                     });
+
+                // A column title clicked in the header row: apply the sort
+                // AFTER the whole panel closure has finished (the grid above
+                // only borrows the layout immutably). This is exactly what
+                // used to happen right after the old separate header grid.
+                if let Some(col) = sort_request {
+                    if self.column_layout.sort_column == Some(col) {
+                        self.column_layout.sort_ascending = !self.column_layout.sort_ascending;
+                    } else {
+                        self.column_layout.sort_column = Some(col);
+                        self.column_layout.sort_ascending = true;
+                    }
+                    self.column_layout.sort_rows(&mut self.file_rows);
+                }
             }
         });
 
