@@ -479,14 +479,23 @@ fn device_enumeration_uses_cpal_015_host_api_via_rodio_reexport() {
     assert!(!code.contains("supported_output_devices()"), "nonexistent rodio 0.19 API supported_output_devices");
     assert!(code.contains("use rodio::cpal::traits::{DeviceTrait, HostTrait};"), "trait imports required for devices()/name()/supported_output_configs()");
 
-    // Output-capability filtering and device typing.
-    assert!(code.contains("supported_output_configs()"), "devices must be probed for output configs (skip capture-only PCMs)");
+    // Output-capability filtering and device typing. Probing must be LAZY
+    // (per candidate in pick_output_device), never eager for every device —
+    // eager supported_output_configs() opens every ALSA PCM via alsa-lib and
+    // spams dmix/dsnoop/JACK errors on desktop Debian.
+    assert!(code.contains("supported_output_configs()"), "candidate devices must still be probed for output configs");
+    assert!(code.contains("fn device_has_output(device: &rodio::cpal::Device) -> bool"), "lazy per-device output probe expected");
     assert!(code.contains("Vec<(rodio::cpal::Device, String)>"), "device list typed with the cpal::Device that OutputStream::try_from_device accepts");
 
-    // The scan feeds the ALSA 'default' preference and the fallback stays.
-    assert_eq!(code.matches("fn list_output_devices").count(), 1);
-    assert_eq!(code.matches("fn find_alsa_default_device").count(), 1);
-    assert!(code.contains("OutputStream::try_from_device(&device)"), "ALSA default device must be opened via try_from_device");
+    // Device preference order: env override → PulseAudio host → ALSA virtual
+    // routings ("pulse"/"default"/"dmix") → system default fallback. The old
+    // exact-match-only scan for a literally-named "default" device is gone:
+    // cpal's ALSA backend does not enumerate it on typical Debian setups.
+    assert_eq!(code.matches("fn pick_output_device").count(), 1);
+    assert!(code.contains("AUDIOSCOUT_ALSA_DEVICE"), "manual device override via env must exist");
+    assert!(code.contains("\"pulse\"") && code.contains("host_id.as_str().contains(\"pulse\")"), "PulseAudio host must be preferred over raw ALSA PCMs");
+    assert!(!code.contains("fn find_alsa_default_device"), "old exact-\"default\" scanner removed");
+    assert!(code.contains("OutputStream::try_from_device(&device)"), "chosen device must be opened via try_from_device");
     assert!(code.contains("OutputStream::try_default()"), "fallback to the system default device must remain");
 }
 
