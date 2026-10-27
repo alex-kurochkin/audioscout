@@ -883,50 +883,23 @@ impl eframe::App for AudioScoutApp {
 
         // Bottom stack — declaration order matters: in egui the FIRST declared
         // bottom panel docks to the very bottom edge of the window and each
-        // subsequent one is placed above the previous. So this order gives
-        // the visual stack (top → bottom): file actions (Mute/Apply…) →
-        // player controls (Play/Stop…) → visualization window → status bar.
-        // The transport panel therefore now sits *above* the file-content
-        // view, directly under the file-actions panel (bug #1). All four
-        // panels are declared before the CentralPanel below, so the central
-        // area's `available_height()` already accounts for their real,
-        // measured sizes — the visualization window is resizable, its height
-        // changes at runtime, and the file list shrinks/grows with it instead
-        // of rendering underneath the player windows (bug #2).
-        // File-actions panel (Mute / Normalize / Apply …)
-        egui::TopBottomPanel::bottom("actions").default_height(40.0).show(ctx, |ui| {
-            // Fallback measurement of the bottom stack for the very first
-            // frame (before egui has reserved anything). This panel is
-            // declared first, so it docks to the bottom edge and nothing
-            // below it exists yet: `screen_rect().height() - available_height()`
-            // at entry equals its own reserved height plus margins. From the
-            // second frame on all four bottom panels are already reserved
-            // when the CentralPanel is shown, so the file list uses
-            // `available_height()` there directly.
-            let stack_height_at_entry = ui.ctx().screen_rect().height() - ui.available_height();
-            ui.horizontal(|ui| {
-                if ui.button("Mute").clicked() { self.mute_selection(); }
-                ui.label("Normalize:");
-                ui.add(egui::DragValue::new(&mut self.normalize_dbfs).range(-60.0..=0.0).suffix(" dBFS"));
-                if ui.button("Apply").clicked() { self.normalize_selection(); }
-                ui.separator();
-                if ui.button("Delete all markers").clicked() { self.document.markers.clear(); }
-                if let Some(path) = &self.active_file {
-                    ui.separator();
-                    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                    ui.strong(name);
-                }
-            });
-            if (stack_height_at_entry - self.bottom_panels_height).abs() > 1.0 {
-                self.bottom_panels_height = stack_height_at_entry;
-                // Re-layout once so the table height catches up immediately
-                // after the user drags the audio-view separator.
-                ui.ctx().request_repaint();
-            }
-        }
+        // subsequent one is placed above the previous. So this declaration
+        // order (player → audio_view → actions → status) yields the visual
+        // stack, top → bottom: file actions (Mute/Apply…) → player controls
+        // (Play/Stop…) → visualization window → status bar. The transport
+        // panel therefore now sits *above* the file-content view, directly
+        // under the file-actions panel (bug #1). All four panels are declared
+        // before the CentralPanel below, so the central area's
+        // `available_height()` already accounts for their real, measured
+        // sizes — the visualization window is resizable, its height changes
+        // at runtime, and the file list shrinks/grows with it instead of
+        // rendering underneath the player windows (bug #2).
 
-                // Player panel (transport controls) — sits above the visualization
-        // area and below the actions panel in the bottom stack.
+        // Player panel (transport controls) — declared FIRST so it docks to
+        // the very bottom edge of the window; the visualization window is
+        // then placed *below* it and the actions panel above (bug #1:
+        // Play/Stop must sit under the file-actions panel and above the
+        // audio-content view).
         egui::TopBottomPanel::bottom("player").default_height(80.0).show(ctx, |ui| {
             ui.horizontal(|ui| {
                 if ui.button("|<").clicked() { self.navigate_file(-1); }
@@ -955,10 +928,10 @@ impl eframe::App for AudioScoutApp {
                 ui.label(time_str);
                 if duration > 0.0 { let progress = (current_pos / duration) as f32; ui.add(egui::ProgressBar::new(progress).desired_width(ui.available_width())); }
             });
-        }
+        });
 
-                // Audio view panel (visualization area — declared between the status
-        // bar and the player so the player controls sit *above* it)
+        // Audio view panel (visualization area — declared after the player,
+        // i.e. docked *below* it in the bottom stack)
         egui::TopBottomPanel::bottom("audio_view").default_height(200.0).resizable(true).show(ctx, |ui| {
             let (rect, response) = ui.allocate_exact_size(ui.available_size(), egui::Sense::click_and_drag());
             ui.painter().rect_filled(rect, 0.0, egui::Color32::from_rgb(25, 25, 30));
@@ -1071,9 +1044,42 @@ impl eframe::App for AudioScoutApp {
                     else if scroll.y < 0.0 { if let Some(pos) = i.pointer.hover_pos() { let x_ratio = ((pos.x - rect.left()) / rect.width()).clamp(0.0, 1.0); self.audio_view.zoom_at_x(1.0 / 1.25, x_ratio as f64); } }
                 } else if scroll.y != 0.0 { self.audio_view.scroll_horizontal(-scroll.y as f64 * 0.01); }
             });
-        }
+        });
 
-                // Status bar (bottom-most)
+        // File-actions panel (Mute / Normalize / Apply …)
+        egui::TopBottomPanel::bottom("actions").default_height(40.0).show(ctx, |ui| {
+            // Fallback measurement of the bottom stack for the very first
+            // frame (before egui has reserved anything). This panel is the
+            // last-but-one declared, so at its entry only the player +
+            // audio_view reserves exist below it; `screen_rect().height() -
+            // available_height()` tracks the growing stack from frame to
+            // frame anyway. From the second frame on all four bottom panels
+            // are already reserved when the CentralPanel is shown, so the
+            // file list uses `available_height()` there directly.
+            let stack_height_at_entry = ui.ctx().screen_rect().height() - ui.available_height();
+            ui.horizontal(|ui| {
+                if ui.button("Mute").clicked() { self.mute_selection(); }
+                ui.label("Normalize:");
+                ui.add(egui::DragValue::new(&mut self.normalize_dbfs).range(-60.0..=0.0).suffix(" dBFS"));
+                if ui.button("Apply").clicked() { self.normalize_selection(); }
+                ui.separator();
+                if ui.button("Delete all markers").clicked() { self.document.markers.clear(); }
+                if let Some(path) = &self.active_file {
+                    ui.separator();
+                    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                    ui.strong(name);
+                }
+            });
+            if (stack_height_at_entry - self.bottom_panels_height).abs() > 1.0 {
+                self.bottom_panels_height = stack_height_at_entry;
+                // Re-layout once so the table height catches up immediately
+                // after the user drags the audio-view separator.
+                ui.ctx().request_repaint();
+            }
+        });
+
+        // Status bar — declared LAST among the bottom panels, which docks it
+        // highest in the stack, right under the file-list area (§13).
         egui::TopBottomPanel::bottom("status").default_height(20.0).show(ctx, |ui| {
             ui.label(&self.status_message);
         });
@@ -1114,7 +1120,6 @@ impl eframe::App for AudioScoutApp {
             // table closure, so `self` is not captured mutably inside.
             {
                 let column_layout = &self.column_layout;
-                let file_rows = &self.file_rows;
                 // Per-mode texture caches: pick the one matching the active
                 // thumbnail style so switching modes never re-uploads or mixes
                 // wave/spectrogram textures.
@@ -1217,6 +1222,10 @@ impl eframe::App for AudioScoutApp {
                 }
 
                 // --- Body grid (scrollable list under the header) ---
+                // `file_rows` is borrowed *here* — after the sort block above
+                // has finished mutating `self.column_layout`/`self.file_rows`,
+                // so the immutable borrow no longer conflicts with it.
+                let file_rows = &self.file_rows;
                 egui::ScrollArea::vertical()
                     .id_salt("file_list")
                     .auto_shrink([false, false])

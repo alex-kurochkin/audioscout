@@ -33,10 +33,13 @@ fn bottom_panel_ids(src: &str) -> Vec<String> {
 #[test]
 fn player_panel_declared_above_audio_view() {
     // In egui the FIRST declared bottom panel docks to the very bottom edge,
-    // so declaration order status → player → audio_view → actions yields the
-    // visual stack (top→bottom): actions, audio_view, player, status.
+    // so declaration order player → audio_view → actions → status yields the
+    // visual stack (top→bottom): status bar, file actions (Mute/Apply…),
+    // player controls (Play/Stop…), visualization window. The transport
+    // panel sits *above* the audio-content view and directly under the
+    // file-actions panel — exactly what bug #1 asked for.
     let ids = bottom_panel_ids(&app_source());
-    assert_eq!(ids, vec!["status", "player", "audio_view", "actions"],
+    assert_eq!(ids, vec!["player", "audio_view", "actions", "status"],
         "unexpected bottom panel order {:?}", ids);
 }
 
