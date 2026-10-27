@@ -366,10 +366,13 @@ impl RodioOutput {
                 let shared = shared.clone();
                 let controller = controller.clone();
                 let pump = pump.clone();
-                let dead = pump.dead.clone();
+                // BUGFIX (E0599): `pump.dead` is an `AtomicBool`, which does
+                // not implement `Clone`. The flag lives inside the Arc-ed PumpCtl,
+                // so we just keep a clone of the whole `pump` handle and store
+                // through `pump.dead` below.
                 move || {
                     let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        controller_thread(sink, rx, controller, shared, event_tx, stream_format, pump)
+                        controller_thread(sink, rx, controller, shared, event_tx, stream_format, pump.clone())
                     }));
                     if let Err(p) = r {
                         let msg = p
@@ -384,7 +387,9 @@ impl RodioOutput {
                     // Receiver dropping below marks the channel disconnected;
                     // also set the flag so the pump stops spinning and the UI
                     // can surface the failure instead of faking Playing.
-                    dead.store(true, Ordering::Relaxed);
+                    // BUGFIX (E0599): `dead` is an AtomicBool inside PumpCtl —
+                    // not clonable on its own; store through the Arc handle.
+                    pump.dead.store(true, Ordering::Relaxed);
                 }
             });
         match join {
