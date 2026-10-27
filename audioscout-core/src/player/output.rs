@@ -746,30 +746,26 @@ fn pick_output_device() -> Option<(rodio::cpal::Device, String)> {
     }
 
     // 2) PulseAudio host default output device.
-    //    cpal 0.15: `HostId` is an opaque enum without `as_str()`; compare it
-    //    against the `PULSE` constant, which only exists when cpal's "pulse"
-    //    feature is enabled (it is, via rodio on Linux).
+    //    cpal 0.15 with the *default* feature set (which is what rodio pulls
+    //    in — the separate "pulse" feature is NOT enabled) has no
+    //    `HostId::Pulse` variant: PulseAudio is reached through the ALSA
+    //    plugin layer (`pcm.pulse`), i.e. a device named "pulse" under the
+    //    ALSA host. That case is covered by step 3 below. Here we additionally
+    //    try every host's `default_output_device()` (returns Option<Device>,
+    //    not Result, in cpal 0.15) and accept it only if its name mentions
+    //    pulse/pipewire — otherwise we might silently pick a raw hw device.
     for host_id in rodio::cpal::available_hosts() {
-        #[cfg(any(target_os = "linux", target_os = "android"))]
-        let is_pulse = host_id == rodio::cpal::HostId::Pulse;
-        #[cfg(not(any(target_os = "linux", target_os = "android")))]
-        let is_pulse = false;
-        if !is_pulse {
-            continue;
-        }
         let host = match rodio::cpal::host_from_id(host_id) {
             Ok(h) => h,
             Err(_) => continue,
         };
-        // HostTrait exposes `default_output_device()` (there is no plain
-        // `default_device()` in cpal 0.15).
-        if let Ok(device) = host.default_output_device() {
-            // `Host::default_output_device()` returns cpal's concrete device
-            // type; bind it explicitly so `.name()` (DeviceTrait) infers.
-            let name: String = rodio::cpal::traits::DeviceTrait::name(&device)
-                .unwrap_or_else(|_| "pulse".to_string());
-            if device_has_output(&device) {
-                tracing::info!("[output] auto-picked PulseAudio host device \"{name}\"");
+        if let Some(device) = host.default_output_device() {
+            let name = rodio::cpal::traits::DeviceTrait::name(&device)
+                .unwrap_or_else(|_| "<unnamed>".to_string());
+            let lname = name.to_lowercase();
+            let wants_pulse_route = lname.contains("pulse") || lname.contains("pipewire");
+            if wants_pulse_route && device_has_output(&device) {
+                tracing::info!("[output] auto-picked host-default device \"{name}\"");
                 return Some((device, name));
             }
         }
