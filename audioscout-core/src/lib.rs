@@ -39,6 +39,18 @@ impl PreviewMode {
             PreviewMode::Spectrogram => "-spectro",
         }
     }
+
+    /// Parse back from the stored string form (`as_str` / config values).
+    pub fn from_str_name(s: &str) -> Self {
+        match s { "spectro" => PreviewMode::Spectrogram, _ => PreviewMode::Waveform }
+    }
+
+    pub fn toggled(self) -> Self {
+        match self {
+            PreviewMode::Waveform => PreviewMode::Spectrogram,
+            PreviewMode::Spectrogram => PreviewMode::Waveform,
+        }
+    }
 }
 
 /// Events sent from background threads to UI

@@ -30,6 +30,18 @@ impl Scanner {
         self.preview_mode.clone()
     }
 
+    /// Change the thumbnail style used by subsequent scans (top-panel
+    /// Waveform/Spectrogram toggle). Takes effect for the next scan; already
+    /// delivered rows are refreshed by re-scanning the current directory.
+    pub fn set_preview_mode(&self, mode: PreviewMode) {
+        *self.preview_mode.lock().unwrap() = mode;
+    }
+
+    /// Current thumbnail style.
+    pub fn preview_mode(&self) -> PreviewMode {
+        *self.preview_mode.lock().unwrap()
+    }
+
     pub fn scan(&self, dir: PathBuf, sender: Sender<UiEvent>) {
         self.cancel.store(true, Ordering::SeqCst);
         let cancel = Arc::new(AtomicBool::new(false));

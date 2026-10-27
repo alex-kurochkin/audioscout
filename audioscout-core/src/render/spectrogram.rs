@@ -197,7 +197,7 @@ pub fn render_spectrogram_preview(samples: &[f32], channels: u16, width: u32, he
                 let v = map[col * bins + bi] / global_max;
                 let v = (v.ln().max(-6.0) + 6.0) / 6.0; // −60 dB floor → [0,1]
                 // Row 0 = highest frequency → top of the track.
-                let y = (top_row + bi).min((height as usize) - 1);
+                let y = (top_row + bi).min((height as usize) - 1) as u32;
                 img.put_pixel(x as u32, y as u32, heat(v));
             }
         }
@@ -297,7 +297,7 @@ pub fn render_view_spectrogram(
                 let v = map[col * bins + bi] / global_max;
                 let v = (v.ln().max(-6.0) + 6.0) / 6.0;
                 // Row 0 = highest frequency → top of the track.
-                let y = (top_row + bi).min((height as usize) - 1);
+                let y = (top_row + bi).min((height as usize) - 1) as u32;
                 img.put_pixel(col as u32, y, heat(v));
             }
         }

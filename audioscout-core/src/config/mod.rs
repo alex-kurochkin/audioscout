@@ -7,7 +7,33 @@ pub struct AppConfig {
     pub volume: f32, pub space_behavior_stop: bool, pub undo_depth: usize, pub undo_disk_limit_mb: usize,
     pub undo_dir: Option<String>, pub preview_prefetch: usize, pub skip_seconds: u32,
     pub meter_hold_enabled: bool, pub meter_hold_seconds: f64, pub columns: ColumnConfig,
-    pub hotkeys: HashMap<String, HotkeyBinding>, #[serde(skip)] pub version: u64,
+    pub hotkeys: HashMap<String, HotkeyBinding>,
+    /// Table thumbnail style (Waveform/Spectrogram toggle on the top panel).
+    /// Serialized as "wave"/"spectro"; old configs without this key default
+    /// to waveform via `deserialize_with` below.
+    #[serde(default = "default_preview_mode", deserialize_with = "de_preview_mode", serialize_with = "ser_preview_mode")]
+    pub preview_mode: String,
+    /// Player visualization style (Waveform/Spectrogram toggle on the player
+    /// panel). Independent from `preview_mode` (§3.5).
+    #[serde(default = "default_preview_mode", deserialize_with = "de_preview_mode", serialize_with = "ser_preview_mode")]
+    pub audio_view_mode: String,
+    #[serde(skip)] pub version: u64,
+}
+
+fn default_preview_mode() -> String { "wave".into() }
+
+// The mode values live in `audioscout_core::PreviewMode` (string forms
+// "wave"/"spectro"). Config must not depend on egui-side types, so they are
+// stored as plain strings and validated here.
+fn de_preview_mode<'de, D>(d: D) -> Result<String, D::Error>
+where D: serde::Deserializer<'de> {
+    use serde::Deserialize;
+    let s = String::deserialize(d)?;
+    Ok(match s.as_str() { "spectro" => "spectro", _ => "wave" }.to_string())
+}
+fn ser_preview_mode<S>(v: &String, s: S) -> Result<S::Ok, S::Error>
+where S: serde::Serializer {
+    s.serialize_str(v)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -42,7 +68,10 @@ impl Default for AppConfig {
                 full_order: vec!["name","preview","duration","sample_rate","sample_type","channels","size","comment","date_created","date_modified"].into_iter().map(String::from).collect(),
                 widths: HashMap::new(),
             },
-            hotkeys, version: 0,
+            hotkeys,
+            preview_mode: "wave".into(),
+            audio_view_mode: "wave".into(),
+            version: 0,
         }
     }
 }
@@ -53,7 +82,22 @@ impl ConfigStore {
     pub fn new(config_dir: &Path) -> Self {
         let config_path = config_dir.join("config.json");
         let config = if config_path.exists() {
-            std::fs::read_to_string(&config_path).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default()
+            // Merge over `Default`: a config written by an older build simply
+            // lacks the newer keys — instead of discarding *all* user settings
+            // because one field is missing, patch the defaults with whatever
+            // the file actually contains.
+            std::fs::read_to_string(&config_path)
+                .ok()
+                .and_then(|s| {
+                    serde_json::from_str::<serde_json::Value>(&s).ok().map(|v| {
+                        let mut base = serde_json::to_value(AppConfig::default()).expect("serializable");
+                        if let (Some(base_obj), Some(v_obj)) = (base.as_object_mut(), v.as_object()) {
+                            for (k, val) in v_obj { base_obj.insert(k.clone(), val.clone()); }
+                        }
+                        serde_json::from_value::<AppConfig>(base).unwrap_or_default()
+                    })
+                })
+                .unwrap_or_default()
         } else { AppConfig::default() };
         Self { config, config_path }
     }

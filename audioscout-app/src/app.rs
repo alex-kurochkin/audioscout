@@ -73,6 +73,14 @@ pub struct AudioScoutApp {
     /// load, edits/undo/redo, mode switch) so a re-render is triggered even
     /// when the numeric view key stays the same.
     document_generation: u64,
+    /// Measured total height of the bottom panel stack (status bar +
+    /// visualization window + player controls + file actions), taken from
+    /// the *previous* frame. The four panels are declared before the
+    /// CentralPanel so egui already reserves their space, but on the very
+    /// first frame the resizable audio view has no size yet — until it does,
+    /// the file list falls back to this estimate (or a default) so its rows
+    /// never render underneath the player windows.
+    bottom_panels_height: f32,
 }
 
 impl AudioScoutApp {
@@ -154,6 +162,17 @@ impl AudioScoutApp {
             view_spectro_texture: None,
             view_spectro_key: None,
             document_generation: 0,
+            bottom_panels_height: 0.0,
+        };
+
+        // Restore the two independent Waveform/Spectrogram toggles from the
+        // config (§3.1 table previews, §3.5 player visualization).
+        let saved_preview_mode = PreviewMode::from_str_name(&app.config_store.config().preview_mode);
+        *app.preview_mode.lock().unwrap() = saved_preview_mode;
+        app.scanner.set_preview_mode(saved_preview_mode);
+        app.audio_view.mode = match app.config_store.config().audio_view_mode.as_str() {
+            "spectro" => AudioViewMode::Spectrogram,
+            _ => AudioViewMode::Waveform,
         };
 
         if let Some(dir_str) = app.db.load_session("lastDir") {
@@ -198,6 +217,37 @@ impl AudioScoutApp {
         }
 
         app
+    }
+
+    /// Top-panel Waveform/Spectrogram toggle for the *table thumbnails*
+    /// (§3.1). Flips the shared mode, re-scans the current directory so rows
+    /// pick up cached PNGs of the other style immediately, and repumps the
+    /// texture cache for whatever is missing.
+    fn toggle_preview_mode(&mut self) {
+        let new_mode = self.preview_mode.lock().unwrap().toggled();
+        *self.preview_mode.lock().unwrap() = new_mode;
+        self.scanner.set_preview_mode(new_mode);
+        self.config_store.config_mut().preview_mode = new_mode.as_str().to_string();
+        let _ = self.config_store.save();
+        if let Some(dir) = self.current_dir.clone() {
+            // Fresh scan: rows arrive with per-mode cached UUIDs; missing
+            // ones fall through to `request_previews` via ScanDone.
+            self.scanner.scan(dir, self.event_tx.clone());
+        } else {
+            self.request_previews();
+        }
+    }
+
+    /// Player-panel Waveform/Spectrogram toggle for the *visualization area*
+    /// (§3.5). Independent from the table thumbnail mode.
+    fn toggle_audio_view_mode(&mut self) {
+        self.audio_view.toggle_mode();
+        let name = match self.audio_view.mode {
+            AudioViewMode::Spectrogram => "spectro",
+            AudioViewMode::Waveform => "wave",
+        };
+        self.config_store.config_mut().audio_view_mode = name.to_string();
+        let _ = self.config_store.save();
     }
 
     fn request_previews(&mut self) {
@@ -706,6 +756,18 @@ impl eframe::App for AudioScoutApp {
                 ui.separator();
                 if ui.button("Columns").clicked() { self.show_columns_dialog = true; }
                 ui.separator();
+                // Table thumbnail style toggle (§3.1): the code to switch
+                // modes existed but had no control — this button exposes the
+                // current state and flips it atomically for the whole set.
+                let preview_spectro = *self.preview_mode.lock().unwrap() == PreviewMode::Spectrogram;
+                let preview_btn = egui::SelectableLabel::new(
+                    preview_spectro,
+                    if preview_spectro { "Spectrogram" } else { "Waveform" },
+                );
+                if ui.add(preview_btn).on_hover_text("Toggle table previews between waveform and spectrogram").clicked() {
+                    self.toggle_preview_mode();
+                }
+                ui.separator();
                 if ui.button("Settings").clicked() { self.show_settings = true; }
             });
         });
@@ -807,6 +869,196 @@ impl eframe::App for AudioScoutApp {
             self.expanded_dirs.remove(&dir);
         }
 
+        // Status bar (bottom-most)
+        egui::TopBottomPanel::bottom("status").default_height(20.0).show(ctx, |ui| {
+            ui.label(&self.status_message);
+        });
+        // Audio view panel (visualization area — declared between the status
+        // bar and the player so the player controls sit *above* it)
+        egui::TopBottomPanel::bottom("audio_view").default_height(200.0).resizable(true).show(ctx, |ui| {
+            let (rect, response) = ui.allocate_exact_size(ui.available_size(), egui::Sense::click_and_drag());
+            ui.painter().rect_filled(rect, 0.0, egui::Color32::from_rgb(25, 25, 30));
+
+            if !self.document.samples.is_empty() {
+                // Spectrogram mode: draw the pre-rendered widget-resolution
+                // image first; markers/selection/cursor overlay on top of it.
+                if self.audio_view.mode == AudioViewMode::Spectrogram {
+                    self.refresh_view_spectrogram(ui, rect);
+                    if let Some(tex) = &self.view_spectro_texture {
+                        ui.put(rect, egui::Image::new(tex).fit_to_exact_size(rect.size()));
+                    }
+                }
+
+                let num_tracks = self.cached_channels.len();
+                // Draw center line only for mono (1 track)
+                // For stereo/multichannel, separator lines are drawn in the waveform rendering loop
+                // (In spectrogram mode the image already contains them.)
+                if self.audio_view.mode == AudioViewMode::Waveform && num_tracks == 1 {
+                    let mid_y = rect.center().y;
+                    ui.painter().line_segment([egui::pos2(rect.left(), mid_y), egui::pos2(rect.right(), mid_y)], egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(60, 60, 65)));
+                }
+
+                // Cursor
+                let cursor_x = self.audio_view.frame_to_x(self.audio_view.cursor_frame, rect.width() as u32);
+                let cursor_screen_x = rect.left() + cursor_x;
+                if cursor_screen_x >= rect.left() && cursor_screen_x <= rect.right() {
+                    ui.painter().line_segment([egui::pos2(cursor_screen_x, rect.top()), egui::pos2(cursor_screen_x, rect.bottom())], egui::Stroke::new(1.5_f32, egui::Color32::RED));
+                }
+
+                // Markers
+                for (idx, marker) in self.document.markers.iter().enumerate() {
+                    let mx = self.audio_view.frame_to_x(marker.time_samples, rect.width() as u32);
+                    let screen_x = rect.left() + mx;
+                    if screen_x >= rect.left() && screen_x <= rect.right() {
+                        let color = if self.audio_view.active_marker == Some(idx) { egui::Color32::YELLOW } else { egui::Color32::from_rgb(100, 180, 255) };
+                        let mut y = rect.top();
+                        while y < rect.bottom() {
+                            let seg_end = (y + 4.0).min(rect.bottom());
+                            ui.painter().line_segment([egui::pos2(screen_x, y), egui::pos2(screen_x, seg_end)], egui::Stroke::new(1.0_f32, color));
+                            y += 8.0;
+                        }
+                        ui.painter().text(egui::pos2(screen_x + 2.0, rect.top() + 2.0), egui::Align2::LEFT_TOP, &marker.name, egui::FontId::proportional(10.0), color);
+                    }
+                }
+
+                // Selection
+                if let Some(sel) = self.audio_view.selection_range() {
+                    let x1 = rect.left() + self.audio_view.frame_to_x(sel.0, rect.width() as u32);
+                    let x2 = rect.left() + self.audio_view.frame_to_x(sel.1, rect.width() as u32);
+                    let sel_rect = egui::Rect::from_min_max(egui::pos2(x1.max(rect.left()), rect.top()), egui::pos2(x2.min(rect.right()), rect.bottom()));
+                    ui.painter().rect_filled(sel_rect, 0.0, egui::Color32::from_rgba_premultiplied(80, 120, 255, 60));
+                }
+
+                // Waveform - using cached Peaks tree for fast rendering
+                // Render 1 track for mono, 2 tracks for stereo/multichannel
+                let start_frame = self.audio_view.view_range.start_frame;
+                let end_frame = self.audio_view.view_range.end_frame;
+                let view_frames = end_frame.saturating_sub(start_frame);
+                let num_tracks = self.cached_channels.len();
+
+                if view_frames > 0 && num_tracks > 0 {
+                    let track_height = rect.height() / num_tracks as f32;
+                    let pixels = rect.width() as u32;
+                    let step = view_frames as f64 / pixels as f64;
+                    let start = start_frame as f64;
+
+                    for (track_idx, (channel_data, peaks)) in self.cached_channels.iter().enumerate() {
+                        let track_top = rect.top() + track_idx as f32 * track_height;
+                        let track_mid_y = track_top + track_height / 2.0;
+
+                        // Draw separator line between tracks (except before first)
+                        if track_idx > 0 {
+                            ui.painter().line_segment(
+                                [egui::pos2(rect.left(), track_top), egui::pos2(rect.right(), track_top)],
+                                egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(60, 60, 65))
+                            );
+                        }
+
+                        // Get min/max for each pixel column using cached peaks tree
+                        let columns = peaks.spans(channel_data, start, step, pixels as usize);
+
+                        let half_h = track_height / 2.0;
+                        for (px, &(min_val, max_val)) in columns.iter().enumerate() {
+                            let x = rect.left() + px as f32;
+                            let y_top = track_mid_y - max_val * half_h;
+                            let y_bot = track_mid_y - min_val * half_h;
+                            ui.painter().line_segment(
+                                [egui::pos2(x, y_top), egui::pos2(x, y_bot)],
+                                egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(50, 200, 80))
+                            );
+                        }
+                    }
+                }
+            }
+
+            if response.clicked() {
+                if let Some(pos) = response.interact_pointer_pos() {
+                    let x_ratio = (pos.x - rect.left()) / rect.width();
+                    let frame = self.audio_view.x_to_frame(x_ratio * rect.width(), rect.width() as u32);
+                    self.audio_view.set_cursor(frame);
+                    self.player.seek(frame, &self.document, audioscout_core::player::CursorSource::User);
+                }
+            }
+
+            ui.input(|i| {
+                let scroll = i.smooth_scroll_delta;
+                if i.modifiers.ctrl {
+                    if scroll.y > 0.0 { if let Some(pos) = i.pointer.hover_pos() { let x_ratio = ((pos.x - rect.left()) / rect.width()).clamp(0.0, 1.0); self.audio_view.zoom_at_x(1.25, x_ratio as f64); } }
+                    else if scroll.y < 0.0 { if let Some(pos) = i.pointer.hover_pos() { let x_ratio = ((pos.x - rect.left()) / rect.width()).clamp(0.0, 1.0); self.audio_view.zoom_at_x(1.0 / 1.25, x_ratio as f64); } }
+                } else if scroll.y != 0.0 { self.audio_view.scroll_horizontal(-scroll.y as f64 * 0.01); }
+            });
+        });
+        // Player panel (transport controls) — sits above the visualization
+        // area and below the actions panel in the bottom stack.
+        egui::TopBottomPanel::bottom("player").default_height(80.0).show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                if ui.button("|<").clicked() { self.navigate_file(-1); }
+                let play_text = match self.player.state() { TransportState::Playing => "⏸", _ => "▶" };
+                if ui.button(play_text).clicked() { let sel = self.audio_view.selection_range(); self.player.play_pause(&self.document, sel); }
+                if ui.button("⏹").clicked() { self.player.stop(); }
+                if ui.button(">|").clicked() { self.navigate_file(1); }
+                let loop_color = if self.player.is_looping() && self.player.state() == TransportState::Playing { egui::Color32::YELLOW } else if self.player.is_looping() { egui::Color32::GREEN } else { ui.visuals().text_color() };
+                if ui.colored_label(loop_color, "🔁").clicked() { self.player.toggle_loop(); }
+                ui.separator();
+                if ui.button("+").clicked() { self.audio_view.zoom_in(); }
+                if ui.button("−").clicked() { self.audio_view.zoom_out(); }
+                ui.separator();
+                ui.label("Vol:");
+                let mut vol = self.player.volume() * 100.0;
+                if ui.add(egui::Slider::new(&mut vol, 0.0..=100.0)).changed() { self.player.set_volume(vol / 100.0); }
+                ui.separator();
+                // Visualization-area toggle (§3.5), independent from the
+                // table-preview mode on the top panel.
+                let view_spectro = self.audio_view.mode == AudioViewMode::Spectrogram;
+                let view_btn = egui::SelectableLabel::new(
+                    view_spectro,
+                    if view_spectro { "Spectrogram" } else { "Waveform" },
+                );
+                if ui.add(view_btn).on_hover_text("Toggle the visualization between waveform and spectrogram").clicked() {
+                    self.toggle_audio_view_mode();
+                }
+                ui.separator();
+                let save_color = if self.document.dirty { egui::Color32::YELLOW } else { ui.visuals().text_color() };
+                let save_label = if self.document.dirty { "Save*" } else { "Save" };
+                if ui.colored_label(save_color, save_label).clicked() { self.save_file(); }
+            });
+            ui.horizontal(|ui| {
+                let duration = self.document.duration_secs();
+                let current_pos = self.player.current_secs(self.document.sample_rate);
+                let time_str = if duration < 60.0 { format!("{:.1}s / {:.1}s", current_pos, duration) } else { format!("{} / {}", format_time_hms(current_pos), format_time_hms(duration)) };
+                ui.label(time_str);
+                if duration > 0.0 { let progress = (current_pos / duration) as f32; ui.add(egui::ProgressBar::new(progress).desired_width(ui.available_width())); }
+            });
+        });
+        // Actions panel
+        egui::TopBottomPanel::bottom("actions").default_height(40.0).show(ctx, |ui| {
+            // Measure the bottom stack for the next frame's first-frame
+            // guard. At this point every sibling panel above us has been
+            // laid out; `available_height()` is what remains *below* the
+            // CentralPanel region, i.e. exactly the combined height of the
+            // four bottom windows (incl. resize separators/margins).
+            let stack_height_at_entry = ui.ctx().screen_rect().height() - ui.available_height();
+            ui.horizontal(|ui| {
+                if ui.button("Mute").clicked() { self.mute_selection(); }
+                ui.label("Normalize:");
+                ui.add(egui::DragValue::new(&mut self.normalize_dbfs).range(-60.0..=0.0).suffix(" dBFS"));
+                if ui.button("Apply").clicked() { self.normalize_selection(); }
+                ui.separator();
+                if ui.button("Delete all markers").clicked() { self.document.markers.clear(); }
+                if let Some(path) = &self.active_file {
+                    ui.separator();
+                    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                    ui.strong(name);
+                }
+            });
+            if (stack_height_at_entry - self.bottom_panels_height).abs() > 1.0 {
+                self.bottom_panels_height = stack_height_at_entry;
+                // Re-layout once so the table height catches up immediately
+                // after the user drags the audio-view separator.
+                ui.ctx().request_repaint();
+            }
+        });
+
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.label(format!("{} files", self.file_rows.len()));
@@ -839,7 +1091,18 @@ impl eframe::App for AudioScoutApp {
                 ((last - estimate).abs() < 1.0).then_some(last).unwrap_or(estimate)
             };
 
-            let list_max_height = (ui.available_height() - header_height - 2.0).max(60.0);
+            // BUGFIX: the file-list height must account for the whole bottom
+            // stack — actions panel + player controls + the (user-resizable)
+            // visualization window + status bar. Previously the CentralPanel
+            // was declared *before* those panels, so `available_height()`
+            // still covered the region they occupy and rows rendered behind
+            // the player windows. Now all four bottom panels are declared
+            // first, so egui reserves their *measured* space automatically
+            // and the value below tracks any resize of the audio-view
+            // window. The constant is only a first-frame fallback before the
+            // stack has been measured once.
+            let first_frame_reserve = if self.bottom_panels_height > 0.0 { 0.0 } else { 340.0 };
+            let list_max_height = (ui.available_height() - header_height - 2.0 - first_frame_reserve).max(60.0);
 
             // Borrow the pieces the row loop needs *before* opening the
             // ScrollArea closure, so `self` is not captured mutably inside.
@@ -1051,174 +1314,13 @@ impl eframe::App for AudioScoutApp {
             self.load_file(&path);
         }
 
-        // Status bar (bottom-most)
-        egui::TopBottomPanel::bottom("status").default_height(20.0).show(ctx, |ui| {
-            ui.label(&self.status_message);
-        });
 
-        // Player panel (above status, below audio_view)
-        egui::TopBottomPanel::bottom("player").default_height(80.0).show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                if ui.button("|<").clicked() { self.navigate_file(-1); }
-                let play_text = match self.player.state() { TransportState::Playing => "⏸", _ => "▶" };
-                if ui.button(play_text).clicked() { let sel = self.audio_view.selection_range(); self.player.play_pause(&self.document, sel); }
-                if ui.button("⏹").clicked() { self.player.stop(); }
-                if ui.button(">|").clicked() { self.navigate_file(1); }
-                let loop_color = if self.player.is_looping() && self.player.state() == TransportState::Playing { egui::Color32::YELLOW } else if self.player.is_looping() { egui::Color32::GREEN } else { ui.visuals().text_color() };
-                if ui.colored_label(loop_color, "🔁").clicked() { self.player.toggle_loop(); }
-                ui.separator();
-                if ui.button("+").clicked() { self.audio_view.zoom_in(); }
-                if ui.button("−").clicked() { self.audio_view.zoom_out(); }
-                ui.separator();
-                ui.label("Vol:");
-                let mut vol = self.player.volume() * 100.0;
-                if ui.add(egui::Slider::new(&mut vol, 0.0..=100.0)).changed() { self.player.set_volume(vol / 100.0); }
-                ui.separator();
-                let save_color = if self.document.dirty { egui::Color32::YELLOW } else { ui.visuals().text_color() };
-                let save_label = if self.document.dirty { "Save*" } else { "Save" };
-                if ui.colored_label(save_color, save_label).clicked() { self.save_file(); }
-            });
-            ui.horizontal(|ui| {
-                let duration = self.document.duration_secs();
-                let current_pos = self.player.current_secs(self.document.sample_rate);
-                let time_str = if duration < 60.0 { format!("{:.1}s / {:.1}s", current_pos, duration) } else { format!("{} / {}", format_time_hms(current_pos), format_time_hms(duration)) };
-                ui.label(time_str);
-                if duration > 0.0 { let progress = (current_pos / duration) as f32; ui.add(egui::ProgressBar::new(progress).desired_width(ui.available_width())); }
-            });
-        });
 
-        // Audio view panel (visualization area — declared before the player
-        // so it ends up *above* the player controls in the bottom stack)
-        egui::TopBottomPanel::bottom("audio_view").default_height(200.0).resizable(true).show(ctx, |ui| {
-            let (rect, response) = ui.allocate_exact_size(ui.available_size(), egui::Sense::click_and_drag());
-            ui.painter().rect_filled(rect, 0.0, egui::Color32::from_rgb(25, 25, 30));
 
-            if !self.document.samples.is_empty() {
-                // Spectrogram mode: draw the pre-rendered widget-resolution
-                // image first; markers/selection/cursor overlay on top of it.
-                if self.audio_view.mode == AudioViewMode::Spectrogram {
-                    self.refresh_view_spectrogram(ui, rect);
-                    if let Some(tex) = &self.view_spectro_texture {
-                        ui.put(rect, egui::Image::new(tex).fit_to_exact_size(rect.size()));
-                    }
-                }
 
-                let num_tracks = self.cached_channels.len();
-                // Draw center line only for mono (1 track)
-                // For stereo/multichannel, separator lines are drawn in the waveform rendering loop
-                // (In spectrogram mode the image already contains them.)
-                if self.audio_view.mode == AudioViewMode::Waveform && num_tracks == 1 {
-                    let mid_y = rect.center().y;
-                    ui.painter().line_segment([egui::pos2(rect.left(), mid_y), egui::pos2(rect.right(), mid_y)], egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(60, 60, 65)));
-                }
 
-                // Cursor
-                let cursor_x = self.audio_view.frame_to_x(self.audio_view.cursor_frame, rect.width() as u32);
-                let cursor_screen_x = rect.left() + cursor_x;
-                if cursor_screen_x >= rect.left() && cursor_screen_x <= rect.right() {
-                    ui.painter().line_segment([egui::pos2(cursor_screen_x, rect.top()), egui::pos2(cursor_screen_x, rect.bottom())], egui::Stroke::new(1.5_f32, egui::Color32::RED));
-                }
 
-                // Markers
-                for (idx, marker) in self.document.markers.iter().enumerate() {
-                    let mx = self.audio_view.frame_to_x(marker.time_samples, rect.width() as u32);
-                    let screen_x = rect.left() + mx;
-                    if screen_x >= rect.left() && screen_x <= rect.right() {
-                        let color = if self.audio_view.active_marker == Some(idx) { egui::Color32::YELLOW } else { egui::Color32::from_rgb(100, 180, 255) };
-                        let mut y = rect.top();
-                        while y < rect.bottom() {
-                            let seg_end = (y + 4.0).min(rect.bottom());
-                            ui.painter().line_segment([egui::pos2(screen_x, y), egui::pos2(screen_x, seg_end)], egui::Stroke::new(1.0_f32, color));
-                            y += 8.0;
-                        }
-                        ui.painter().text(egui::pos2(screen_x + 2.0, rect.top() + 2.0), egui::Align2::LEFT_TOP, &marker.name, egui::FontId::proportional(10.0), color);
-                    }
-                }
 
-                // Selection
-                if let Some(sel) = self.audio_view.selection_range() {
-                    let x1 = rect.left() + self.audio_view.frame_to_x(sel.0, rect.width() as u32);
-                    let x2 = rect.left() + self.audio_view.frame_to_x(sel.1, rect.width() as u32);
-                    let sel_rect = egui::Rect::from_min_max(egui::pos2(x1.max(rect.left()), rect.top()), egui::pos2(x2.min(rect.right()), rect.bottom()));
-                    ui.painter().rect_filled(sel_rect, 0.0, egui::Color32::from_rgba_premultiplied(80, 120, 255, 60));
-                }
-
-                // Waveform - using cached Peaks tree for fast rendering
-                // Render 1 track for mono, 2 tracks for stereo/multichannel
-                let start_frame = self.audio_view.view_range.start_frame;
-                let end_frame = self.audio_view.view_range.end_frame;
-                let view_frames = end_frame.saturating_sub(start_frame);
-                let num_tracks = self.cached_channels.len();
-
-                if view_frames > 0 && num_tracks > 0 {
-                    let track_height = rect.height() / num_tracks as f32;
-                    let pixels = rect.width() as u32;
-                    let step = view_frames as f64 / pixels as f64;
-                    let start = start_frame as f64;
-
-                    for (track_idx, (channel_data, peaks)) in self.cached_channels.iter().enumerate() {
-                        let track_top = rect.top() + track_idx as f32 * track_height;
-                        let track_mid_y = track_top + track_height / 2.0;
-
-                        // Draw separator line between tracks (except before first)
-                        if track_idx > 0 {
-                            ui.painter().line_segment(
-                                [egui::pos2(rect.left(), track_top), egui::pos2(rect.right(), track_top)],
-                                egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(60, 60, 65))
-                            );
-                        }
-
-                        // Get min/max for each pixel column using cached peaks tree
-                        let columns = peaks.spans(channel_data, start, step, pixels as usize);
-
-                        let half_h = track_height / 2.0;
-                        for (px, &(min_val, max_val)) in columns.iter().enumerate() {
-                            let x = rect.left() + px as f32;
-                            let y_top = track_mid_y - max_val * half_h;
-                            let y_bot = track_mid_y - min_val * half_h;
-                            ui.painter().line_segment(
-                                [egui::pos2(x, y_top), egui::pos2(x, y_bot)],
-                                egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(50, 200, 80))
-                            );
-                        }
-                    }
-                }
-            }
-
-            if response.clicked() {
-                if let Some(pos) = response.interact_pointer_pos() {
-                    let x_ratio = (pos.x - rect.left()) / rect.width();
-                    let frame = self.audio_view.x_to_frame(x_ratio * rect.width(), rect.width() as u32);
-                    self.audio_view.set_cursor(frame);
-                    self.player.seek(frame, &self.document, audioscout_core::player::CursorSource::User);
-                }
-            }
-
-            ui.input(|i| {
-                let scroll = i.smooth_scroll_delta;
-                if i.modifiers.ctrl {
-                    if scroll.y > 0.0 { if let Some(pos) = i.pointer.hover_pos() { let x_ratio = ((pos.x - rect.left()) / rect.width()).clamp(0.0, 1.0); self.audio_view.zoom_at_x(1.25, x_ratio as f64); } }
-                    else if scroll.y < 0.0 { if let Some(pos) = i.pointer.hover_pos() { let x_ratio = ((pos.x - rect.left()) / rect.width()).clamp(0.0, 1.0); self.audio_view.zoom_at_x(1.0 / 1.25, x_ratio as f64); } }
-                } else if scroll.y != 0.0 { self.audio_view.scroll_horizontal(-scroll.y as f64 * 0.01); }
-            });
-        });
-
-        // Actions panel
-        egui::TopBottomPanel::bottom("actions").default_height(40.0).show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                if ui.button("Mute").clicked() { self.mute_selection(); }
-                ui.label("Normalize:");
-                ui.add(egui::DragValue::new(&mut self.normalize_dbfs).range(-60.0..=0.0).suffix(" dBFS"));
-                if ui.button("Apply").clicked() { self.normalize_selection(); }
-                ui.separator();
-                if ui.button("Delete all markers").clicked() { self.document.markers.clear(); }
-                if let Some(path) = &self.active_file {
-                    ui.separator();
-                    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                    ui.strong(name);
-                }
-            });
-        });
 
         // Settings dialog
         if self.show_settings {
