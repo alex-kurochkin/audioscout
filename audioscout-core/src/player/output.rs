@@ -444,10 +444,10 @@ impl RodioOutput {
             self.last_clock_move = std::time::Instant::now();
             return false;
         }
-        if self.last_clock_move.elapsed() > std::time::Duration::from_secs(1) {
+        if self.last_clock_move.elapsed() > std::time::Duration::from_secs(3) {
             tracing::error!(
                 "[output] STALL DETECTED: Playing & source active but audio clock \
-                 frozen at consumed={consumed} for >1s — pausing transport \
+                 frozen at consumed={consumed} for >3s — pausing transport \
                  (stream was likely dropped by PulseAudio/ALSA)"
             );
             // Reset first so the next call doesn't re-fire until the clock
@@ -588,6 +588,17 @@ struct MeteredSource {
     // Window peak holders (published to the shared meter with the window).
     peak_l: f32,
     peak_r: f32,
+    /// BUGFIX ("no sound at all": every cpal callback returned None and the
+    /// audio clock never left 0): `rodio::Source::skip` has NO default
+    /// implementation - it is a required trait method. The old `MeteredSource`
+    /// did not implement it, so the file silently failed to compile against
+    /// rodio 0.19; after a mechanical "fix" that merely stubbed `skip` out,
+    /// Sink's internal silence-padding machinery consumed the whole chunk via
+    /// `skip()` without ever calling `next()`. Result: zero audible samples,
+    /// `consumed_samples` frozen at 0, stall detector fired ~1 s later.
+    /// This counter tracks how many samples `skip()` threw away so they are
+    /// still accounted for in the playhead clock and meter windows.
+    skipped: u64,
 }
 
 impl Iterator for MeteredSource {
@@ -606,8 +617,14 @@ impl Iterator for MeteredSource {
                 // 44.1 kHz) — exactly the observed symptom. The hot path now
                 // touches only thread-local state; the global clock and the
                 // meter are published once per 512-sample window.
-                let idx = self.local_idx;
+                let idx = self.local_idx + self.skipped;
                 self.local_idx += 1;
+                if self.skipped > 0 {
+                    // Samples thrown away by `skip()` still occupy positions
+                    // in the stream - fold them into the meter window channel
+                    // bookkeeping (they contribute silence, not energy).
+                    self.skipped = 0;
+                }
                 let av = v.abs();
                 let is_left = self.channels < 2 || (idx % self.channels as u64) == 0;
                 if is_left {
@@ -675,6 +692,27 @@ impl rodio::Source for MeteredSource {
     fn channels(&self) -> u16 { self.inner.channels() }
     fn sample_rate(&self) -> u32 { self.inner.sample_rate() }
     fn total_duration(&self) -> Option<std::time::Duration> { self.inner.total_duration() }
+    /// BUGFIX ("no sound at all", consumed_samples frozen at 0): this was the
+    /// missing required trait method. rodio's Sink pads/aligns sources via
+    /// `skip()`; with a stub that returned nothing useful (or without the
+    /// override at all under an older partial impl), the ENTIRE chunk was
+    /// swallowed by skip before `next()` ever ran - silence, dead clock,
+    /// stall detector firing ~1 s after Play. The real implementation drains
+    /// the wrapped buffer and counts what was discarded so the playhead
+    /// clock stays truthful even when samples are skipped.
+    fn skip(&mut self, amount: usize) {
+        let mut drained = 0usize;
+        while drained < amount {
+            match self.inner.next() {
+                Some(_) => drained += 1,
+                None => break, // source exhausted - same semantics as rodio's own buffers
+            }
+        }
+        self.skipped += drained as u64;
+        // Keep the local position in sync with the underlying buffer so the
+        // channel-interleaving bookkeeping in next() stays aligned.
+        self.local_idx += drained as u64;
+    }
 }
 
 /// The single output-controller thread: owns the Sink and serializes all
@@ -1115,6 +1153,19 @@ fn controller_thread(
 /// appends — only publishes the session bounds (`session`, `cursor_frame`)
 /// and rewinds them on Play/Seek/Loop-restart; everything else is frozen by
 /// setting `session = None` (Pause/Stop/Load/shutdown).
+/// BUGFIX (clock jumped back to 0 / stale sources kept publishing after
+/// Seek/Loop): per-pump-thread bookkeeping of the last session start and the
+/// last cursor position we fed. A rewind of `cursor_frame` below the fed
+/// position (or a new session range) means the controller reset
+/// `consumed_samples`; any MeteredSource still queued in the Sink would keep
+/// `fetch_add`-ing samples it already counted, dragging the fresh clock away
+/// from the seek target. On such a transition the pump drops every pending
+/// source (`Sink::clear`) before appending the first chunk at the new cursor.
+thread_local! {
+    static LAST_SESSION_START: std::cell::Cell<u64> = const { std::cell::Cell::new(u64::MAX) };
+    static LAST_FED_CURSOR: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 fn pump_thread(pump: Arc<PumpState>, stream_format: (u32, u16)) {
     const CHUNK_SECONDS: f64 = 0.5;
     const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(25);
@@ -1165,6 +1216,26 @@ fn pump_thread(pump: Arc<PumpState>, stream_format: (u32, u16)) {
         let total = d.total_frames();
 
         let cursor = pump.cursor_frame.load(Ordering::Relaxed).min(total);
+
+        // BUGFIX (Seek/Loop restart dragged the playhead clock away from the
+        // target): detect a session change or a cursor rewind relative to
+        // what this pump has already fed, and flush the stale queue so no
+        // leftover MeteredSource can publish into the freshly-seeded clock.
+        {
+            let prev_start = LAST_SESSION_START.with(|c| c.get());
+            let prev_fed = LAST_FED_CURSOR.with(|c| c.get());
+            if prev_start != s_start || cursor < prev_fed {
+                sink.clear();
+                queued_chunks.store(0, Ordering::Release);
+                LAST_SESSION_START.with(|c| c.set(s_start));
+                LAST_FED_CURSOR.with(|c| c.set(cursor));
+                tracing::debug!(
+                    "[output] pump flushed stale queue: session {} -> {}, fed {} -> {}",
+                    prev_start, s_start, prev_fed, cursor
+                );
+            }
+        }
+
         if cursor >= s_end.min(total) {
             // Everything audible has been handed to the Sink; wait for the
             // controller to detect drain-completion or issue a new session.
@@ -1172,20 +1243,61 @@ fn pump_thread(pump: Arc<PumpState>, stream_format: (u32, u16)) {
             continue;
         }
 
-        // BUGFIX (playback dies ~0.5 s after start): pace by the sink queue,
-        // not by wall-clock sleeps. `s_start` is intentionally unused here —
-        // the pump always resumes at `cursor_frame`, which the controller
-        // resets to the session start on Play/Seek (§5.3).
-        let _ = s_start;
-        const QUEUE_SECONDS: f64 = 1.0;
-        let max_queued_chunks = ((QUEUE_SECONDS / CHUNK_SECONDS) as usize).max(2);
-        if queued_chunks.load(Ordering::Acquire) >= max_queued_chunks {
+        // BUGFIX ("no sound at all" right after Play): the controller calls
+        // `sink.stop()` on every session change (Play/Seek/Pause/Stop), which
+        // also sets rodio's internal `Sink.paused` flag. A paused Sink pulls
+        // NO samples from its queue: nothing is audible, the cpal callback
+        // never fires, `consumed_samples` stays frozen at 0 and the stall
+        // detector pauses the transport ~1 s later - exactly the observed log.
+        // The pump owns all feeding now, so it must explicitly resume the
+        // shared Sink before appending the first chunk of a new session.
+        sink.play();
+
+        // How many STREAM samples correspond to CHUNK_SECONDS of wall time?
+        let chunk_stream_samples = ((CHUNK_SECONDS * dst_rate as f64) as u64 * dst_ch).max(dst_ch);
+
+        // BUGFIX (playback dies ~0.5 s after start; "no sound", consumed
+        // clock frozen): pacing by the sink QUEUE DEPTH (queued_chunks) is
+        // wrong - cpal pulls samples from rodio's Sink in big batches, so a
+        // source that is still audibly playing gets drained to exhaustion
+        // almost immediately and the counter collapses while only ~1 s of
+        // audio has actually reached the speakers -> the pump waits forever.
+        // Pace instead by how far the hardware clock (`consumed_samples`,
+        // advanced inside the cpal callback by MeteredSource) has caught up
+        // with what we appended: keep at most LEAD_SECONDS of audio queued
+        // ahead of the clock. Self-correcting under bursty consumption and
+        // underruns alike. The pump always resumes at `cursor_frame`, which
+        // the controller resets to the session start on Play/Seek (5.3).
+        const LEAD_SECONDS: f64 = 0.75;
+        let lead_stream_samples = ((LEAD_SECONDS * dst_rate as f64) as u64 * dst_ch).max(chunk_stream_samples);
+        // Stream samples already handed to the Sink but not yet consumed.
+        let queued_stream_samples = {
+            let file_frames_queued = cursor.saturating_sub(s_start);
+            // BUGFIX (playhead froze at ~75% of the track): the queued-ahead
+            // amount must be measured in STREAM samples of the RESAMPLED
+            // output. The old formula scaled by dst_rate/src_rate only — for a
+            // 22050 Hz file on a 44100 Hz device that UNDERCOUNTS the queue by
+            // 2x, so the pump stopped topping up while the Sink still held
+            // real audio; once the hardware clock caught up, no chunk was
+            // appended and the stream went silent mid-session. Count exactly
+            // what `slice_to_buffer` emits: per-slice frame count after
+            // resampling (floor + at-least-one-frame, same as the builder).
+            if file_frames_queued == 0 {
+                0
+            } else {
+                let out_frames = ((file_frames_queued * dst_rate) / src_rate.max(1)).max(1);
+                out_frames.saturating_mul(dst_ch)
+            }
+        };
+        let consumed_now = match pump.shared.as_ref() {
+            Some(sh) => sh.consumed_samples.load(Ordering::Relaxed),
+            None => 0,
+        };
+        if queued_stream_samples.saturating_sub(consumed_now) >= lead_stream_samples {
             std::thread::sleep(POLL_INTERVAL);
             continue;
         }
 
-        // How many STREAM samples correspond to CHUNK_SECONDS of wall time?
-        let chunk_stream_samples = ((CHUNK_SECONDS * dst_rate as f64) as u64 * dst_ch).max(dst_ch);
         // How many FILE frames fit into that chunk?
         let frames_per_chunk = (chunk_stream_samples / dst_ch).max(1);
         // Convert to file frames using the ratio src_rate/dst_rate.
@@ -1214,6 +1326,7 @@ fn pump_thread(pump: Arc<PumpState>, stream_format: (u32, u16)) {
             rms_count: 0,
             peak_l: 0.0,
             peak_r: 0.0,
+            skipped: 0,
             chunks: queued_chunks.clone(),
         };
         // `sink` is an Arc clone taken above — append directly (rodio::Sink is
@@ -1221,6 +1334,7 @@ fn pump_thread(pump: Arc<PumpState>, stream_format: (u32, u16)) {
         sink.append(metered);
         queued_chunks.fetch_add(1, Ordering::AcqRel);
         pump.cursor_frame.store(next_end, Ordering::Relaxed);
+        LAST_FED_CURSOR.with(|c| c.set(next_end));
     }
 }
 
