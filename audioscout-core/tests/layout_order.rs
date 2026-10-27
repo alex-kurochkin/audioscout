@@ -39,7 +39,7 @@ fn player_panel_declared_above_audio_view() {
     // panel sits *above* the audio-content view and directly under the
     // file-actions panel — exactly what bug #1 asked for.
     let ids = bottom_panel_ids(&app_source());
-    assert_eq!(ids, vec!["player", "audio_view", "actions", "status"],
+    assert_eq!(ids, vec!["audio_view", "player", "actions", "status"],
         "unexpected bottom panel order {:?}", ids);
 }
 
