@@ -142,6 +142,11 @@ struct PumpState {
     shared: Option<Arc<SharedOutput>>,
     /// Stop signal for the pump thread (controller-thread shutdown / app exit).
     quit: AtomicBool,
+    /// BUGFIX (regression "controller thread is gone"): set when the
+    /// controller thread has terminated (panic or clean exit) so the pump
+    /// stops feeding the orphaned Sink and `poll_stall` can tell a dead
+    /// controller apart from a dropped audio stream.
+    dead: AtomicBool,
 }
 
 /// Output-side player: spawns the controller thread on creation and talks to
@@ -170,6 +175,13 @@ impl RodioOutput {
     /// browsing/editing, transport state simply never advances (graceful
     /// degradation, §0 runtime-dependency note about libasound2).
     pub fn new(controller: Arc<Mutex<Controller>>, event_tx: Sender<UiEvent>) -> Option<Self> {
+        // DEBUG (regression "controller thread is gone"): the wrapper around
+        // `controller_thread` logs any panic payload, but the default hook
+        // also prints the actual panic location + backtrace to stderr — with
+        // it the very first console run pinpoints where the thread died.
+        std::panic::set_hook(Box::new(|info| {
+            tracing::error!("[panic] {info}");
+        }));
         // DEBUG (playback diagnostics): every early return below is a hard
         // reason why playback can never start — log which stage failed.
         //
@@ -340,13 +352,40 @@ impl RodioOutput {
             stream_channels: stream_format.1.max(1),
         });
 
+        // BUGFIX (regression "controller thread is gone": Cmd::Load/Cmd::Play
+        // send FAILED on a disconnected channel right after startup): the
+        // controller thread used to be spawned *unchecked* — if its body
+        // panicked (or failed to spawn), RodioOutput kept holding a `tx` whose
+        // receiver was already dropped, so every subsequent command silently
+        // died and playback never started. Now we watch the JoinHandle: an
+        // early thread exit is logged loudly with the panic payload, and both
+        // the pump and the UI poll learn about it via `dead`.
         let join = std::thread::Builder::new()
             .name("player-controller".into())
             .spawn({
                 let shared = shared.clone();
                 let controller = controller.clone();
                 let pump = pump.clone();
-                move || controller_thread(sink, rx, controller, shared, event_tx, stream_format, pump)
+                let dead = pump.dead.clone();
+                move || {
+                    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        controller_thread(sink, rx, controller, shared, event_tx, stream_format, pump)
+                    }));
+                    if let Err(p) = r {
+                        let msg = p
+                            .downcast_ref::<String>()
+                            .cloned()
+                            .or_else(|| p.downcast_ref::<&str>().map(|s| s.to_string()))
+                            .unwrap_or_else(|| "<non-string panic>".to_string());
+                        tracing::error!("[output] CONTROLLER THREAD PANICKED: {msg} — playback is dead");
+                    } else {
+                        tracing::warn!("[output] controller thread exited normally (shutdown?)");
+                    }
+                    // Receiver dropping below marks the channel disconnected;
+                    // also set the flag so the pump stops spinning and the UI
+                    // can surface the failure instead of faking Playing.
+                    dead.store(true, Ordering::Relaxed);
+                }
             });
         match join {
             Ok(_) => tracing::info!("[output] controller thread spawned OK"),
@@ -377,6 +416,16 @@ impl RodioOutput {
     /// source is attached, and the clock has not moved for >1 s, we pause the
     /// transport and report `true` once so the app can surface the error.
     pub fn poll_stall(&mut self) -> bool {
+        // BUGFIX (regression "controller thread is gone"): if the controller
+        // thread died (panic), its receiver was dropped — no command can ever
+        // reach it again. Surface that as a stall too so the UI leaves the
+        // fake Playing state; the panic payload was already logged by the
+        // wrapper around `controller_thread`.
+        if self.pump.dead.load(Ordering::Relaxed) {
+            tracing::error!("[output] poll_stall: controller thread is DEAD — transport frozen");
+            self.last_clock_move = std::time::Instant::now();
+            return true;
+        }
         let playing = self.controller_state() == TransportState::Playing;
         let active = self.shared.source_active.load(Ordering::Relaxed);
         let consumed = self.shared.consumed_samples.load(Ordering::Relaxed);
@@ -1027,7 +1076,7 @@ fn pump_thread(pump: Arc<PumpState>, stream_format: (u32, u16)) {
     let queued_chunks = Arc::new(AtomicUsize::new(0));
 
     loop {
-        if pump.quit.load(Ordering::Relaxed) {
+        if pump.quit.load(Ordering::Relaxed) || pump.dead.load(Ordering::Relaxed) {
             break;
         }
         let session = *pump.session.lock().unwrap_or_else(|p| p.into_inner());

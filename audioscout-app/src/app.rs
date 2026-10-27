@@ -770,6 +770,21 @@ impl AudioScoutApp {
                 .unwrap_or(false);
             if stalled {
                 self.stall_notified = true;
+                // BUGFIX (regression "controller thread is gone"): a stall
+                // reported while the transport still claims Playing must also
+                // stop the state machine — otherwise poll_playhead returns at
+                // its very first `player_state() != Playing` guard and never
+                // runs again, leaving the UI frozen in a fake playing state.
+                // `poll_stall` already paused the controller on clock-freeze;
+                // do it here too so every stall path (including the dead-
+                // controller one) leaves the app in Paused and Play can
+                // restart the session.
+                {
+                    let mut ctrl = self.player.lock().unwrap_or_else(|p| p.into_inner());
+                    if ctrl.state() == TransportState::Playing {
+                        ctrl.pause();
+                    }
+                }
                 self.status_message = "Playback stalled: audio stream was dropped \
                                        by the system (PulseAudio/ALSA). Press Play \
                                        to retry."
