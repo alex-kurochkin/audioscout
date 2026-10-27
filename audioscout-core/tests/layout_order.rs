@@ -63,6 +63,61 @@ fn toggle_buttons_present() {
     let src = app_source();
     // Top toolbar: table-preview waveform/spectrogram toggle.
     assert!(src.contains("self.toggle_preview_mode()"), "toolbar preview toggle missing");
-    // Player panel: visualization-area toggle.
-    assert!(src.contains("self.toggle_audio_view_mode()"), "player view toggle missing");
+    // Visualization-area toggle (bug #3): the switch code existed but its
+    // state was unknown — now `AudioView::mode` is a real, persisted state
+    // flipped through `toggle_audio_view_mode()` from a toolbar button.
+    assert!(src.contains("self.toggle_audio_view_mode()"), "view-mode toggle missing");
+
+    // There are exactly two view-mode toggle handlers in the source: the
+    // definition (`fn toggle_audio_view_mode`) plus one call site per button.
+    // One button sits on the top toolbar (bug #3 asks for the toggle there),
+    // the other on the player panel (§3.5 "toggle Waveform/Spectrogram").
+    let mut toggle_uses = src
+        .match_indices("self.toggle_audio_view_mode()")
+        .map(|(i, _)| i);
+    let toolbar_toggle_at = toggle_uses.next().expect("toolbar view toggle missing");
+    let player_toggle_at = toggle_uses.next().expect("player-panel view toggle missing");
+    assert!(
+        toggle_uses.next().is_none(),
+        "unexpected extra view-toggle call sites"
+    );
+
+    let toolbar_at = src.find("TopBottomPanel::top(\"toolbar\")").expect("toolbar panel");
+    let side_at = src.find("SidePanel::left").expect("folder tree panel");
+    assert!(
+        toolbar_at < toolbar_toggle_at && toolbar_toggle_at < side_at,
+        "the first Waveform/Spectrogram toggle must be rendered on the top toolbar panel"
+    );
+
+    let player_at = src
+        .find("TopBottomPanel::bottom(\"player\")")
+        .expect("player panel");
+    let actions_at = src
+        .find("TopBottomPanel::bottom(\"actions\")")
+        .expect("actions panel");
+    assert!(
+        player_at < player_toggle_at && player_toggle_at < actions_at,
+        "the second Waveform/Spectrogram toggle must be rendered on the player panel"
+    );
+
+    // Both toggles must reflect their live state via SelectableLabel so the
+    // current mode is visible (bug #3: "state of the switch code unknown").
+    let selectable_count = src.matches("egui::SelectableLabel::new(").count();
+    assert!(
+        selectable_count >= 3,
+        "expected at least three stateful toggle buttons (table preview + \
+         toolbar/player view toggles), found {}",
+        selectable_count
+    );
+
+    // Core side: the mode is real state with a flip helper.
+    let av = std::fs::read_to_string(
+        Path::new("../audioscout-core/src/audio_view.rs")
+            .exists()
+            .then(|| Path::new("../audioscout-core/src/audio_view.rs"))
+            .unwrap_or(Path::new("audioscout-core/src/audio_view.rs")),
+    )
+    .unwrap();
+    assert!(av.contains("pub enum AudioViewMode"), "AudioViewMode enum missing");
+    assert!(av.contains("pub fn toggle_mode"), "AudioView::toggle_mode missing");
 }
