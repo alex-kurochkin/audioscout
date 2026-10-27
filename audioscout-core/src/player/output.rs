@@ -40,6 +40,13 @@ pub struct SharedOutput {
     /// Frame offset where the currently appended slice started — added to
     /// the Sink's relative get_pos() clock to obtain an absolute frame.
     pub pos_offset: AtomicU64,
+    /// BUGFIX ("sometimes needs a second Play press"): bumped by the
+    /// controller every time a playback session is (re)engaged (Play/Seek/
+    /// loop rewind). `RodioOutput::poll_stall` compares it against its own
+    /// last-seen value and restarts the freeze timer whenever it moves — so
+    /// the audio clock can never be judged "frozen" for samples that simply
+    /// were not supposed to have been consumed yet at session start.
+    pub session_epoch: AtomicU64,
 }
 
 impl Default for SharedOutput {
@@ -50,6 +57,7 @@ impl Default for SharedOutput {
             source_active: AtomicBool::new(false),
             meter: Mutex::new(MeterData::default()),
             pos_offset: AtomicU64::new(0),
+            session_epoch: AtomicU64::new(0),
         }
     }
 }
@@ -163,6 +171,11 @@ pub struct RodioOutput {
     last_consumed: u64,
     /// When the audio clock last moved (or playback was not active).
     last_clock_move: std::time::Instant,
+    /// BUGFIX ("sometimes needs a second Play press"): last observed value of
+    /// `SharedOutput::session_epoch`. Whenever it changes, the freeze timer is
+    /// rewound — a brand-new session must get its full grace period before
+    /// poll_stall may declare the stream dead.
+    last_session_epoch: u64,
     /// BUGFIX (playback dies ~0.5 s after start): pacing state shared with
     /// the pump thread; the pump is signalled through this on every session
     /// change and told to quit when the output is dropped.
@@ -407,6 +420,7 @@ impl RodioOutput {
             _holder: holder,
             last_consumed: 0,
             last_clock_move: std::time::Instant::now(),
+            last_session_epoch: 0,
             pump,
         })
     }
@@ -434,6 +448,20 @@ impl RodioOutput {
         let playing = self.controller_state() == TransportState::Playing;
         let active = self.shared.source_active.load(Ordering::Relaxed);
         let consumed = self.shared.consumed_samples.load(Ordering::Relaxed);
+        // BUGFIX ("sometimes needs a second Play press"): a fresh session
+        // rewinds `consumed_samples` to the seed value and the cpal callback
+        // only starts pulling ~25 ms later. Without this check the freeze
+        // timer — last refreshed while the app sat idle before Play — could
+        // expire within milliseconds of engaging the session, auto-pausing
+        // perfectly healthy playback (observed in the log: STALL DETECTED
+        // fired 18 ms after "PLAY ... pump engaged"). Any epoch change means
+        // "new session, restart the grace period".
+        let epoch = self.shared.session_epoch.load(Ordering::Acquire);
+        if epoch != self.last_session_epoch {
+            self.last_session_epoch = epoch;
+            self.last_consumed = consumed;
+            self.last_clock_move = std::time::Instant::now();
+        }
         if !playing || !active {
             self.last_consumed = consumed;
             self.last_clock_move = std::time::Instant::now();
@@ -787,6 +815,28 @@ fn controller_thread(
                     // never sees a live session pointing at a stale frame.
                     *pump.session.lock().unwrap_or_else(|p| p.into_inner()) = Some((s, e));
                     shared.source_active.store(true, Ordering::Relaxed);
+                    // BUGFIX ("sometimes needs a second Play press"): two
+                    // fresh-session races fixed here:
+                    // 1) `Sink::stop()` above leaves rodio's internal paused
+                    //    flag set until somebody calls play() again (the pump
+                    //    only did that on its next ~25 ms tick). Appending /
+                    //    pulling from a PAUSED sink is silent, so Playing +
+                    //    source_active could coexist with a frozen clock.
+                    //    Resume right now — the state machine below flips to
+                    //    Playing only after the sink is already running.
+                    // 2) The UI stall detector (`RodioOutput::poll_stall`)
+                    //    measures how long `consumed_samples` has been frozen
+                    //    from a timer last refreshed while the app sat idle
+                    //    BEFORE this Play. A brand-new session therefore could
+                    //    be declared stalled within milliseconds of starting
+                    //    (observed log: "STALL DETECTED ... >3s" fired 18 ms
+                    //    after "PLAY ... pump engaged") and auto-paused —
+                    //    exactly the reported "works only on the second Play
+                    //    press". Bumping `session_epoch` tells the detector a
+                    //    new session began: it rewinds its grace period and
+                    //    re-syncs its previous-clock sample.
+                    sink.play();
+                    shared.session_epoch.fetch_add(1, Ordering::Release);
                     let mut ctrl = controller.lock().unwrap_or_else(|p| p.into_inner());
                     ctrl.mark_playing(s, e);
                     sink.set_volume(ctrl.volume());
@@ -934,6 +984,10 @@ fn controller_thread(
                             pump.cursor_frame.store(s, Ordering::Relaxed);
                             *pump.session.lock().unwrap_or_else(|p| p.into_inner()) = Some((s, e));
                             shared.source_active.store(true, Ordering::Relaxed);
+                            // BUGFIX ("sometimes needs a second Play press"):
+                            // Seek rewinds the audio clock just like Play —
+                            // rewind the stall detector's grace period too.
+                            shared.session_epoch.fetch_add(1, Ordering::Release);
                             sel_start = s;
                             sel_end = e;
                         } else {
@@ -960,6 +1014,15 @@ fn controller_thread(
                         shared.pos_offset.store(sel_start, Ordering::Relaxed);
                         pump.cursor_frame.store(sel_start, Ordering::Relaxed);
                         *pump.session.lock().unwrap_or_else(|p| p.into_inner()) = Some((sel_start, sel_end));
+                        // BUGFIX ("sometimes needs a second Play press"):
+                        // resume the sink FIRST (sink.stop() above left it
+                        // paused), then bump `session_epoch` LAST so the UI
+                        // stall detector never observes
+                        // source_active=true + epoch-bumped while the sink is
+                        // still paused — that exact race auto-paused healthy
+                        // fresh sessions in the field log.
+                        sink.play();
+                        shared.session_epoch.fetch_add(1, Ordering::Release);
                     }
                 }
             }
@@ -1080,6 +1143,14 @@ fn controller_thread(
                 shared.pos_offset.store(sel_start, Ordering::Relaxed);
                 pump.cursor_frame.store(sel_start, Ordering::Relaxed);
                 *pump.session.lock().unwrap_or_else(|p| p.into_inner()) = Some((sel_start, sel_end));
+                // BUGFIX ("sometimes needs a second Play press"): resume the
+                // sink FIRST (a previous stop() may have left it paused), then
+                // bump `session_epoch` LAST so poll_stall can never observe an
+                // epoch change while the sink is still paused. The rewind also
+                // moves the audio clock backwards — the epoch bump gives the
+                // stall detector a fresh grace period for the new pass.
+                sink.play();
+                shared.session_epoch.fetch_add(1, Ordering::Release);
             } else {
                 // Natural end of a non-loop session: rewind the playhead to
                 // the session start point (§5.3). Freeze the pump so no new
