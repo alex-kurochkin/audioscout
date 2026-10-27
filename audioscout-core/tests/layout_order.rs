@@ -375,3 +375,24 @@ fn controller_has_no_duplicate_public_accessors() {
     assert!(!code.contains("self.meter"), "controller.rs still references removed meter field");
     assert!(!code.contains("use super::output::AudioOutput"), "AudioOutput does not exist in output.rs (it is RodioOutput)");
 }
+
+#[test]
+fn output_holder_keeps_stream_handle_alive() {
+    // Regression: playback was silent and the playhead frozen because only
+    // `OutputStream` was stored — the last `OutputStreamHandle` drop destroys
+    // the cpal stream (cpal 0.15 ALSA backend calls StreamId::destroy on
+    // handle drop), so the Sink appended sources into a dead endpoint.
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/src/player/output.rs");
+    let code: String = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("cannot read {}: {}", path, e))
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    // The holder struct must own both the stream and a handle clone.
+    assert!(code.contains("_stream: rodio::OutputStream"), "holder lost the OutputStream field");
+    assert!(code.contains("_handle: rodio::OutputStreamHandle"), "holder must keep an OutputStreamHandle alive");
+    // And the construction site must actually clone the handle into it.
+    assert!(code.contains("_handle: handle.clone()"), "handle is not cloned into the holder at construction");
+}

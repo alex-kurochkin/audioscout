@@ -88,10 +88,20 @@ enum Cmd {
     Shutdown,
 }
 
-/// Owns the `rodio::OutputStream` for the entire application lifetime (§5.2).
-/// Dropping this handle closes the audio device.
+/// Owns the `rodio::OutputStream` AND its `OutputStreamHandle` for the entire
+/// application lifetime (§5.2). Dropping this handle closes the audio device.
+///
+/// BUGFIX (play appended but silent, playhead frozen at 0): in cpal 0.15 the
+/// stream only keeps running while a live clone of its `StreamHandle` exists —
+/// every handle drop triggers `StreamId::destroy()`. We used to keep only the
+/// `OutputStream` and let the handle returned by `try_default()` die right
+/// after `Sink::try_new`, so the ALSA stream was destroyed immediately: the
+/// Sink happily "played" into a dead endpoint (append OK, zero samples
+/// consumed, `get_pos()` stuck). Keeping one handle alive next to the stream
+/// prevents the destruction.
 pub struct OutputStreamHolder {
     _stream: rodio::OutputStream,
+    _handle: rodio::OutputStreamHandle,
 }
 
 /// Output-side player: spawns the controller thread on creation and talks to
@@ -135,7 +145,13 @@ impl RodioOutput {
 
         let shared = Arc::new(SharedOutput::default());
         let (tx, rx) = bounded::<Cmd>(16);
-        let holder = Arc::new(OutputStreamHolder { _stream: stream });
+        // Keep a clone of the stream handle alive for the whole session —
+        // see the BUGFIX note on `OutputStreamHolder` (dropping every handle
+        // destroys the cpal stream and mutes playback completely).
+        let holder = Arc::new(OutputStreamHolder {
+            _stream: stream,
+            _handle: handle.clone(),
+        });
 
         let join = std::thread::Builder::new()
             .name("player-controller".into())
@@ -305,6 +321,11 @@ fn controller_thread(
     // BUGFIX (play never starts): a Play that arrives before any document is
     // loaded is parked here and applied by the next Load (§5.1/§5.3).
     let mut pending_play: Option<(u64, u64)> = None;
+    // DEBUG (playback diagnostics): cadence limiter for the "stuck playhead"
+    // warning below so it fires at most once per second while Playing.
+    let mut last_stuck_warn = std::time::Instant::now();
+    let mut last_seen_pos_frame: u64 = u64::MAX;
+    let mut stuck_since = std::time::Instant::now();
 
     // Append the [start,end) slice of the current document to the sink and
     // mirror the new session into the shared state (§5.3). Shared by the
@@ -500,6 +521,40 @@ fn controller_thread(
             let active = shared.source_active.load(Ordering::Relaxed);
             (pos, playing && active && sink.empty())
         };
+
+        // DEBUG (playback diagnostics): if the state machine says Playing and
+        // a source is active but the audio clock does not move for >1s, the
+        // cpal stream is almost certainly dead (e.g. OutputStreamHandle was
+        // dropped — see OutputStreamHolder BUGFIX). Log the raw clock values
+        // so the stall is attributable from the console alone.
+        {
+            let ctrl = controller.lock().unwrap_or_else(|p| p.into_inner());
+            let playing = ctrl.state() == TransportState::Playing;
+            drop(ctrl);
+            let active = shared.source_active.load(Ordering::Relaxed);
+            if playing && active {
+                if pos_frame != last_seen_pos_frame {
+                    last_seen_pos_frame = pos_frame;
+                    stuck_since = std::time::Instant::now();
+                } else if stuck_since.elapsed() > std::time::Duration::from_secs(1)
+                    && last_stuck_warn.elapsed() > std::time::Duration::from_secs(1)
+                {
+                    last_stuck_warn = std::time::Instant::now();
+                    tracing::error!(
+                        "[output] playhead STUCK at frame {pos_frame} for >1s while Playing \
+                         (sink.get_pos()={:.4}s empty={} consumed={} pos_offset={}) \
+                         — audio stream likely destroyed/muted",
+                        sink.get_pos().as_secs_f64(),
+                        sink.empty(),
+                        shared.consumed_samples.load(Ordering::Relaxed),
+                        shared.pos_offset.load(Ordering::Relaxed),
+                    );
+                }
+            } else {
+                last_seen_pos_frame = u64::MAX;
+                stuck_since = std::time::Instant::now();
+            }
+        }
 
         if let Some(d) = &doc {
             let sr = d.sample_rate.max(1) as f64;
