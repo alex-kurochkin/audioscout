@@ -180,14 +180,15 @@ fn file_list_height_uses_only_eguis_available_height() {
 /// Regression test for the files-window grid bug: the column-header cells
 /// used to live in a SECOND `egui::Grid` ("file_table_header") whose column
 /// geometry was computed independently of the data-rows' grid, so the header
-/// drifted against the body rows. The fix binds every header cell to the
-/// file-row cell underneath it: both grids use the SAME per-column widths
-/// (`column_widths`), the SAME horizontal spacing and the SAME cell painter
-/// (`draw_cell`), so their columns are identical by construction — each
-/// title sits exactly above its column of file rows (and stays visible while
-/// the body scrolls).
+/// drifted against the body rows. The fix puts the header back into ONE
+/// shared grid: "file_table" is the only table grid, it lives inside the
+/// file-list ScrollArea, and the header cells are emitted as its FIRST ROW
+/// (before the data-row loop) — so titles and row cells are laid out by the
+/// very same grid pass over the very same rect and share every column's
+/// geometry by construction. Per-column widths (`column_widths`) and the
+/// shared cell painter (`draw_cell`) pin each cell to its configured width.
 #[test]
-fn file_table_header_is_bound_to_the_row_columns() {
+fn file_table_header_shares_one_grid_with_the_rows() {
     // Comment-insensitive view of the source again: comments may mention
     // removed constructs, only real code references matter.
     let code: String = app_source()
@@ -206,33 +207,57 @@ fn file_table_header_is_bound_to_the_row_columns() {
         .collect::<Vec<_>>()
         .join("\n");
 
-    // The old "one shared mesh" experiment (header as first row of the body
-    // grid inside the ScrollArea) is gone: the header now lives in its own
-    // fixed grid ABOVE the scroll area…
+    // There must be exactly ONE table grid; the separate header grid and the
+    // old body-grid id are gone.
     let header_grid_id = "egui::Grid::new(\"file_table_header\")";
     let body_grid_id = "egui::Grid::new(\"file_table\")";
     assert_eq!(
         code.matches(header_grid_id).count(),
-        1,
-        "the header must be rendered as one dedicated grid"
+        0,
+        "the header must NOT be rendered as a separate second grid anymore"
     );
     assert_eq!(
         code.matches(body_grid_id).count(),
         1,
-        "the data rows must be rendered as one dedicated grid"
+        "there must be exactly one \"file_table\" grid holding header and rows"
     );
-    let header_pos = code.find(header_grid_id).unwrap();
-    let body_pos = code.find(body_grid_id).unwrap();
-    let scroll_pos = code
-        .find(".id_salt(\"file_list\")")
-        .expect("the body must live in the file-list ScrollArea");
     assert!(
-        header_pos < scroll_pos && scroll_pos < body_pos,
-        "the header grid must sit above the ScrollArea that hosts the data grid"
+        !code.contains("file_table_body"),
+        "there must be no separate \"file_table_body\" grid anymore"
     );
 
-    // …but the two grids share ONE set of per-column widths, so every header
-    // cell is locked to the column of file rows beneath it.
+    // That single grid lives INSIDE the file-list ScrollArea…
+    let scroll_pos = code
+        .find(".id_salt(\"file_list\")")
+        .expect("the table must live in the file-list ScrollArea");
+    let grid_pos = code.find(body_grid_id).unwrap();
+    assert!(
+        scroll_pos < grid_pos,
+        "the shared table grid must be hosted by the ScrollArea"
+    );
+
+    // …and the header row is emitted BEFORE the data-row loop, i.e. it is
+    // the FIRST ROW of that same grid.
+    let header_loop_pos = code
+        .find("for (ci, col) in visible_cols.iter().enumerate()")
+        .expect("header cells must iterate over the visible columns");
+    let data_loop_pos = code
+        .find("for (idx, row) in file_rows.iter().enumerate()")
+        .expect("data rows must iterate over file_rows");
+    assert!(
+        grid_pos < header_loop_pos && header_loop_pos < data_loop_pos,
+        "the header cells must be laid out inside the shared grid, ahead of \
+         the data rows (one grid, header first)"
+    );
+    // The header row is terminated with end_row() before the data loop starts.
+    let between = &code[header_loop_pos..data_loop_pos];
+    assert!(
+        between.contains("ui.end_row()"),
+        "the header row must end with ui.end_row() before the first data row"
+    );
+
+    // Header and data cells take their width from ONE shared vector of
+    // per-column widths and are painted through the same helper.
     assert!(
         code.contains("let column_widths: Vec<f32>"),
         "a single shared list of column widths must drive the table layout"
@@ -243,30 +268,11 @@ fn file_table_header_is_bound_to_the_row_columns() {
         "both the header cells and the data cells must take their width from \
          the same column_widths vector (found {width_uses} uses)"
     );
-
-    // Same horizontal spacing on both grids → identical column offsets.
-    assert!(
-        code.contains(".spacing([10.0, 4.0])"),
-        "the table grids must use the shared spacing"
-    );
-    let spacing_uses = code.matches(".spacing([10.0, 4.0])").count();
-    assert_eq!(
-        spacing_uses, 2,
-        "header grid and data grid must declare the same spacing"
-    );
-
-    // And the same cell painter for header and data cells.
     let painter_uses = code.matches("draw_cell(ui, width,").count();
     assert!(
         painter_uses >= 2,
         "header and data cells must be painted through the same draw_cell helper \
          (found {painter_uses} uses)"
-    );
-
-    // No leftover second body grid id anywhere.
-    assert!(
-        !code.contains("file_table_body"),
-        "there must be no separate \"file_table_body\" grid anymore"
     );
 }
 
