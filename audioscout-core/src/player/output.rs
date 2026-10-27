@@ -588,17 +588,6 @@ struct MeteredSource {
     // Window peak holders (published to the shared meter with the window).
     peak_l: f32,
     peak_r: f32,
-    /// BUGFIX ("no sound at all": every cpal callback returned None and the
-    /// audio clock never left 0): `rodio::Source::skip` has NO default
-    /// implementation - it is a required trait method. The old `MeteredSource`
-    /// did not implement it, so the file silently failed to compile against
-    /// rodio 0.19; after a mechanical "fix" that merely stubbed `skip` out,
-    /// Sink's internal silence-padding machinery consumed the whole chunk via
-    /// `skip()` without ever calling `next()`. Result: zero audible samples,
-    /// `consumed_samples` frozen at 0, stall detector fired ~1 s later.
-    /// This counter tracks how many samples `skip()` threw away so they are
-    /// still accounted for in the playhead clock and meter windows.
-    skipped: u64,
 }
 
 impl Iterator for MeteredSource {
@@ -617,14 +606,8 @@ impl Iterator for MeteredSource {
                 // 44.1 kHz) — exactly the observed symptom. The hot path now
                 // touches only thread-local state; the global clock and the
                 // meter are published once per 512-sample window.
-                let idx = self.local_idx + self.skipped;
+                let idx = self.local_idx;
                 self.local_idx += 1;
-                if self.skipped > 0 {
-                    // Samples thrown away by `skip()` still occupy positions
-                    // in the stream - fold them into the meter window channel
-                    // bookkeeping (they contribute silence, not energy).
-                    self.skipped = 0;
-                }
                 let av = v.abs();
                 let is_left = self.channels < 2 || (idx % self.channels as u64) == 0;
                 if is_left {
@@ -687,32 +670,15 @@ impl MeteredSource {
 // rodio 0.19 `Source` inherits `Iterator`; the metadata getters resolve on
 // `SamplesBuffer<f32>` once `S: Sample` holds (which f32 does). All four
 // overrides simply forward to the wrapped buffer.
+//
+// NOTE: do NOT add a `skip` here — cpal 0.15's `Source` has no `skip` member
+// (the previous "required method" theory was wrong; it broke the build with
+// E0407). Silence-padding is handled by rodio's own iterators only.
 impl rodio::Source for MeteredSource {
     fn current_frame_len(&self) -> Option<usize> { self.inner.current_frame_len() }
     fn channels(&self) -> u16 { self.inner.channels() }
     fn sample_rate(&self) -> u32 { self.inner.sample_rate() }
     fn total_duration(&self) -> Option<std::time::Duration> { self.inner.total_duration() }
-    /// BUGFIX ("no sound at all", consumed_samples frozen at 0): this was the
-    /// missing required trait method. rodio's Sink pads/aligns sources via
-    /// `skip()`; with a stub that returned nothing useful (or without the
-    /// override at all under an older partial impl), the ENTIRE chunk was
-    /// swallowed by skip before `next()` ever ran - silence, dead clock,
-    /// stall detector firing ~1 s after Play. The real implementation drains
-    /// the wrapped buffer and counts what was discarded so the playhead
-    /// clock stays truthful even when samples are skipped.
-    fn skip(&mut self, amount: usize) {
-        let mut drained = 0usize;
-        while drained < amount {
-            match self.inner.next() {
-                Some(_) => drained += 1,
-                None => break, // source exhausted - same semantics as rodio's own buffers
-            }
-        }
-        self.skipped += drained as u64;
-        // Keep the local position in sync with the underlying buffer so the
-        // channel-interleaving bookkeeping in next() stays aligned.
-        self.local_idx += drained as u64;
-    }
 }
 
 /// The single output-controller thread: owns the Sink and serializes all
@@ -1137,30 +1103,30 @@ fn controller_thread(
     }
 }
 
-/// BUGFIX (playback dies ~0.5 s after start): pacing thread for the Sink.
+// BUGFIX (playback dies ~0.5 s after start): pacing thread for the Sink.
 ///
-/// The previous implementation appended the whole [start,end) session as one
-/// giant `SamplesBuffer<f32>` inside `apply_play!`. For a 166 k-frame file
-/// that is a ~60 MB allocation + memcpy storm (the disk hammering the user
-/// observed was page-cache churn), and once the cpal hardware clock drained
-/// the first pre-buffered period (~0.5 s at 44.1 kHz) there was nothing left
-/// in the queue → silence.
+// The previous implementation appended the whole [start,end) session as one
+// giant `SamplesBuffer<f32>` inside `apply_play!`. For a 166 k-frame file
+// that is a ~60 MB allocation + memcpy storm (the disk hammering the user
+// observed was page-cache churn), and once the cpal hardware clock drained
+// the first pre-buffered period (~0.5 s at 44.1 kHz) there was nothing left
+// in the queue → silence.
 ///
-/// The pump now owns all audible samples: it watches the audio clock advanced
-/// by `MeteredSource` inside the cpal callback, and whenever the Sink has
-/// consumed enough frames it appends the NEXT small chunk (≈0.5 s of audio)
-/// resampled to the device's stream format. The controller thread NEVER
-/// appends — only publishes the session bounds (`session`, `cursor_frame`)
-/// and rewinds them on Play/Seek/Loop-restart; everything else is frozen by
-/// setting `session = None` (Pause/Stop/Load/shutdown).
-/// BUGFIX (clock jumped back to 0 / stale sources kept publishing after
-/// Seek/Loop): per-pump-thread bookkeeping of the last session start and the
-/// last cursor position we fed. A rewind of `cursor_frame` below the fed
-/// position (or a new session range) means the controller reset
-/// `consumed_samples`; any MeteredSource still queued in the Sink would keep
-/// `fetch_add`-ing samples it already counted, dragging the fresh clock away
-/// from the seek target. On such a transition the pump drops every pending
-/// source (`Sink::clear`) before appending the first chunk at the new cursor.
+// The pump now owns all audible samples: it watches the audio clock advanced
+// by `MeteredSource` inside the cpal callback, and whenever the Sink has
+// consumed enough frames it appends the NEXT small chunk (≈0.5 s of audio)
+// resampled to the device's stream format. The controller thread NEVER
+// appends — only publishes the session bounds (`session`, `cursor_frame`)
+// and rewinds them on Play/Seek/Loop-restart; everything else is frozen by
+// setting `session = None` (Pause/Stop/Load/shutdown).
+// BUGFIX (clock jumped back to 0 / stale sources kept publishing after
+// Seek/Loop): per-pump-thread bookkeeping of the last session start and the
+// last cursor position we fed. A rewind of `cursor_frame` below the fed
+// position (or a new session range) means the controller reset
+// `consumed_samples`; any MeteredSource still queued in the Sink would keep
+// `fetch_add`-ing samples it already counted, dragging the fresh clock away
+// from the seek target. On such a transition the pump drops every pending
+// source (`Sink::clear`) before appending the first chunk at the new cursor.
 thread_local! {
     static LAST_SESSION_START: std::cell::Cell<u64> = const { std::cell::Cell::new(u64::MAX) };
     static LAST_FED_CURSOR: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
@@ -1326,7 +1292,6 @@ fn pump_thread(pump: Arc<PumpState>, stream_format: (u32, u16)) {
             rms_count: 0,
             peak_l: 0.0,
             peak_r: 0.0,
-            skipped: 0,
             chunks: queued_chunks.clone(),
         };
         // `sink` is an Arc clone taken above — append directly (rodio::Sink is
