@@ -758,18 +758,10 @@ impl eframe::App for AudioScoutApp {
                 if ui.add(preview_btn).on_hover_text("Toggle table previews between waveform and spectrogram").clicked() {
                     self.toggle_preview_mode();
                 }
-                // Visualization-area toggle (§3.5): lives on the *top* panel
-                // next to the preview toggle (bug #3). The button reflects the
-                // live `AudioView::mode` state — which is restored from
-                // config.json on startup — and flips it atomically.
-                let view_spectro = self.audio_view.mode == AudioViewMode::Spectrogram;
-                let view_btn = egui::SelectableLabel::new(
-                    view_spectro,
-                    if view_spectro { "Spectrogram" } else { "Waveform" },
-                );
-                if ui.add(view_btn).on_hover_text("Toggle the visualization between waveform and spectrogram").clicked() {
-                    self.toggle_audio_view_mode();
-                }
+                // NOTE: the second Waveform/Spectrogram toggle that used to sit
+                // here (visualization-area mode) was removed by request — the
+                // audio-view display mode has exactly ONE control now, the one
+                // on the player panel below.
                 ui.separator();
                 if ui.button("Settings").clicked() { self.show_settings = true; }
             });
@@ -1125,7 +1117,7 @@ impl eframe::App for AudioScoutApp {
                 };
                 let selected_row = &mut self.selected_row;
                 let filter_text = self.filter_text.to_lowercase();
-                // BUGFIX (table grid): the header used to be emitted *after*
+                // REFACTOR (table grid): the header used to be emitted *after*
                 // the ScrollArea (i.e. under the list), then it was moved on
                 // top but rendered as a SECOND, separate `Grid`
                 // ("file_table_header") while the data rows lived in another
@@ -1136,10 +1128,13 @@ impl eframe::App for AudioScoutApp {
                 // the body's grid only, or differing outer margins) shifted
                 // the whole header against the body — the header cells were
                 // not part of the same grid as the row cells.
-                // Now the header row is the FIRST ROW of the single
-                // `file_table` grid shown inside the ScrollArea: every title
-                // cell and every data cell occupies a slot of one and the
-                // same grid, so columns line up by construction.
+                // The header row now sits in its own fixed grid ABOVE the
+                // ScrollArea, but every cell of that grid is sized with the
+                // SAME per-column widths (`column_widths`) and the SAME cell
+                // painter (`draw_cell`) and spacing as the data-row grid
+                // inside the ScrollArea — so each header cell is rigidly
+                // bound to the file-row cell underneath it: the two grids
+                // have identical column geometry by construction.
                 let column_widths: Vec<f32> = visible_cols
                     .iter()
                     .map(|c| column_layout.width(c))
@@ -1185,6 +1180,49 @@ impl eframe::App for AudioScoutApp {
                 // borrowed immutably inside).
                 let mut sort_request: Option<Column> = None;
 
+                // --- Header row: a FIXED grid above the ScrollArea. Its cell
+                // widths, spacing and painter are identical to the data grid
+                // below, so every title cell is bound 1:1 to the file-row
+                // column underneath it (and stays visible while scrolling). ---
+                egui::Grid::new("file_table_header")
+                    .num_columns(visible_cols.len())
+                    .spacing([10.0, 4.0])
+                    .striped(true)
+                    .show(ui, |ui| {
+                        for (ci, col) in visible_cols.iter().enumerate() {
+                            let width = column_widths[ci];
+                            let label = col.title();
+                            let indicator = if sort_column == Some(*col) {
+                                if sort_ascending { " ▲" } else { " ▼" }
+                            } else {
+                                ""
+                            };
+                            let sortable = col.sortable();
+                            let col_copy = *col;
+                            draw_cell(ui, width, 24.0, |ui| {
+                                let response = if sortable {
+                                    ui.add_sized(
+                                        [width, 24.0],
+                                        egui::Button::new(format!("{}{}", label, indicator)),
+                                    )
+                                } else {
+                                    ui.add_sized(
+                                        [width, 24.0],
+                                        egui::Label::new(egui::RichText::new(label).strong()),
+                                    )
+                                };
+                                if sortable && response.clicked() {
+                                    sort_request = Some(col_copy);
+                                }
+                            });
+                        }
+                        ui.end_row();
+                    });
+                ui.separator();
+
+                // --- The files table: ONE grid holding all data rows
+                // (scrollable), sharing its column geometry with the header
+                // grid above ---
                 egui::ScrollArea::vertical()
                     .id_salt("file_list")
                     .auto_shrink([false, false])
@@ -1201,38 +1239,6 @@ impl eframe::App for AudioScoutApp {
                             .striped(true);
 
                         grid.show(ui, |ui| {
-                            // --- Header row: first row OF THE SAME GRID, so
-                            // its cells share the column mesh with every data
-                            // row underneath. ---
-                            for (ci, col) in visible_cols.iter().enumerate() {
-                                let width = column_widths[ci];
-                                let label = col.title();
-                                let indicator = if sort_column == Some(*col) {
-                                    if sort_ascending { " ▲" } else { " ▼" }
-                                } else {
-                                    ""
-                                };
-                                let sortable = col.sortable();
-                                let col_copy = *col;
-                                draw_cell(ui, width, 24.0, |ui| {
-                                    let response = if sortable {
-                                        ui.add_sized(
-                                            [width, 24.0],
-                                            egui::Button::new(format!("{}{}", label, indicator)),
-                                        )
-                                    } else {
-                                        ui.add_sized(
-                                            [width, 24.0],
-                                            egui::Label::new(egui::RichText::new(label).strong()),
-                                        )
-                                    };
-                                    if sortable && response.clicked() {
-                                        sort_request = Some(col_copy);
-                                    }
-                                });
-                            }
-                            ui.end_row();
-
                             // --- Data rows ---
                             for (idx, row) in file_rows.iter().enumerate() {
                                 if !filter_text.is_empty() && !row.name.to_lowercase().contains(&filter_text) {

@@ -178,18 +178,18 @@ fn file_list_height_uses_only_eguis_available_height() {
 }
 
 /// Regression test for the files-window grid bug: the column-header cells
-/// used to live in a SECOND `egui::Grid` ("file_table_header") separate from
-/// the data rows' grid ("file_table_body"). Two independent grids never share
-/// a real cell mesh — their column offsets come from separately allocated
-/// rects (e.g. the vertical scrollbar eats width only inside the scroll area
-/// that hosts the body grid), so the header drifted against the body rows.
-/// The fix: exactly ONE grid ("file_table") whose FIRST ROW contains the
-/// header cells, followed by all data rows — titles and cells are then cells
-/// of one and the same grid by construction.
+/// used to live in a SECOND `egui::Grid` ("file_table_header") whose column
+/// geometry was computed independently of the data-rows' grid, so the header
+/// drifted against the body rows. The fix binds every header cell to the
+/// file-row cell underneath it: both grids use the SAME per-column widths
+/// (`column_widths`), the SAME horizontal spacing and the SAME cell painter
+/// (`draw_cell`), so their columns are identical by construction — each
+/// title sits exactly above its column of file rows (and stays visible while
+/// the body scrolls).
 #[test]
-fn file_table_has_one_grid_with_header_as_first_row() {
-    // Comment-insensitive view of the source again: BUGFIX comments may
-    // mention the removed grid ids, only real code references matter.
+fn file_table_header_is_bound_to_the_row_columns() {
+    // Comment-insensitive view of the source again: comments may mention
+    // removed constructs, only real code references matter.
     let code: String = app_source()
         .lines()
         .map(|l| {
@@ -206,40 +206,107 @@ fn file_table_has_one_grid_with_header_as_first_row() {
         .collect::<Vec<_>>()
         .join("\n");
 
-    // The two-grid layout is gone…
-    assert!(
-        !code.contains("file_table_header") && !code.contains("file_table_body"),
-        "header and body must not be rendered as two separate grids"
-    );
-
-    // …and there is exactly one table grid in the files window.
-    let grid_id = "egui::Grid::new(\"file_table\")";
-    let occurrences = code.matches(grid_id).count();
+    // The old "one shared mesh" experiment (header as first row of the body
+    // grid inside the ScrollArea) is gone: the header now lives in its own
+    // fixed grid ABOVE the scroll area…
+    let header_grid_id = "egui::Grid::new(\"file_table_header\")";
+    let body_grid_id = "egui::Grid::new(\"file_table\")";
     assert_eq!(
-        occurrences, 1,
-        "the files window must build exactly one egui Grid named \"file_table\""
+        code.matches(header_grid_id).count(),
+        1,
+        "the header must be rendered as one dedicated grid"
+    );
+    assert_eq!(
+        code.matches(body_grid_id).count(),
+        1,
+        "the data rows must be rendered as one dedicated grid"
+    );
+    let header_pos = code.find(header_grid_id).unwrap();
+    let body_pos = code.find(body_grid_id).unwrap();
+    let scroll_pos = code
+        .find(".id_salt(\"file_list\")")
+        .expect("the body must live in the file-list ScrollArea");
+    assert!(
+        header_pos < scroll_pos && scroll_pos < body_pos,
+        "the header grid must sit above the ScrollArea that hosts the data grid"
     );
 
-    // Inside that single grid's closure: the header row is emitted first
-    // (its end_row precedes the data-row loop), and the data rows close the
-    // same grid.show call.
-    let grid_pos = code.find(grid_id).unwrap();
-    let after_grid = &code[grid_pos..];
-    let header_end_row = after_grid
-        .find("ui.end_row();")
-        .expect("header row must end with ui.end_row() before the data rows");
-    let data_loop = after_grid
-        .find("for (idx, row) in file_rows.iter().enumerate()")
-        .expect("data rows must be rendered in the same grid closure");
+    // …but the two grids share ONE set of per-column widths, so every header
+    // cell is locked to the column of file rows beneath it.
     assert!(
-        header_end_row < data_loop,
-        "the header cells must be the FIRST ROW of the single file_table grid"
+        code.contains("let column_widths: Vec<f32>"),
+        "a single shared list of column widths must drive the table layout"
     );
-    let grid_close = after_grid
-        .rfind("});")
-        .expect("grid.show closure must be closed");
+    let width_uses = code.matches("column_widths[ci]").count();
     assert!(
-        grid_close > data_loop,
-        "the data rows must live inside the same grid.show closure as the header"
+        width_uses >= 2,
+        "both the header cells and the data cells must take their width from \
+         the same column_widths vector (found {width_uses} uses)"
+    );
+
+    // Same horizontal spacing on both grids → identical column offsets.
+    assert!(
+        code.contains(".spacing([10.0, 4.0])"),
+        "the table grids must use the shared spacing"
+    );
+    let spacing_uses = code.matches(".spacing([10.0, 4.0])").count();
+    assert_eq!(
+        spacing_uses, 2,
+        "header grid and data grid must declare the same spacing"
+    );
+
+    // And the same cell painter for header and data cells.
+    let painter_uses = code.matches("draw_cell(ui, width,").count();
+    assert!(
+        painter_uses >= 2,
+        "header and data cells must be painted through the same draw_cell helper \
+         (found {painter_uses} uses)"
+    );
+
+    // No leftover second body grid id anywhere.
+    assert!(
+        !code.contains("file_table_body"),
+        "there must be no separate \"file_table_body\" grid anymore"
+    );
+}
+
+/// Regression test for the duplicated Waveform/Spectrogram toggle: the
+/// visualization-area mode had TWO controls (one on the toolbar, one on the
+/// player panel). The user asked to remove the second one; exactly one
+/// audio-view toggle must remain in the whole UI.
+#[test]
+fn audio_view_mode_has_a_single_toggle_button() {
+    let code: String = app_source()
+        .lines()
+        .map(|l| {
+            let t = l.trim_start();
+            if t.starts_with("//") {
+                ""
+            } else {
+                match l.find("//") {
+                    Some(i) => &l[..i],
+                    None => l,
+                }
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert_eq!(
+        code.matches("let view_btn = egui::SelectableLabel::new(").count(),
+        1,
+        "the waveform/spectrogram visualization toggle must exist exactly once"
+    );
+    assert_eq!(
+        code.matches("self.toggle_audio_view_mode()").count(),
+        1,
+        "only one control may flip the audio-view display mode"
+    );
+    // The table-thumbnail toggle (preview_btn) is a different control and
+    // must still be present.
+    assert_eq!(
+        code.matches("let preview_btn = egui::SelectableLabel::new(").count(),
+        1,
+        "the table-preview waveform/spectrogram toggle must remain"
     );
 }
