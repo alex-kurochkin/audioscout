@@ -126,6 +126,19 @@ pub struct AudioScoutApp {
     /// each poll blends the raw clock back into the anchor whenever the lead
     /// exceeds that cap, which keeps motion smooth AND time-accurate.
     playhead_lead_cap_frames: u64,
+    /// BUGFIX (cursor races ahead of the audio and stalls at the right edge
+    /// while a short file finishes playing): hard ceiling for the visible
+    /// cursor — the furthest FILE frame that has provably been handed to the
+    /// Sink (`RodioOutput::playhead_ceiling_frame`, fed by the pump thread).
+    /// Wall-clock extrapolation alone cannot know how much audio is actually
+    /// queued ahead of the device; without this clamp the estimate drifts up
+    /// to the full pump lead (~0.75 s+) past the audible position, reaches
+    /// EOF and the window edge early, and stands there while the sound keeps
+    /// playing — very visible on short files (e.g. 7 s). Cached here so the
+    /// field can be invalidated on every session transition (Play / Seek /
+    /// Stop) exactly like `playhead_est_frame`; the output thread republishes
+    /// the honest value from the pump on its first append after a transition.
+    playhead_fed_ceiling: Option<u64>,
 }
 
 impl AudioScoutApp {
@@ -227,6 +240,9 @@ impl AudioScoutApp {
             // One 50 ms poll quantum at 192 kHz — the absolute worst case;
             // re-derived from the document's sample rate on every poll.
             playhead_lead_cap_frames: 9600,
+            // No session engaged yet — the pump publishes the real ceiling
+            // after its first append (see `poll_playhead`).
+            playhead_fed_ceiling: None,
         };
 
         // Restore the two independent Waveform/Spectrogram toggles from the
@@ -936,7 +952,24 @@ impl AudioScoutApp {
                 .max(true_frame);
             self.playhead_lead_cap_frames = (0.05 * sr) as u64 + 1;
             let lead_ceiling = true_frame.saturating_add(self.playhead_lead_cap_frames);
-            let frame = est.min(lead_ceiling);
+            // BUGFIX (cursor races ahead of the audio and stalls at the right
+            // edge while a short file finishes): the pump thread publishes the
+            // furthest FILE frame it has handed to the Sink
+            // (`playhead_ceiling_frame`). The visible cursor may never display
+            // frames above that ceiling — they provably have not reached the
+            // device queue yet, so no wall-clock extrapolation is allowed to
+            // paint them. Combined with the one-quantum lead cap this pins the
+            // cursor to the audible position: on a 7 s clip it now reaches the
+            // right edge exactly when the sound does, instead of seconds early.
+            // `None` (no session engaged / fresh Load-Pause-Stop reset) means
+            // "nothing queued yet": fall back to the true clock so the cursor
+            // cannot race ahead during the pre-buffer window.
+            self.playhead_fed_ceiling = self
+                .output
+                .as_ref()
+                .and_then(|out| out.playhead_ceiling_frame());
+            let fed_ceiling = self.playhead_fed_ceiling.unwrap_or(true_frame);
+            let frame = est.min(lead_ceiling).min(fed_ceiling);
             let frame = match self.playhead_session {
                 Some((_s, e)) => frame.min(e.saturating_sub(1)),
                 None => frame,
