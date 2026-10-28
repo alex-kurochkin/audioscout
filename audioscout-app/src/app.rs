@@ -1393,6 +1393,18 @@ impl eframe::App for AudioScoutApp {
                 let cursor_screen_x = rect.left() + cursor_x;
                 if cursor_screen_x >= rect.left() && cursor_screen_x <= rect.right() {
                     ui.painter().line_segment([egui::pos2(cursor_screen_x, overlay_start_y), egui::pos2(cursor_screen_x, rect.bottom())], egui::Stroke::new(1.5_f32, egui::Color32::RED));
+                    // Small "handle" triangle at the very TOP of the view —
+                    // the user asked for the cursor to sit above everything;
+                    // the marker makes it readable even over dense waveforms.
+                    ui.painter().add(egui::Shape::convex_polygon(
+                        vec![
+                            egui::pos2(cursor_screen_x - 4.0, overlay_start_y),
+                            egui::pos2(cursor_screen_x + 4.0, overlay_start_y),
+                            egui::pos2(cursor_screen_x, overlay_start_y + 6.0),
+                        ],
+                        egui::Color32::RED.into(),
+                        egui::Stroke::NONE,
+                    ));
                 }
             }
 
