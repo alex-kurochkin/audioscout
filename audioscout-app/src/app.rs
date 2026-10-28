@@ -771,6 +771,11 @@ impl AudioScoutApp {
             // jump back to `start` after having shown a later position.
             self.playhead_est_frame = start;
             self.playhead_est_at = std::time::Instant::now();
+            // BUGFIX (cursor races ahead of the audio and stalls at the right
+            // edge while a short file finishes): drop the cached fed-ceiling —
+            // the new session has nothing queued yet, and the output thread
+            // republishes it as soon as the pump appends its first chunk.
+            self.playhead_fed_ceiling = None;
             self.playhead_session = if end > start { Some((start, end)) } else { Some((start, self.document.total_frames())) };
             let mut ctrl = self.player.lock().unwrap_or_else(|p| p.into_inner());
             if self.output.is_some() {
@@ -789,6 +794,9 @@ impl AudioScoutApp {
         // clock to the session start; drop any live extrapolation so the next
         // Play re-arms it from a consistent point.
         self.playhead_session = None;
+        // BUGFIX (cursor races ahead of the audio): no queued samples remain
+        // above the rewound clock — invalidate the cached fed-ceiling too.
+        self.playhead_fed_ceiling = None;
         let mut ctrl = self.player.lock().unwrap_or_else(|p| p.into_inner());
         ctrl.stop();
     }
@@ -801,6 +809,12 @@ impl AudioScoutApp {
         // until the next poll drags it back.
         self.playhead_est_frame = frame;
         self.playhead_est_at = std::time::Instant::now();
+        // BUGFIX (cursor races ahead of the audio): a seek teleports the true
+        // clock AND discards everything queued above the target; rewind the
+        // cached ceiling with it so the extrapolation cannot show frames that
+        // are no longer (or not yet) audible. The output thread republishes
+        // the real value from the pump on its first append after the seek.
+        self.playhead_fed_ceiling = Some(frame);
         let mut ctrl = self.player.lock().unwrap_or_else(|p| p.into_inner());
         ctrl.seek(frame, &self.document, source);
     }

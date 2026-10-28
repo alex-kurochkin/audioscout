@@ -64,6 +64,14 @@ pub struct SharedOutput {
     /// ordering, so the UI poll gets a monotone, race-free truth position
     /// without redoing the conversion itself.
     pub true_playhead_file_frame: AtomicU64,
+    /// BUGFIX (playhead races ahead of the audio; cursor stalls at the right
+    /// edge while a short file keeps playing): the FILE frame the pump thread
+    /// has fed into the Sink so far — everything below it was handed to the
+    /// device queue; everything above it is provably NOT audible yet. Written
+    /// by `pump_thread` with Release ordering after every append and reset on
+    /// session teardown; read by the UI poll through `fed_until_frame` as the
+    /// hard playhead ceiling for its wall-clock extrapolation.
+    pub pumped_to_frame: AtomicU64,
 }
 
 impl Default for SharedOutput {
@@ -104,13 +112,6 @@ impl SharedOutput {
     pub fn fed_until_frame(&self) -> Option<u64> {
         Some(self.pumped_to_frame.load(Ordering::Acquire))
     }
-
-    /// File frame the pump thread has fed into the Sink so far (everything
-    /// below it was handed to the device queue; everything above it is not
-    /// audible yet). Written by `pump_thread` with Release ordering after
-    /// every append / queue flush; read by the UI poll through
-    /// `fed_until_frame` as the hard playhead ceiling.
-    pub pumped_to_frame: AtomicU64,
 }
 
 /// Commands accepted by the output controller thread. All transport actions
@@ -480,8 +481,18 @@ impl RodioOutput {
     /// clamped to this ceiling, so the cursor can never show samples that
     /// have not reached (or are not about to reach) the speakers. `None`
     /// when no document is loaded into the output yet.
-    pub fn playhead_ceiling_frame(&self, doc: &Document) -> Option<u64> {
-        self.shared.fed_until_frame(doc, self.stream_format)
+    pub fn playhead_ceiling_frame(&self) -> Option<u64> {
+        // `pumped_to_frame` is the FILE frame the pump handed to the Sink;
+        // everything above it provably has not reached the device queue yet,
+        // so no extrapolation may ever display it.
+        let fed_file = self.shared.pumped_to_frame.load(Ordering::Acquire);
+        if fed_file == 0 {
+            // No session engaged yet (fresh Load/Stop resets the counter):
+            // no honest ceiling exists — let the caller fall back to its own
+            // conservative clamp instead of pinning the cursor at 0.
+            return None;
+        }
+        Some(fed_file)
     }
 
     /// File-frame position the pump thread has fed up to (i.e. everything
@@ -679,6 +690,23 @@ struct MeteredSource {
     // this counter — it is incremented on `append` and decremented here when
     // the chunk runs dry, so the queue never grows past ~1 s of audio.
     chunks: Arc<AtomicUsize>,
+    /// Device (STREAM) sample rate this chunk was resampled to. Carried
+    /// explicitly because `rodio::buffer::SamplesBuffer::sample_rate` is a
+    /// trait method (`rodio::Source`) that is not imported in this module's
+    /// hot path (E0599 fix).
+    stream_rate: u32,
+    /// FILE frame where the CURRENT session started (snapshot taken by the
+    /// pump at append time). The raw `consumed_samples` clock counts stream
+    /// samples since the buffer/session seed, so mapping it back to file
+    /// frames requires adding this origin — without it every Seek/Loop pass
+    /// would report positions relative to 0 and the UI ceiling clamp would
+    /// fight the true clock.
+    session_start_file_frame: u64,
+    /// Hard FILE-frame ceiling for this source's published truth: the frame
+    /// the pump had fed up to when this chunk was appended. Guards against a
+    /// stale queued source publishing beyond the current session after a
+    /// rewind (defensive; the pump already clears stale queues).
+    fed_ceiling_file_frame: u64,
     // Local mirror of the global `consumed_samples` clock. Incremented in
     // `next()` and flushed into the atomic only every 512 samples — see the
     // BUGFIX note below (atomic-per-sample starved the cpal callback).
@@ -763,17 +791,28 @@ impl MeteredSource {
         // the true position ~1.4% (512 extra samples per 36k) — a bug in the
         // bugfix itself that kept the extrapolation ceiling above the real
         // audible frame and let the cursor race ahead anyway.
-        let consumed = self.shared.consumed_samples.load(Ordering::Relaxed);
+        // The clock BEFORE this window was flushed plus the samples produced
+        // since the previous publish == absolute STREAM-sample position of the
+        // window's end (the frame the hardware has just finished playing).
+        let consumed = self.shared.consumed_samples.load(Ordering::Relaxed)
+            + self.rms_count as u64;
         // Absolute STREAM frames played so far (device rate / device
         // channels), then mapped back into FILE frames with the exact
         // resampling ratio used by `slice_to_buffer` for this chunk:
-        // out_frames = file_frames * dst_rate / src_rate. Because every
-        // chunk is emitted with the device's own sample rate/channels,
-        // `inner.sample_rate()`/`channels` ARE the stream format here.
+        // out_frames = file_frames * dst_rate / src_rate. `self.stream_rate`
+        // is the device rate the chunk was built with (passed in by the pump)
+        // — `SamplesBuffer::sample_rate` is an inherent field getter behind
+        // the `rodio::Source` trait, so we carry the value explicitly instead
+        // of importing the trait into this hot path.
         let stream_frames = consumed / self.channels.max(1) as u64;
-        let dst_rate = self.inner.sample_rate().max(1) as u64;
+        let dst_rate = self.stream_rate.max(1) as u64;
         let src_rate = self.file_sample_rate.max(1) as u64;
-        let file_frame_true = stream_frames.saturating_mul(src_rate) / dst_rate;
+        // Absolute FILE frame from the session origin (chunk-relative count).
+        let file_frame_rel = stream_frames.saturating_mul(src_rate) / dst_rate;
+        let file_frame_true = self
+            .session_start_file_frame
+            .saturating_add(file_frame_rel)
+            .min(self.fed_ceiling_file_frame);
         // Publish the ground-truth audible position before advancing the
         // raw clock, both with ordering strong enough for the UI poll:
         // Acquire on the load pairs with the pump/controller Release stores
@@ -920,6 +959,11 @@ fn controller_thread(
                     sel_start = s;
                     sel_end = e;
                     pump.cursor_frame.store(s, Ordering::Relaxed);
+                    // BUGFIX (playhead races ahead of the audio): the hard
+                    // UI ceiling must restart at the session origin — any
+                    // stale `pumped_to_frame` from a previous run would let
+                    // the extrapolation show frames that are not queued yet.
+                    shared.pumped_to_frame.store(s, Ordering::Release);
                     // Publish the session AFTER seeding the cursor so the pump
                     // never sees a live session pointing at a stale frame.
                     *pump.session.lock().unwrap_or_else(|p| p.into_inner()) = Some((s, e));
@@ -1007,6 +1051,9 @@ fn controller_thread(
                     tracing::info!("[output] applying DEFERRED play {:?} on Load", deferred);
                 }
                 *pump.session.lock().unwrap_or_else(|p| p.into_inner()) = None;
+                // BUGFIX (playhead races ahead of the audio): a fresh document
+                // has nothing queued — zero the UI ceiling immediately.
+                shared.pumped_to_frame.store(0, Ordering::Release);
                 doc = Some(new_doc.clone());
                 // Publish the document for the pump thread (single writer —
                 // this controller thread; the pump only ever reads it).
@@ -1043,6 +1090,10 @@ fn controller_thread(
             Some(Cmd::Pause) => {
                 pending_play = None; // a parked Play must not survive Pause
                 *pump.session.lock().unwrap_or_else(|p| p.into_inner()) = None;
+                // BUGFIX (playhead races ahead of the audio): drop the fed
+                // ceiling to the seed position; the queue is being discarded
+                // by sink.stop() below, so nothing above the clock is audible.
+                shared.pumped_to_frame.store(0, Ordering::Release);
                 sink.stop();
                 shared.source_active.store(false, Ordering::Relaxed);
                 let mut ctrl = controller.lock().unwrap_or_else(|p| p.into_inner());
@@ -1063,6 +1114,8 @@ fn controller_thread(
             Some(Cmd::Stop) => {
                 pending_play = None; // ... or Stop (§5.3 stop = silence)
                 *pump.session.lock().unwrap_or_else(|p| p.into_inner()) = None;
+                // BUGFIX (playhead races ahead of the audio): see Pause arm.
+                shared.pumped_to_frame.store(0, Ordering::Release);
                 sink.stop();
                 shared.source_active.store(false, Ordering::Relaxed);
                 let start = shared.session_start_frame.load(Ordering::Relaxed);
@@ -1089,6 +1142,10 @@ fn controller_thread(
                     {
                         let mut ctrl = controller.lock().unwrap_or_else(|p| p.into_inner());
                         ctrl.mark_seek(target);
+                        // BUGFIX (playhead races ahead of the audio): the seek
+                        // teleports the true clock; rewind the UI ceiling with
+                        // it so no stale "already fed" mark survives the jump.
+                        shared.pumped_to_frame.store(target, Ordering::Release);
                         if ctrl.is_playing() {
                             let (s, e) = (target, if sel_end > sel_start { sel_end } else { d.total_frames() });
                             pump.cursor_frame.store(s, Ordering::Relaxed);
@@ -1252,6 +1309,9 @@ fn controller_thread(
                 );
                 shared.pos_offset.store(sel_start, Ordering::Relaxed);
                 pump.cursor_frame.store(sel_start, Ordering::Relaxed);
+                // BUGFIX (playhead races ahead of the audio): the loop pass
+                // rewinds the true clock — rewind the ceiling with it.
+                shared.pumped_to_frame.store(sel_start, Ordering::Release);
                 *pump.session.lock().unwrap_or_else(|p| p.into_inner()) = Some((sel_start, sel_end));
                 // BUGFIX ("sometimes needs a second Play press"): resume the
                 // sink FIRST (a previous stop() may have left it paused), then
@@ -1266,6 +1326,9 @@ fn controller_thread(
                 // the session start point (§5.3). Freeze the pump so no new
                 // chunks are queued while we transition to Stopped.
                 *pump.session.lock().unwrap_or_else(|p| p.into_inner()) = None;
+                // BUGFIX (playhead races ahead of the audio): session over —
+                // no audible samples remain above the rewound clock.
+                shared.pumped_to_frame.store(0, Ordering::Release);
                 sink.stop();
                 let start = shared.session_start_frame.load(Ordering::Relaxed);
                 match &doc {
@@ -1475,6 +1538,14 @@ fn pump_thread(pump: Arc<PumpState>, stream_format: (u32, u16)) {
             channels: stream_format.1.max(1),
             shared: shared_for_chunk,
             file_sample_rate: d.sample_rate.max(1),
+            stream_rate: stream_format.0.max(1),
+            // Snapshot of the session origin at append time: this chunk's
+            // relative sample count maps onto absolute FILE frames only when
+            // added to the frame the session (or the latest Seek/Loop pass)
+            // started from. The pump knows it as `s_start` — the same value
+            // the controller seeded `consumed_samples` with.
+            session_start_file_frame: s_start,
+            fed_ceiling_file_frame: next_end,
             local_idx: 0,
             rms_sum_l: 0.0,
             rms_sum_r: 0.0,
