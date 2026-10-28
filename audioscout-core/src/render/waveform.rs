@@ -129,7 +129,7 @@ pub fn render_envelope(env: &crate::audio_io::Envelope, width: u32, height: u32,
     let n = env.frames;
 
     let mut img = RgbaImage::new(width, height);
-    let (bg, fg, _grid, separator) = palette(style);
+    let (bg, fg, zero, separator) = palette(style);
 
     for pixel in img.pixels_mut() {
         *pixel = bg;
@@ -193,7 +193,9 @@ pub fn render_envelope(env: &crate::audio_io::Envelope, width: u32, height: u32,
 
         // Drawn AFTER the wave columns so each channel keeps a continuous
         // 0 dB reference line even where the signal is dense.
-        draw_zero_line(&mut img, cy, width, style);
+        for x in 0..width {
+            *img.get_pixel_mut(x, cy) = zero;
+        }
     }
 
     img
@@ -201,18 +203,22 @@ pub fn render_envelope(env: &crate::audio_io::Envelope, width: u32, height: u32,
 
 /// Color palette shared by both renderers (mirrors the Dark/Light styles of
 /// the `waveform-preview` example).
+///
+/// Tuple order: `(background, foreground/wave, grid/0 dBFS center line,
+/// track separator)`. The third entry is the color the per-channel middle
+/// line is painted with (see [`zero_line`]); the renderers draw that line
+/// through [`draw_zero_line`] after the wave columns, so it stays visible on
+/// top of dense signal.
 fn palette(style: Style) -> (Rgba<u8>, Rgba<u8>, Rgba<u8>, Rgba<u8>) {
-    let (bg, fg, grid, separator) = match style {
+    let (bg, fg, separator) = match style {
         Style::Dark => (
             Rgba([13, 18, 32, 255]),
             Rgba([16, 185, 129, 255]),
-            Rgba([31, 41, 55, 255]),
             Rgba([55, 65, 81, 255]),
         ),
         Style::Light => (
             Rgba([255, 255, 255, 255]),
             Rgba([5, 150, 105, 255]),
-            Rgba([229, 231, 235, 255]),
             Rgba([209, 213, 219, 255]),
         ),
     };
@@ -232,17 +238,6 @@ pub fn zero_line(style: Style) -> Rgba<u8> {
     }
 }
 
-/// Draws the 0 dBFS center line of one track across its full width.
-///
-/// Shared by the raw-signal renderer, the envelope fast path and the live
-/// egui painter in the player panel, so all previews show the same line.
-pub(crate) fn draw_zero_line(img: &mut RgbaImage, y: u32, width: u32, style: Style) {
-    let color = zero_line(style);
-    for x in 0..width {
-        *img.get_pixel_mut(x, y) = color;
-    }
-}
-
 /// Core renderer following the `waveform-preview` example: draws one track
 /// per channel slice, each with its own center line and peak/RMS columns.
 fn render_tracks(channels: &[&[f32]], peaks_list: &[Peaks], opts: &RenderOptions) -> RgbaImage {
@@ -250,7 +245,7 @@ fn render_tracks(channels: &[&[f32]], peaks_list: &[Peaks], opts: &RenderOptions
     let h = opts.height;
     let mut img = RgbaImage::new(w, h);
 
-    let (bg, fg, _grid, separator) = palette(opts.style);
+    let (bg, fg, zero, separator) = palette(opts.style);
 
     // Background
     for pixel in img.pixels_mut() {
@@ -287,7 +282,9 @@ fn render_tracks(channels: &[&[f32]], peaks_list: &[Peaks], opts: &RenderOptions
         let cy = y_start + track_h / 2;
 
         if samples.is_empty() {
-            draw_zero_line(&mut img, cy, w, opts.style);
+            for x in 0..w {
+                *img.get_pixel_mut(x, cy) = zero;
+            }
             continue;
         }
 
@@ -320,7 +317,9 @@ fn render_tracks(channels: &[&[f32]], peaks_list: &[Peaks], opts: &RenderOptions
 
         // Drawn AFTER the wave columns so each channel keeps a continuous
         // 0 dB reference line even where the signal is dense.
-        draw_zero_line(&mut img, cy, w, opts.style);
+        for x in 0..w {
+            *img.get_pixel_mut(x, cy) = zero;
+        }
     }
 
     img

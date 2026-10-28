@@ -1322,13 +1322,13 @@ impl eframe::App for AudioScoutApp {
                     }
                 }
 
-                // Draw center line only for mono (1 track)
-                // For stereo/multichannel, separator lines are drawn in the waveform rendering loop
-                // (In spectrogram mode the image already contains them.)
-                if self.audio_view.mode == AudioViewMode::Waveform && num_tracks == 1 {
-                    let mid_y = rect.center().y;
-                    ui.painter().line_segment([egui::pos2(rect.left(), mid_y), egui::pos2(rect.right(), mid_y)], egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(60, 60, 65)));
-                }
+                // The per-channel 0 dBFS middle lines are NOT drawn here any
+                // more: in waveform mode they are painted at the end of each
+                // track's loop iteration below (on top of that track's wave
+                // columns), and in spectrogram mode `render_view_spectrogram`
+                // bakes them into the image. Drawing a single line only for
+                // mono here used to leave stereo/multichannel tracks without
+                // a zero reference.
 
                 // Markers
                 for (idx, marker) in self.document.markers.iter().enumerate() {
@@ -1391,6 +1391,16 @@ impl eframe::App for AudioScoutApp {
                                 egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(50, 200, 80))
                             );
                         }
+
+                        // Per-channel middle line at 0 dBFS (amplitude 0),
+                        // painted AFTER this track's wave columns so it stays
+                        // visible on top of dense signal — one line for every
+                        // channel (mono: 1, stereo/multichannel: 2), matching
+                        // the table-preview renderer.
+                        ui.painter().line_segment(
+                            [egui::pos2(rect.left(), track_mid_y.round()), egui::pos2(rect.right(), track_mid_y.round())],
+                            egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(148, 163, 184))
+                        );
                     }
                 }
 

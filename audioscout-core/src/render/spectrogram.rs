@@ -222,6 +222,19 @@ pub fn render_spectrogram_preview(samples: &[f32], channels: u16, width: u32, he
         }
     }
 
+    // Per-channel middle line at 0 dBFS (amplitude 0), painted over the heat
+    // map so every thumbnail track keeps a continuous zero reference — same
+    // color/semantics as the waveform previews (`waveform::zero_line`).
+    if height > 2 {
+        let line = crate::render::waveform::zero_line(crate::render::waveform::Style::Dark);
+        for track in 0..ch {
+            let mid = ((track * track_height + track_height / 2) as u32).min(height - 1);
+            for x in 0..width {
+                img.put_pixel(x, mid, line);
+            }
+        }
+    }
+
     img
 }
 
@@ -319,6 +332,19 @@ pub fn render_view_spectrogram(
         let sep = track_height as u32;
         for x in 0..width {
             img.put_pixel(x, sep, Rgba([60, 60, 65, 255]));
+        }
+    }
+
+    // Per-channel middle line at 0 dBFS (amplitude 0), painted over the heat
+    // map so every track of the live view keeps a continuous zero reference —
+    // same color/semantics as the waveform renderers (`waveform::zero_line`).
+    if height > 2 {
+        let line = crate::render::waveform::zero_line(crate::render::waveform::Style::Dark);
+        for track in 0..ch {
+            let mid = ((track * track_height + track_height / 2) as u32).min(height - 1);
+            for x in 0..width {
+                img.put_pixel(x, mid, line);
+            }
         }
     }
 

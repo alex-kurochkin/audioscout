@@ -33,10 +33,13 @@ impl PreviewMode {
 
     /// Deterministic suffix mixed into the preview UUID so waveform and
     /// spectrogram PNGs never overwrite each other in the cache directory.
+    ///
+    /// `v2` = previews now carry a per-channel 0 dBFS middle line; bumping the
+    /// suffix forces already-cached (line-less) thumbnails to be re-rendered.
     pub fn uuid_suffix(self) -> &'static str {
         match self {
-            PreviewMode::Waveform => "",
-            PreviewMode::Spectrogram => "-spectro",
+            PreviewMode::Waveform => "-v2",
+            PreviewMode::Spectrogram => "-spectro-v2",
         }
     }
 
