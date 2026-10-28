@@ -10,7 +10,7 @@ use audioscout_core::db::Database;
 use audioscout_core::audio_io::PcmFile;
 use audioscout_core::disk::DiskProvider;
 use audioscout_core::preview_worker::{PreviewWorker, PreviewJob};
-use audioscout_core::{Document, EventChannel, Marker, PreviewMode, UiEvent, is_editable_file};
+use audioscout_core::{Document, EventChannel, Marker, PreviewMode, UiEvent, is_audio_file, is_editable_file};
 use crossbeam_channel::Receiver;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -454,7 +454,14 @@ impl AudioScoutApp {
     }
 
     fn load_file(&mut self, path: &Path) {
-        if !is_editable_file(path) { self.status_message = "File format not editable".to_string(); return; }
+        // All supported audio formats load into the player (§3.4: playback must
+        // work for non-editable files too). "Editable" (PCM read/write) only
+        // gates destructive edit operations (mute/normalize/save), never
+        // loading or playback — see `apply_mute`/`apply_normalize`.
+        if !is_audio_file(path) {
+            self.status_message = "Unsupported file format".to_string();
+            return;
+        }
         self.transport_stop();
         self.player.lock().unwrap_or_else(|p| p.into_inner()).reset();
         match audioscout_core::audio_io::load_audio(path) {
@@ -463,6 +470,9 @@ impl AudioScoutApp {
                 // decoded to an empty buffer — Play would compute end==start
                 // and drop the append.
                 tracing::info!("[load] OK {path:?} samples={} sr={sr} ch={ch} frames={}", samples.len(), samples.len() / (ch.max(1) as usize));
+                // BUGFIX (sticky "not editable" message): a successful load
+                // must clear any stale status from a previously rejected file.
+                self.status_message.clear();
                 self.document = Document {
                     samples, sample_rate: sr, channels: ch, markers: Vec::new(),
                     source_path: path.to_path_buf(), temp_path: None, dirty: false, sample_type: st,

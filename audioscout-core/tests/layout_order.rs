@@ -573,3 +573,67 @@ fn playback_is_paced_by_a_sink_queue_budget_not_wall_clock_sleeps() {
     assert!(!code.contains("Some(&(s, e))"), "Option<(u64,u64)> Copy tuple must be matched by value (E0308)");
     assert!(flat.contains("Some((s, e)) => s < e && pump.cursor_frame.load(Ordering::Relaxed) >= e"), "completion check reads the pump cursor vs session end");
 }
+
+// ---------------------------------------------------------------------------
+// Regression: non-editable audio files must load into the player.
+//
+// Bug (user report): double-clicking an mp3 in the file list showed
+// "File format not editable" and refused to load; the message also stuck in
+// the status bar after subsequently loading a wav. Per the TZ, playback must
+// work for every supported audio format; "editable" only gates destructive
+// edit operations (mute/normalize/save).
+// ---------------------------------------------------------------------------
+
+fn app_src_for_editable_check() -> String {
+    let mut p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    p.push("../audioscout-app/src/app.rs");
+    std::fs::read_to_string(p).expect("app.rs readable")
+}
+
+#[test]
+fn load_file_accepts_all_supported_audio_formats() {
+    let src = app_src_for_editable_check();
+    // Isolate the body of `fn load_file` up to the next top-level fn.
+    let start = src.find("fn load_file(&mut self, path: &Path)").expect("load_file present");
+    let rest = &src[start..];
+    let end = rest.find("\n    fn ").or(rest.find("\n    /// Rebuild")).expect("load_file end");
+    let body = &rest[..end];
+
+    // The hard gate on *editability* must be gone from the load path...
+    assert!(
+        !body.contains("if !is_editable_file(path)"),
+        "load_file must not refuse non-editable formats (§3.4: all audio files play)"
+    );
+    // ...replaced by a supported-audio-format check.
+    assert!(
+        body.contains("is_audio_file(path)"),
+        "load_file should validate against the supported audio extension list"
+    );
+    // A successful load must clear any stale status message (sticky-message bug).
+    assert!(
+        body.contains("self.status_message.clear()"),
+        "successful load must clear the sticky status message"
+    );
+    // Edit gating stays where it belongs — on the edit operations themselves.
+    assert!(
+        src.contains("if !is_editable_file(&self.document.source_path)"),
+        "edit operations must still be gated on is_editable_file"
+    );
+}
+
+#[test]
+fn wma_is_supported_non_editable_format() {
+    assert!(
+        audioscout_core::AUDIO_EXTENSIONS.contains(&"wma"),
+        "WMA must be listed among supported (playable) audio extensions"
+    );
+    assert!(
+        !audioscout_core::EDITABLE_EXTENSIONS.contains(&"wma"),
+        "WMA is decode-only: it must NOT be editable"
+    );
+    let p = std::path::Path::new("track.wma");
+    assert!(audioscout_core::is_audio_file(p));
+    assert!(!audioscout_core::is_editable_file(p));
+    let mp3 = std::path::Path::new("song.MP3");
+    assert!(audioscout_core::is_audio_file(mp3), "extension matching is case-insensitive");
+}
