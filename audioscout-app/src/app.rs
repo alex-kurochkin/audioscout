@@ -145,6 +145,14 @@ pub struct AudioScoutApp {
     /// and taken by the audio-view panel when the pointer hovers it. See the
     /// handler in `update()` for the full rationale.
     pending_wheel_delta: Option<f32>,
+    /// Rect of the audio-view content area, recorded by the panel itself on
+    /// every frame. The wheel handler at the top of `update()` tests the live
+    /// pointer against THIS rect to decide who owns `pending_wheel_delta`.
+    /// (Previous attempts used `Memory::area_rect(Id::new("audio_view"))`,
+    /// which never matched the inner `Ui`'s id and always returned `None` —
+    /// so the audio view never claimed the delta and wheel zoom silently did
+    /// nothing while the +/- buttons kept working.)
+    audio_view_rect: Option<egui::Rect>,
 }
 
 impl AudioScoutApp {
@@ -250,6 +258,7 @@ impl AudioScoutApp {
             // after its first append (see `poll_playhead`).
             playhead_fed_ceiling: None,
             pending_wheel_delta: None,
+            audio_view_rect: None,
         };
 
         // Restore the two independent Waveform/Spectrogram toggles from the
@@ -1294,9 +1303,23 @@ impl eframe::App for AudioScoutApp {
         // (the common "move mouse over the wave, start scrolling" case),
         // the panel still believes the pointer is elsewhere, never calls
         // `take()`, and the zoom silently does nothing. Checking the actual
-        // pointer coords against `Memory::area_rect("audio_view")` removes
-        // that one-frame race entirely.
-        let audio_view_rect = ctx.memory(|m| m.area_rect(egui::Id::new("audio_view")));
+        // pointer coords against the panel rect removes that one-frame race.
+        //
+        // BUGFIX (wheel zoom stopped working AGAIN): the rect lookup used to
+        // go through `Memory::area_rect(Id::new("audio_view"))`, but egui
+        // registers areas under the *inner Ui's* generated id, not under the
+        // panel's string id — so the lookup returned `None` on every frame,
+        // `pointer_over_audio_view` was always false, `pending_wheel_delta`
+        // stayed `None`, and the wheel handler inside the panel never saw a
+        // delta (the +/- buttons kept working because they call
+        // `zoom_in()/zoom_out()` directly). The audio-view panel now records
+        // its exact content rect into `self.audio_view_rect` every frame
+        // (see the panel below); we test the pointer against that rect. It
+        // is one frame stale at most — during continuous scrolling it is
+        // exact, and even the first wheel notch after entering the view is
+        // handled because the pointer had to move (triggering a repaint)
+        // before it could scroll there.
+        let audio_view_rect = self.audio_view_rect;
         let (wheel_dy, pointer_over_audio_view) = ctx.input(|i| {
             let dy = i
                 .events
@@ -1321,6 +1344,21 @@ impl eframe::App for AudioScoutApp {
         // keep their normal wheel behaviour and stale deltas from earlier
         // frames never leak into a later zoom action.
         self.pending_wheel_delta = pointer_over_audio_view.then_some(wheel_dy);
+        // BUGFIX (wheel zoom "works once, then stops working"): egui only
+        // repaints when something interesting happens, and by default a
+        // MouseWheel event does NOT schedule a repaint on its own — only
+        // events that touch an interactive widget do (scroll areas, buttons,
+        // …). The audio view's `Sense::click_and_drag` response ignores the
+        // wheel, so without this call the first notch after entering the
+        // view is processed (the preceding pointer move scheduled the frame)
+        // but every following notch arrives in a frame that was never
+        // requested — the OS delivers the events, nobody redraws, and zoom
+        // appears to "stop working" until the mouse moves again. Requesting
+        // a repaint whenever we claimed a delta keeps the wheel responsive
+        // for continuous scrolling with a stationary pointer.
+        if pointer_over_audio_view {
+            ctx.request_repaint();
+        }
 
         self.process_events(ctx);
         self.handle_keyboard(ctx);
@@ -1514,6 +1552,11 @@ impl eframe::App for AudioScoutApp {
         // file-actions panel and above the audio-content view).
         egui::TopBottomPanel::bottom("audio_view").default_height(200.0).resizable(true).show(ctx, |ui| {
             let (rect, response) = ui.allocate_exact_size(ui.available_size(), egui::Sense::click_and_drag());
+            // Publish this panel's exact content rect for the wheel-delta
+            // ownership test at the top of `update()` (see BUGFIX note on
+            // `audio_view_rect`). Done before any early return below so the
+            // rect is always fresh while the panel exists.
+            self.audio_view_rect = Some(rect);
             ui.painter().rect_filled(rect, 0.0, egui::Color32::from_rgb(25, 25, 30));
 
             if !self.document.samples.is_empty() {
@@ -1668,23 +1711,42 @@ impl eframe::App for AudioScoutApp {
             // state and swallow the delta whenever a wheel event arrives in
             // the same frame the pointer entered the view (zoom "stopped
             // working" regression).
+            // UX: pointing-hand cursor while the pointer is over the audio
+            // view (it accepts clicks-to-seek and drags — same affordance as
+            // the buttons). The wheel handler below may consume this frame's
+            // delta; the hand must still show when merely hovering, so it is
+            // driven by the live pointer position against `rect`, not by
+            // `response.hovered()` (last-frame state).
+            if ctx.input(|i| i.pointer.hover_pos().is_some_and(|p| rect.contains(p))) {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+
             let wheel_dy = self.pending_wheel_delta.take();
             if let Some(dy) = wheel_dy {
-                let ctrl = ctx.input(|i| i.modifiers.ctrl);
-                if ctrl {
-                    if dy > 0.0 {
-                        if let Some(pos) = ctx.input(|i| i.pointer.hover_pos()) {
-                            let x_ratio = ((pos.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
-                            self.audio_view.zoom_at_x(1.25, x_ratio as f64);
-                        }
-                    } else if dy < 0.0 {
-                        if let Some(pos) = ctx.input(|i| i.pointer.hover_pos()) {
-                            let x_ratio = ((pos.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
-                            self.audio_view.zoom_at_x(1.0 / 1.25, x_ratio as f64);
-                        }
-                    }
-                } else if dy != 0.0 {
+                // BUGFIX (wheel zoom stopped working AGAIN, second half):
+                // zoom used to be gated behind Ctrl. On Linux/Wayland/X11
+                // egui reports the wheel with `MouseWheelUnit::Line` and no
+                // modifier, so plain scrolling never reached `zoom_at_x` at
+                // all — it only panned, which on a fully zoomed-out view is
+                // a visual no-op ("zoom does nothing, buttons work"). The
+                // documented interaction (§3.5) is plain-wheel zoom in the
+                // player window; handle every claimed notch as zoom centered
+                // on the pointer, and keep horizontal pan for the Shift key
+                // (the conventional "wheel scrolls sideways" modifier).
+                let shift = ctx.input(|i| i.modifiers.shift);
+                let pos = ctx.input(|i| i.pointer.hover_pos());
+                if shift {
                     self.audio_view.scroll_horizontal(-dy as f64 * 0.01);
+                } else if dy > 0.0 {
+                    if let Some(pos) = pos {
+                        let x_ratio = ((pos.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
+                        self.audio_view.zoom_at_x(1.25, x_ratio as f64);
+                    }
+                } else if dy < 0.0 {
+                    if let Some(pos) = pos {
+                        let x_ratio = ((pos.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
+                        self.audio_view.zoom_at_x(1.0 / 1.25, x_ratio as f64);
+                    }
                 }
             }
         });
