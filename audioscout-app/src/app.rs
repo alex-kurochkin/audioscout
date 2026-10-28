@@ -1273,24 +1273,25 @@ impl eframe::App for AudioScoutApp {
         // default style never changes the mouse cursor, so buttons looked
         // inert. Instead of guessing from previous-frame memory (the old
         // `interacted_widget` / `hovered_widget` APIs no longer exist in
-        // egui 0.29), we use an immediate-mode helper `hand_cursor(ui)`
-        // that sets `CursorIcon::PointingHand` whenever the returned
-        // response is hovered. Panels below call it for toolbars, player
-        // transport, file rows and folder tree items.
-        fn hand_cursor(ui: &egui::Ui, resp: &egui::Response) -> bool {
-            if resp.hovered() {
-                ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::PointingHand);
-            }
-            resp.clicked()
-        }
+        // egui 0.29), we use an immediate-mode helper that sets
+        // `CursorIcon::PointingHand` whenever a response is hovered. Panels
+        // below call it for toolbars, player transport, file rows and folder
+        // tree items.
 
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
+            let ctx = ui.ctx().clone();
+            let hand_cursor = |resp: &egui::Response| -> bool {
+                if resp.hovered() {
+                    ctx.output_mut(|o| o.cursor_icon = egui::CursorIcon::PointingHand);
+                }
+                resp.clicked()
+            };
             ui.horizontal(|ui| {
                 ui.label("Filter:");
                 ui.text_edit_singleline(&mut self.filter_text);
-                if hand_cursor(ui, &ui.button("✕")) { self.filter_text.clear(); }
+                if hand_cursor(&ui.button("✕")) { self.filter_text.clear(); }
                 ui.separator();
-                if hand_cursor(ui, &ui.button("Columns")) { self.show_columns_dialog = true; }
+                if hand_cursor(&ui.button("Columns")) { self.show_columns_dialog = true; }
                 ui.separator();
                 // Table thumbnail style toggle (§3.1): the code to switch
                 // modes existed but had no control — this button exposes the
@@ -1300,7 +1301,7 @@ impl eframe::App for AudioScoutApp {
                     preview_spectro,
                     if preview_spectro { "Spectrogram" } else { "Waveform" },
                 );
-                if hand_cursor(ui, &ui.add(preview_btn).on_hover_text("Toggle table previews between waveform and spectrogram")) {
+                if hand_cursor(&ui.add(preview_btn).on_hover_text("Toggle table previews between waveform and spectrogram")) {
                     self.toggle_preview_mode();
                 }
                 // NOTE: the second Waveform/Spectrogram toggle that used to sit
@@ -1308,7 +1309,7 @@ impl eframe::App for AudioScoutApp {
                 // audio-view display mode has exactly ONE control now, the one
                 // on the player panel below.
                 ui.separator();
-                if hand_cursor(ui, &ui.button("Settings")) { self.show_settings = true; }
+                if hand_cursor(&ui.button("Settings")) { self.show_settings = true; }
             });
         });
 
@@ -1621,27 +1622,28 @@ impl eframe::App for AudioScoutApp {
             // Reserve the right strip for the meter; everything else lays
             // out in a child UI confined to the remaining area.
             ui.allocate_ui(egui::vec2(meter_rect.min.x - 6.0 - panel_rect.min.x, panel_rect.height()), |ui| {
-            let hand_cursor = |ui: &egui::Ui, resp: &egui::Response| -> bool {
+            let ctx = ui.ctx().clone();
+            let hand_cursor = |resp: &egui::Response| -> bool {
                 if resp.hovered() {
-                    ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::PointingHand);
+                    ctx.output_mut(|o| o.cursor_icon = egui::CursorIcon::PointingHand);
                 }
                 resp.clicked()
             };
             ui.horizontal(|ui| {
-                if hand_cursor(ui, &ui.button("|<")) { self.navigate_file(-1); }
+                if hand_cursor(&ui.button("|<")) { self.navigate_file(-1); }
                 let play_text = match self.player_state() { TransportState::Playing => "⏸", _ => "▶" };
-                if hand_cursor(ui, &ui.button(play_text)) { self.transport_play_pause(); }
-                if hand_cursor(ui, &ui.button("⏹")) { self.transport_stop(); }
-                if hand_cursor(ui, &ui.button(">|")) { self.navigate_file(1); }
+                if hand_cursor(&ui.button(play_text)) { self.transport_play_pause(); }
+                if hand_cursor(&ui.button("⏹")) { self.transport_stop(); }
+                if hand_cursor(&ui.button(">|")) { self.navigate_file(1); }
                 let (looping, playing_now) = {
                     let ctrl = self.player.lock().unwrap_or_else(|p| p.into_inner());
                     (ctrl.is_looping(), ctrl.state() == TransportState::Playing)
                 };
                 let loop_color = if looping && playing_now { egui::Color32::YELLOW } else if looping { egui::Color32::GREEN } else { ui.visuals().text_color() };
-                if hand_cursor(ui, &ui.colored_label(loop_color, "🔁")) { self.transport_toggle_loop(); }
+                if hand_cursor(&ui.colored_label(loop_color, "🔁")) { self.transport_toggle_loop(); }
                 ui.separator();
-                if hand_cursor(ui, &ui.button("+")) { self.audio_view.zoom_in(); }
-                if hand_cursor(ui, &ui.button("−")) { self.audio_view.zoom_out(); }
+                if hand_cursor(&ui.button("+")) { self.audio_view.zoom_in(); }
+                if hand_cursor(&ui.button("−")) { self.audio_view.zoom_out(); }
                 ui.separator();
                 ui.label("Vol:");
                 let mut vol = self.player.lock().unwrap_or_else(|p| p.into_inner()).volume() * 100.0;
@@ -1649,7 +1651,7 @@ impl eframe::App for AudioScoutApp {
                 ui.separator();
                 let save_color = if self.document.dirty { egui::Color32::YELLOW } else { ui.visuals().text_color() };
                 let save_label = if self.document.dirty { "Save*" } else { "Save" };
-                if hand_cursor(ui, &ui.colored_label(save_color, save_label)) { self.save_file(); }
+                if hand_cursor(&ui.colored_label(save_color, save_label)) { self.save_file(); }
                 ui.separator();
                 // Player-panel display-mode toggle (§3.5): reflects and flips
                 // the live `AudioView::mode` state (persisted in config.json).
@@ -1658,7 +1660,7 @@ impl eframe::App for AudioScoutApp {
                     view_spectro,
                     if view_spectro { "Spectrogram" } else { "Waveform" },
                 );
-                if hand_cursor(ui, &ui.add(view_btn).on_hover_text("Toggle the visualization between waveform and spectrogram")) {
+                if hand_cursor(&ui.add(view_btn).on_hover_text("Toggle the visualization between waveform and spectrogram")) {
                     self.toggle_audio_view_mode();
                 }
             });
@@ -1677,19 +1679,20 @@ impl eframe::App for AudioScoutApp {
         // the player, i.e. docked *above* it: this is the panel the transport
         // controls must sit under (bug #1).
         egui::TopBottomPanel::bottom("actions").default_height(40.0).show(ctx, |ui| {
-            let hand_cursor = |ui: &egui::Ui, resp: &egui::Response| -> bool {
+            let ctx = ui.ctx().clone();
+            let hand_cursor = |resp: &egui::Response| -> bool {
                 if resp.hovered() {
-                    ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::PointingHand);
+                    ctx.output_mut(|o| o.cursor_icon = egui::CursorIcon::PointingHand);
                 }
                 resp.clicked()
             };
             ui.horizontal(|ui| {
-                if hand_cursor(ui, &ui.button("Mute")) { self.mute_selection(); }
+                if hand_cursor(&ui.button("Mute")) { self.mute_selection(); }
                 ui.label("Normalize:");
                 ui.add(egui::DragValue::new(&mut self.normalize_dbfs).range(-60.0..=0.0).suffix(" dBFS"));
-                if hand_cursor(ui, &ui.button("Apply")) { self.normalize_selection(); }
+                if hand_cursor(&ui.button("Apply")) { self.normalize_selection(); }
                 ui.separator();
-                if hand_cursor(ui, &ui.button("Delete all markers")) { self.document.markers.clear(); }
+                if hand_cursor(&ui.button("Delete all markers")) { self.document.markers.clear(); }
                 if let Some(path) = &self.active_file {
                     ui.separator();
                     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
