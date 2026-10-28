@@ -129,7 +129,7 @@ pub fn render_envelope(env: &crate::audio_io::Envelope, width: u32, height: u32,
     let n = env.frames;
 
     let mut img = RgbaImage::new(width, height);
-    let (bg, fg, grid, separator) = palette(style);
+    let (bg, fg, _grid, separator) = palette(style);
 
     for pixel in img.pixels_mut() {
         *pixel = bg;
@@ -159,10 +159,8 @@ pub fn render_envelope(env: &crate::audio_io::Envelope, width: u32, height: u32,
             }
         }
 
+        // Zero line (0 dBFS) of this channel track.
         let cy = y_start + track_h / 2;
-        for x in 0..width {
-            *img.get_pixel_mut(x, cy) = grid;
-        }
 
         // Map envelope frames onto pixel columns, merging min/max per column
         // exactly like Peaks::spans does for the raw-signal path.
@@ -182,7 +180,7 @@ pub fn render_envelope(env: &crate::audio_io::Envelope, width: u32, height: u32,
                 if hi[i] > col_hi { col_hi = hi[i]; }
             }
             if col_lo > col_hi {
-                continue; // empty column: leave the grid line visible
+                continue; // empty column: leave the zero line visible
             }
             let y_top = cy as f32 - col_hi.clamp(-1.0, 1.0) * (draw_h / 2.0);
             let y_bot = cy as f32 - col_lo.clamp(-1.0, 1.0) * (draw_h / 2.0);
@@ -192,6 +190,10 @@ pub fn render_envelope(env: &crate::audio_io::Envelope, width: u32, height: u32,
                 *img.get_pixel_mut(x, y) = fg;
             }
         }
+
+        // Drawn AFTER the wave columns so each channel keeps a continuous
+        // 0 dB reference line even where the signal is dense.
+        draw_zero_line(&mut img, cy, width, style);
     }
 
     img
@@ -200,7 +202,7 @@ pub fn render_envelope(env: &crate::audio_io::Envelope, width: u32, height: u32,
 /// Color palette shared by both renderers (mirrors the Dark/Light styles of
 /// the `waveform-preview` example).
 fn palette(style: Style) -> (Rgba<u8>, Rgba<u8>, Rgba<u8>, Rgba<u8>) {
-    match style {
+    let (bg, fg, grid, separator) = match style {
         Style::Dark => (
             Rgba([13, 18, 32, 255]),
             Rgba([16, 185, 129, 255]),
@@ -213,6 +215,31 @@ fn palette(style: Style) -> (Rgba<u8>, Rgba<u8>, Rgba<u8>, Rgba<u8>) {
             Rgba([229, 231, 235, 255]),
             Rgba([209, 213, 219, 255]),
         ),
+    };
+    // The 0 dBFS center line must stay readable on top of the wave columns.
+    (bg, fg, zero_line(style), separator)
+}
+
+/// Color of the per-channel 0 dBFS (zero-amplitude) center line.
+///
+/// Drawn AFTER the wave columns so every channel track keeps a continuous
+/// reference line even where the signal is dense — matching how editors show
+/// the midline over the waveform.
+pub fn zero_line(style: Style) -> Rgba<u8> {
+    match style {
+        Style::Dark => Rgba([148, 163, 184, 255]),
+        Style::Light => Rgba([107, 114, 128, 255]),
+    }
+}
+
+/// Draws the 0 dBFS center line of one track across its full width.
+///
+/// Shared by the raw-signal renderer, the envelope fast path and the live
+/// egui painter in the player panel, so all previews show the same line.
+pub(crate) fn draw_zero_line(img: &mut RgbaImage, y: u32, width: u32, style: Style) {
+    let color = zero_line(style);
+    for x in 0..width {
+        *img.get_pixel_mut(x, y) = color;
     }
 }
 
@@ -223,7 +250,7 @@ fn render_tracks(channels: &[&[f32]], peaks_list: &[Peaks], opts: &RenderOptions
     let h = opts.height;
     let mut img = RgbaImage::new(w, h);
 
-    let (bg, fg, grid, separator) = palette(opts.style);
+    let (bg, fg, _grid, separator) = palette(opts.style);
 
     // Background
     for pixel in img.pixels_mut() {
@@ -256,13 +283,11 @@ fn render_tracks(channels: &[&[f32]], peaks_list: &[Peaks], opts: &RenderOptions
             }
         }
 
-        // Track center line
+        // Zero line (0 dBFS) of this channel track.
         let cy = y_start + track_h / 2;
-        for x in 0..w {
-            *img.get_pixel_mut(x, cy) = grid;
-        }
 
         if samples.is_empty() {
+            draw_zero_line(&mut img, cy, w, opts.style);
             continue;
         }
 
@@ -292,6 +317,10 @@ fn render_tracks(channels: &[&[f32]], peaks_list: &[Peaks], opts: &RenderOptions
                 *img.get_pixel_mut(x, y) = fg;
             }
         }
+
+        // Drawn AFTER the wave columns so each channel keeps a continuous
+        // 0 dB reference line even where the signal is dense.
+        draw_zero_line(&mut img, cy, w, opts.style);
     }
 
     img
@@ -338,6 +367,56 @@ mod tests {
             .collect();
         let img = render_waveform(&samples, 1, 340, 20, Style::Light, Mode::Rms);
         assert_eq!(img.dimensions(), (340, 20));
+    }
+
+    /// Each channel track must carry its own 0 dBFS center line, even for
+    /// stereo files (the separator between tracks is a different row).
+    #[test]
+    fn test_center_line_per_channel_stereo() {
+        // Interleaved stereo: L = +0.5, R = -0.5 → two 20-px tracks in 40 px.
+        let samples: Vec<f32> = (0..44100).flat_map(|_| [0.5f32, -0.5]).collect();
+        let img = render_waveform(&samples, 2, 340, 40, Style::Dark, Mode::Peak);
+        let (_, _, grid, _) = palette(Style::Dark);
+        // Track centers: y = 10 (L) and y = 30 (R). Wave columns are drawn
+        // over the lines, so check a column that stays outside the lines:
+        // verify every row of each center has at least one grid pixel…
+        for &cy in &[10u32, 30u32] {
+            assert!(
+                (0..340).any(|x| img.get_pixel(x, cy) == &grid),
+                "missing 0 dB center line at y={cy}"
+            );
+        }
+    }
+
+    /// Silent audio must leave the 0 dB center line fully visible.
+    #[test]
+    fn test_center_line_visible_on_silence() {
+        let samples = vec![0.0f32; 4410];
+        let img = render_waveform(&samples, 1, 100, 20, Style::Dark, Mode::Peak);
+        let (_, _, grid, _) = palette(Style::Dark);
+        for x in 0..100 {
+            assert_eq!(img.get_pixel(x, 10), &grid, "center line broken at x={x}");
+        }
+    }
+
+    /// The fast envelope path (file-list thumbnails) must draw the same
+    /// per-channel 0 dB lines as the raw-signal renderer.
+    #[test]
+    fn test_envelope_center_lines_per_channel() {
+        let env = crate::audio_io::Envelope {
+            channels: 2,
+            frames: 680,
+            lo: vec![vec![-0.5f32; 680], vec![-0.2; 680]],
+            hi: vec![vec![0.5f32; 680], vec![0.2; 680]],
+        };
+        let img = render_envelope(&env, 340, 40, Style::Dark);
+        let (_, _, grid, _) = palette(Style::Dark);
+        for &cy in &[10u32, 30u32] {
+            assert!(
+                (0..340).any(|x| img.get_pixel(x, cy) == &grid),
+                "missing 0 dB center line at y={cy}"
+            );
+        }
     }
 
     #[test]
