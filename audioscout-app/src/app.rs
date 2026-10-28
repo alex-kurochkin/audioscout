@@ -113,6 +113,19 @@ pub struct AudioScoutApp {
     /// Session bounds [start,end) currently being played — used to clamp the
     /// extrapolated cursor so it can never run past the end of a short file.
     playhead_session: Option<(u64, u64)>,
+    /// BUGFIX (cursor races ahead of the audio and stalls at the window edge
+    /// while the file finishes playing): the free-running wall-clock estimate
+    /// was previously allowed to lead the true hardware clock by an unbounded
+    /// amount — every poll re-anchored the estimate at `max(estimate, clock)`
+    /// instead of pulling it back toward the clock, so the visible lead only
+    /// grew (it equals the whole pump/sink buffer depth plus event jitter once
+    /// the pump has fed the last chunk). On a short file (e.g. 7 s) the cursor
+    /// reached the right edge of the player window seconds before the audio
+    /// actually finished and stood there while playback caught up. Now the
+    /// estimate may lead the true clock by at most one poll quantum (~50 ms):
+    /// each poll blends the raw clock back into the anchor whenever the lead
+    /// exceeds that cap, which keeps motion smooth AND time-accurate.
+    playhead_lead_cap_frames: u64,
 }
 
 impl AudioScoutApp {
@@ -211,6 +224,9 @@ impl AudioScoutApp {
             playhead_est_frame: 0,
             playhead_est_at: std::time::Instant::now(),
             playhead_session: None,
+            // One 50 ms poll quantum at 192 kHz — the absolute worst case;
+            // re-derived from the document's sample rate on every poll.
+            playhead_lead_cap_frames: 9600,
         };
 
         // Restore the two independent Waveform/Spectrogram toggles from the
@@ -885,15 +901,31 @@ impl AudioScoutApp {
             // is very visible on short files. Estimate = max(true clock,
             // anchor advanced at the nominal rate), clamped to the session
             // end so a short file can never be over-run by the estimate.
+            //
+            // BUGFIX (cursor races ahead of the audio and stalls at the right
+            // edge while the file finishes): `max(est, true_frame)` alone let
+            // the estimate lead the real clock without bound — every poll
+            // re-anchored at the already-inflated estimate, so the lead grew
+            // to the full pump/sink buffer depth (the pump keeps ~1 s of
+            // samples queued ahead of the device). On a 7 s clip the cursor
+            // reached EOF (and the window edge) visibly early and froze there
+            // while the audio kept playing. The estimate may now lead the
+            // true clock by at most one poll quantum: when it drifts further
+            // ahead, the anchor is pulled back to `true_clock + cap`, which
+            // tracks the device within ~50 ms while staying smooth and
+            // monotonic (never snaps backwards mid-session).
             let sr = self.document.sample_rate.max(1) as f64;
             let elapsed = self.playhead_est_at.elapsed().as_secs_f64().clamp(0.0, 0.25);
             let est = self
                 .playhead_est_frame
                 .saturating_add((elapsed * sr) as u64)
                 .max(true_frame);
+            self.playhead_lead_cap_frames = (0.05 * sr) as u64 + 1;
+            let lead_ceiling = true_frame.saturating_add(self.playhead_lead_cap_frames);
+            let frame = est.min(lead_ceiling);
             let frame = match self.playhead_session {
-                Some((_s, e)) => est.min(e.saturating_sub(1)),
-                None => est,
+                Some((_s, e)) => frame.min(e.saturating_sub(1)),
+                None => frame,
             };
             self.playhead_est_frame = frame;
             self.playhead_est_at = std::time::Instant::now();
