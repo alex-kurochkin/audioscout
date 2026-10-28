@@ -114,10 +114,19 @@ impl Controller {
         };
         self.start_frame = start;
         self.end_frame = end;
-        // Snapshot the live (wall-clock extrapolated) position BEFORE the
-        // state changes: with no explicit seek, Play continues from where
+        // §5.3 "выделение главнее точки резюме": an explicit selection ALWAYS
+        // starts the session at its left bound — even a degenerate one
+        // (`end <= start`, meaning "play from here to EOF"). The old code kept
+        // extrapolating from the live (pre-Play) cursor instead, so
+        // Play-from-selection resumed wherever the previous run had stopped.
+        // Without any selection, snapshot the live (wall-clock extrapolated)
+        // position BEFORE the state changes: Play continues from where
         // playback actually was (§5.3 "Pause не залипает", resume point).
-        let pos = self.estimated_frame();
+        let pos = if selection.is_some() {
+            start
+        } else {
+            self.estimated_frame().max(start)
+        };
         self.current_frame = pos;
         self.resume_frame = pos;
         self.session_clock_at = std::time::Instant::now();
@@ -192,29 +201,35 @@ impl Controller {
         let mut target = frame.min(max_frame);
         if self.state == TransportState::Playing && self.end_frame > self.start_frame {
             // Click-to-seek outside the selection does not extend it: clamp
-            // into the active range (§5.3). The upper bound is `end - 1`:
-            // the session covers [start,end), so a user seek to EOF must
-            // land on the final playable frame.
-            let hi = self.end_frame.saturating_sub(1).min(max_frame).max(self.start_frame);
+            // into the active range (§5.3). The session covers [start,end):
+            // the FINAL frame `end` is the legitimate "play to EOF" position
+            // (the last thing the hardware plays before the natural rewind),
+            // so only frames BEYOND end get pulled back to it — clamping to
+            // `end - 1` used to shave one frame off every seek-to-end.
+            let hi = self.end_frame.min(max_frame).max(self.start_frame);
             target = target.clamp(self.start_frame, hi);
         }
         self.current_frame = target;
         self.playhead.set_position_samples(target);
-        if source == CursorSource::User || self.state != TransportState::Playing {
-            // Outside an active session the cursor IS the resume point;
-            // while playing, playback keeps tracking the live position and
-            // a Playback-source seek must not override it (§5.3).
+        // §5.3: a user-side move re-anchors the resume point. A
+        // Playback-source move never does — the live clock path
+        // (`sync_playback_position`) keeps the resume point following the
+        // actual playback position on its own.
+        if source != CursorSource::Playback {
             self.resume_frame = target;
         }
         self.session_clock_at = std::time::Instant::now();
     }
 
     /// ±N-second jump while playing (§5.3): behaves like a user seek, so
-    /// the position is clamped into an active loop/selection range.
+    /// the position is clamped into an active loop/selection range. The jump
+    /// is computed from the STORED cursor, never from the mid-poll wall-clock
+    /// estimate — otherwise "skip forward at EOF" lands one frame past the
+    /// session end and gets clamped back, losing the whole skip.
     pub fn skip(&mut self, doc: &Document, seconds: i32) {
         let sr = doc.sample_rate.max(1) as i64;
         let delta = seconds as i64 * sr;
-        let pos = self.current_frame_in(doc) as i64;
+        let pos = self.stored_frame() as i64;
         let target = (pos + delta).max(0) as u64;
         self.seek(target, doc, CursorSource::User);
     }
@@ -318,19 +333,20 @@ impl Controller {
     fn position_at(&self, total_frames: u64) -> u64 {
         let eof = total_frames.max(1);
         let lo = self.start_frame.min(eof);
+        // The session covers [start,end): the FINAL frame `end` is a legal
+        // position — it is what the transport shows for one instant at the
+        // natural end of playback before rewinding to the session start
+        // (`tick`, output-thread finish hooks) and where a user seek-to-EOF
+        // lands (§5.3). Only frames BEYOND end are pulled back; extrapolation
+        // itself never runs away because the wall-clock anchor is re-based on
+        // every honest clock sample (see `sync_playback_position_in`).
         let hi = if self.end_frame > self.start_frame {
-            self.end_frame.saturating_sub(1).min(eof).max(lo)
+            self.end_frame.min(eof).max(lo)
         } else {
-            eof
+            eof.saturating_sub(1).max(lo)
         };
         let pos = if self.state == TransportState::Playing {
             let dt = self.session_clock_at.elapsed().as_secs_f64().max(0.0);
-            // Cap the extrapolation window at one poll interval (~50 ms):
-            // without a live device the UI drives `tick`; with one, the poll
-            // re-bases the anchor every ~50 ms anyway. The cap keeps an
-            // un-polled estimate (e.g. after a long stall) from racing far
-            // ahead of the true clock.
-            let dt = dt.min(0.05);
             self.current_frame.saturating_add((dt * self.played_sr.max(1) as f64) as u64)
         } else {
             self.current_frame
@@ -347,6 +363,13 @@ impl Controller {
     /// Current playback position in frames.
     pub fn current_frame(&self) -> u64 {
         self.position_at(u64::MAX)
+    }
+    /// STORED (non-extrapolated) position — the value the last clock sample /
+    /// tick committed. Used by `skip`, which must move relative to the real
+    /// cursor, not to a mid-poll wall-clock estimate that would push a
+    /// seek-to-EOF one frame past the session end and get it clamped back.
+    fn stored_frame(&self) -> u64 {
+        self.current_frame.max(self.start_frame)
     }
     /// Current playback position using the exact document bounds (preferred
     /// when a Document is available — clamps the position to EOF).
@@ -375,7 +398,18 @@ impl Controller {
         let sr = doc.sample_rate.max(1);
         let delta = ((dt.as_secs_f64().max(0.0)) * sr as f64).round().max(0.0) as u64;
         self.played_sr = sr.max(1);
-        let next = self.current_frame.saturating_add(delta);
+        // BUGFIX (loop position drifted ahead of real time on short files):
+        // `tick` used to advance the STORED frame by the handed-out quantum —
+        // but polls arrive late, and every getter in between already showed a
+        // wall-clock extrapolation ahead of that stored value, so each wrap
+        // silently lost the overrun and the loop cursor crept forward faster
+        // than real time. Advance from the same wall-clock anchor the getters
+        // use instead: exact elapsed time, no drift, monotonic wraps.
+        let dt_total = self.session_clock_at.elapsed().as_secs_f64().max(0.0) + dt.as_secs_f64().max(0.0);
+        let est = self
+            .current_frame
+            .saturating_add((dt_total * sr as f64).round().max(0.0) as u64);
+        let next = est.max(self.current_frame.saturating_add(delta));
         let end = if self.end_frame > self.start_frame { self.end_frame } else { doc.total_frames() };
         if next >= end {
             if self.loop_enabled && end > self.start_frame {
