@@ -47,6 +47,14 @@ pub struct SharedOutput {
     /// the audio clock can never be judged "frozen" for samples that simply
     /// were not supposed to have been consumed yet at session start.
     pub session_epoch: AtomicU64,
+    /// BUGFIX (playhead races ahead of the audio; cursor stalls at the right
+    /// edge while a short file keeps playing): how many STREAM samples the
+    /// pump has handed to the Sink but the device has NOT consumed yet —
+    /// i.e. the audible lead of `pump.cursor_frame` over the true playhead.
+    /// Written by `pump_thread` after every append (`fed_total` minus the
+    /// clock), read by the UI poll so the displayed position can never run
+    /// ahead of what actually reached the speakers.
+    pub queued_stream_samples: AtomicU64,
 }
 
 impl Default for SharedOutput {
@@ -58,6 +66,7 @@ impl Default for SharedOutput {
             meter: Mutex::new(MeterData::default()),
             pos_offset: AtomicU64::new(0),
             session_epoch: AtomicU64::new(0),
+            queued_stream_samples: AtomicU64::new(0),
         }
     }
 }
@@ -68,6 +77,34 @@ impl SharedOutput {
     pub fn current_frame(&self, channels: u16) -> u64 {
         let ch = channels.max(1) as u64;
         self.consumed_samples.load(Ordering::Relaxed) / ch
+    }
+
+    /// BUGFIX (playhead races ahead of the audio): the exact number of FILE
+    /// frames the pump has handed to the Sink — i.e. the furthest frame that
+    /// can possibly have reached the speakers. The clock (`consumed_samples`)
+    /// is seeded at the session start and only ever advanced by
+    /// `MeteredSource::publish` for samples the cpal callback actually pulls,
+    /// while `pump.cursor_frame` runs ahead of it by the whole queue lead
+    /// (~0.75 s + one chunk). Adding the still-unplayed remainder of that
+    /// queue back to the true position yields a display ceiling that tracks
+    /// the audible stream exactly, independent of sample-rate / channel
+    /// rescaling between the file and the device stream. Returns `None` when
+    /// no document/queue bookkeeping is available yet.
+    pub fn fed_until_frame(&self, doc: &crate::Document, stream_format: (u32, u16)) -> Option<u64> {
+        let src_rate = doc.sample_rate.max(1) as u64;
+        let dst_rate = stream_format.0.max(1) as u64;
+        let dst_ch = stream_format.1.max(1) as u64;
+        // File-frame span covered by the still-queued stream samples.
+        let queued_frames = self
+            .queued_stream_samples
+            .load(Ordering::Relaxed)
+            .checked_div(dst_ch)?
+            .saturating_mul(src_rate)
+            / dst_rate;
+        let consumed_frames = (self.consumed_samples.load(Ordering::Relaxed) / dst_ch)
+            .saturating_mul(src_rate)
+            / dst_rate;
+        Some(consumed_frames.saturating_add(queued_frames).min(doc.total_frames()))
     }
 }
 
@@ -180,6 +217,10 @@ pub struct RodioOutput {
     /// the pump thread; the pump is signalled through this on every session
     /// change and told to quit when the output is dropped.
     pump: Arc<PumpState>,
+    /// (sample_rate, channels) the OutputStream was actually opened with.
+    /// Needed by `playhead_ceiling_frame` to convert the pump's queue-depth
+    /// bookkeeping (stream samples) back into file frames for the UI cursor.
+    stream_format: (u32, u16),
 }
 
 impl RodioOutput {
@@ -422,7 +463,27 @@ impl RodioOutput {
             last_clock_move: std::time::Instant::now(),
             last_session_epoch: 0,
             pump,
+            stream_format,
         })
+    }
+
+    /// BUGFIX (playhead races ahead of the audio; cursor stalls at the right
+    /// edge while a short file keeps playing): the maximum file frame the UI
+    /// cursor may display for the CURRENT audible state — the true hardware
+    /// position plus whatever the pump has already queued in the Sink but the
+    /// device has not played yet. The wall-clock extrapolation in the app is
+    /// clamped to this ceiling, so the cursor can never show samples that
+    /// have not reached (or are not about to reach) the speakers. `None`
+    /// when no document is loaded into the output yet.
+    pub fn playhead_ceiling_frame(&self, doc: &Document) -> Option<u64> {
+        self.shared.fed_until_frame(doc, self.stream_format)
+    }
+
+    /// File-frame position the pump thread has fed up to (i.e. everything
+    /// below it was handed to the Sink). Used by the UI as a fallback
+    /// ceiling when the queue-depth bookkeeping is unavailable.
+    pub fn pumped_to_frame(&self) -> u64 {
+        self.pump.cursor_frame.load(Ordering::Relaxed)
     }
 
     /// BUGFIX (playback silently freezes ~0.5 s after start with the cursor
