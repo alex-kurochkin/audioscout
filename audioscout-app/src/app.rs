@@ -928,7 +928,31 @@ impl AudioScoutApp {
             // fresher update path.
             let shared = self.output.as_ref().expect("output present").shared.clone();
             let ch = self.document.channels.max(1);
-            let true_frame = shared.current_frame(ch);
+            // BUGFIX (cursor LAGS behind the audio after the runaway fix):
+            // the raw hardware counter (`current_frame`) is fed by
+            // MeteredSource only every 512 samples AND lags the audible
+            // speaker position by the cpal/rodio buffer depth (~0.3-0.75 s —
+            // seconds on a 7 s clip). The previous revision painted and
+            // re-anchored the extrapolation from this lagging value, so the
+            // cursor crawled behind the sound it was supposed to track.
+            // `true_audible_file_frame` is the honest AUDIBLE position: the
+            // per-window truth published inside the cpal callback
+            // (`true_playhead_file_frame`, already converted to file frames)
+            // floored by the raw clock and bounded above by what the pump has
+            // provably handed to the Sink — never ahead of the speakers, but
+            // no longer behind them either.
+            let sf = self
+                .output
+                .as_ref()
+                .map(|out| out.stream_format())
+                .unwrap_or((44100, 2));
+            let true_frame =
+                shared.true_audible_file_frame(self.document.sample_rate.max(1), sf);
+            // Fallback for the pre-first-publish window (fresh session, the
+            // truth field still tagged with an old epoch): the raw clock is
+            // seeded at the session origin and only ever moves forward while
+            // Playing, so it is a safe lower bound — never paint below it.
+            let true_frame = true_frame.max(shared.current_frame(ch));
             // BUGFIX (cursor jump-ahead / snap-back): paint an extrapolated
             // position instead of the raw hardware clock. The clock lags wall
             // time by the sink buffer (~150 ms) plus up to one 50 ms poll
@@ -957,25 +981,45 @@ impl AudioScoutApp {
                 .playhead_est_frame
                 .saturating_add((elapsed * sr) as u64)
                 .max(true_frame);
+            // BUGFIX (cursor LAGS behind the audio): the audible truth
+            // (`true_audible_file_frame`) is published per 512-sample window
+            // inside the cpal callback and additionally trails the speakers
+            // by the device's own output buffer (~30-80 ms of queued stream
+            // samples that are already handed to ALSA/Pulse but not yet
+            // played). The old one-poll-quantum cap pinned the display to
+            // `truth + ~50 ms`, so the cursor systematically ran a visible
+            // fraction of a second BEHIND the sound — seconds-scale on a 7 s
+            // clip. The honest forward bound is the pump ceiling minus what
+            // is still queued unplayed: `pumped_to_frame` is provably audible
+            // or in-flight, so the extrapolation may legitimately sit up to
+            // the queue depth ahead of the published truth. Cap the lead at
+            // max(one poll quantum + device buffer, queue headroom), which
+            // keeps the motion smooth without letting it race again.
             self.playhead_lead_cap_frames = (0.05 * sr) as u64 + 1;
-            let lead_ceiling = true_frame.saturating_add(self.playhead_lead_cap_frames);
+            // Pump ceiling for THIS tick — read once, used both as the lead
+            // headroom below and as the hard clamp after the estimate.
+            self.playhead_fed_ceiling = self
+                .output
+                .as_ref()
+                .and_then(|out| out.playhead_ceiling_frame());
+            let fed_ceiling = self.playhead_fed_ceiling.unwrap_or(true_frame);
+            let queue_headroom = fed_ceiling.saturating_sub(true_frame);
+            let lead_ceiling = true_frame.saturating_add(
+                self.playhead_lead_cap_frames.max(queue_headroom),
+            );
             // BUGFIX (cursor races ahead of the audio and stalls at the right
             // edge while a short file finishes): the pump thread publishes the
             // furthest FILE frame it has handed to the Sink
             // (`playhead_ceiling_frame`). The visible cursor may never display
             // frames above that ceiling — they provably have not reached the
             // device queue yet, so no wall-clock extrapolation is allowed to
-            // paint them. Combined with the one-quantum lead cap this pins the
-            // cursor to the audible position: on a 7 s clip it now reaches the
-            // right edge exactly when the sound does, instead of seconds early.
+            // paint them. Combined with the queue-depth lead cap this keeps the
+            // cursor locked onto the audible stream: on a 7 s clip it reaches
+            // the right edge exactly when the sound does — neither seconds
+            // early (old runaway) nor seconds late (raw lagging clock).
             // `None` (no session engaged / fresh Load-Pause-Stop reset) means
             // "nothing queued yet": fall back to the true clock so the cursor
             // cannot race ahead during the pre-buffer window.
-            self.playhead_fed_ceiling = self
-                .output
-                .as_ref()
-                .and_then(|out| out.playhead_ceiling_frame());
-            let fed_ceiling = self.playhead_fed_ceiling.unwrap_or(true_frame);
             let frame = est.min(lead_ceiling).min(fed_ceiling);
             let frame = match self.playhead_session {
                 Some((_s, e)) => frame.min(e.saturating_sub(1)),
