@@ -55,6 +55,15 @@ pub struct SharedOutput {
     /// clock), read by the UI poll so the displayed position can never run
     /// ahead of what actually reached the speakers.
     pub queued_stream_samples: AtomicU64,
+    /// BUGFIX (playhead races ahead of the audio): the FILE frame the
+    /// hardware is currently playing, published by `MeteredSource::publish`
+    /// on every 512-sample window inside the cpal callback. The raw
+    /// `consumed_samples` counter counts STREAM samples since the buffer was
+    /// created and mixes in the resampling ratio; this field converts it to
+    /// exact file frames once per publish and stores it with Release
+    /// ordering, so the UI poll gets a monotone, race-free truth position
+    /// without redoing the conversion itself.
+    pub true_playhead_file_frame: AtomicU64,
 }
 
 impl Default for SharedOutput {
@@ -67,6 +76,8 @@ impl Default for SharedOutput {
             pos_offset: AtomicU64::new(0),
             session_epoch: AtomicU64::new(0),
             queued_stream_samples: AtomicU64::new(0),
+            true_playhead_file_frame: AtomicU64::new(0),
+            pumped_to_frame: AtomicU64::new(0),
         }
     }
 }
@@ -79,33 +90,27 @@ impl SharedOutput {
         self.consumed_samples.load(Ordering::Relaxed) / ch
     }
 
-    /// BUGFIX (playhead races ahead of the audio): the exact number of FILE
-    /// frames the pump has handed to the Sink — i.e. the furthest frame that
-    /// can possibly have reached the speakers. The clock (`consumed_samples`)
-    /// is seeded at the session start and only ever advanced by
-    /// `MeteredSource::publish` for samples the cpal callback actually pulls,
-    /// while `pump.cursor_frame` runs ahead of it by the whole queue lead
-    /// (~0.75 s + one chunk). Adding the still-unplayed remainder of that
-    /// queue back to the true position yields a display ceiling that tracks
-    /// the audible stream exactly, independent of sample-rate / channel
-    /// rescaling between the file and the device stream. Returns `None` when
-    /// no document/queue bookkeeping is available yet.
-    pub fn fed_until_frame(&self, doc: &crate::Document, stream_format: (u32, u16)) -> Option<u64> {
-        let src_rate = doc.sample_rate.max(1) as u64;
-        let dst_rate = stream_format.0.max(1) as u64;
-        let dst_ch = stream_format.1.max(1) as u64;
-        // File-frame span covered by the still-queued stream samples.
-        let queued_frames = self
-            .queued_stream_samples
-            .load(Ordering::Relaxed)
-            .checked_div(dst_ch)?
-            .saturating_mul(src_rate)
-            / dst_rate;
-        let consumed_frames = (self.consumed_samples.load(Ordering::Relaxed) / dst_ch)
-            .saturating_mul(src_rate)
-            / dst_rate;
-        Some(consumed_frames.saturating_add(queued_frames).min(doc.total_frames()))
+    /// BUGFIX (playhead races ahead of the audio): the FILE frame the pump
+    /// has fed up to — i.e. the furthest frame that can possibly have reached
+    /// the speakers. The UI extrapolation (`poll_playhead` in the app) is
+    /// clamped to this ceiling: everything above it has provably NOT been
+    /// handed to the Sink yet, so the cursor can never show samples that are
+    /// not audible. `pump_thread` writes it with Release ordering after every
+    /// append and after every queue flush; Play/Seek/Stop/Pause sessions are
+    /// frozen at the session start until the first chunk is appended, which
+    /// also keeps the cursor pinned at the true position for the ~0.75 s of
+    /// pre-buffering instead of letting wall-clock extrapolation race to the
+    /// right edge of the player window while a short file keeps playing.
+    pub fn fed_until_frame(&self) -> Option<u64> {
+        Some(self.pumped_to_frame.load(Ordering::Acquire))
     }
+
+    /// File frame the pump thread has fed into the Sink so far (everything
+    /// below it was handed to the device queue; everything above it is not
+    /// audible yet). Written by `pump_thread` with Release ordering after
+    /// every append / queue flush; read by the UI poll through
+    /// `fed_until_frame` as the hard playhead ceiling.
+    pub pumped_to_frame: AtomicU64,
 }
 
 /// Commands accepted by the output controller thread. All transport actions
@@ -662,6 +667,14 @@ struct MeteredSource {
     inner: rodio::buffer::SamplesBuffer<f32>,
     channels: u16,
     shared: Arc<SharedOutput>,
+    // BUGFIX (playhead races ahead of the audio; cursor stalls at the right
+    // edge while a short file keeps playing): the FILE sample rate of the
+    // document this chunk was sliced from. `consumed_samples` counts
+    // RESAMPLED stream samples (device rate × device channels); mapping them
+    // back to file frames requires the exact src_rate/dst_rate ratio used by
+    // `slice_to_buffer`. Stored per source so `publish()` can convert the
+    // true audible position into file units without reaching for the doc.
+    file_sample_rate: u32,
     // BUGFIX (playback dies ~0.5 s after start): the pump paces itself by
     // this counter — it is incremented on `append` and decremented here when
     // the chunk runs dry, so the queue never grows past ~1 s of audio.
@@ -697,8 +710,17 @@ impl Iterator for MeteredSource {
                 // meter are published once per 512-sample window.
                 let idx = self.local_idx;
                 self.local_idx += 1;
+                // BUGFIX (playhead races ahead of the audio): `idx` counts
+                // STREAM samples in this source, but the clock it feeds
+                // (`consumed_samples`) is seeded by the controller at the
+                // session's absolute stream position. The meter's L/R split
+                // must therefore be computed on the ABSOLUTE sample index —
+                // otherwise every chunk after the first starts its parity
+                // from 0 and (for an odd seed) swaps left/right channels in
+                // the volume meters.
+                let abs_idx = self.shared.consumed_samples.load(Ordering::Relaxed) + idx;
                 let av = v.abs();
-                let is_left = self.channels < 2 || (idx % self.channels as u64) == 0;
+                let is_left = self.channels < 2 || (abs_idx % self.channels as u64) == 0;
                 if is_left {
                     if av > self.peak_l { self.peak_l = av; }
                     self.rms_sum_l += (v as f64).powi(2);
@@ -731,6 +753,32 @@ impl MeteredSource {
     /// most once per 512 samples (~11 ms at 44.1 kHz stereo) — cheap enough
     /// for the audio callback even under contention.
     fn publish(&mut self) {
+        // BUGFIX (playhead races ahead of the audio; cursor stalls at the
+        // right edge while a short file keeps playing): `consumed_samples`
+        // must be read FIRST — it is this source's own absolute stream-sample
+        // position at the start of the window being flushed (seeded by the
+        // controller at session start, advanced only here). The previous
+        // version added the fetch_add RETURN value (the pre-increment clock)
+        // to `rms_count` again, double-counting every window and inflating
+        // the true position ~1.4% (512 extra samples per 36k) — a bug in the
+        // bugfix itself that kept the extrapolation ceiling above the real
+        // audible frame and let the cursor race ahead anyway.
+        let consumed = self.shared.consumed_samples.load(Ordering::Relaxed);
+        // Absolute STREAM frames played so far (device rate / device
+        // channels), then mapped back into FILE frames with the exact
+        // resampling ratio used by `slice_to_buffer` for this chunk:
+        // out_frames = file_frames * dst_rate / src_rate. Because every
+        // chunk is emitted with the device's own sample rate/channels,
+        // `inner.sample_rate()`/`channels` ARE the stream format here.
+        let stream_frames = consumed / self.channels.max(1) as u64;
+        let dst_rate = self.inner.sample_rate().max(1) as u64;
+        let src_rate = self.file_sample_rate.max(1) as u64;
+        let file_frame_true = stream_frames.saturating_mul(src_rate) / dst_rate;
+        // Publish the ground-truth audible position before advancing the
+        // raw clock, both with ordering strong enough for the UI poll:
+        // Acquire on the load pairs with the pump/controller Release stores
+        // (session seeds), Release on the store publishes to the reader.
+        self.shared.true_playhead_file_frame.store(file_frame_true, Ordering::Release);
         // Advance the global clock by the number of samples produced since
         // the last publish (store-free: relative update keeps pause/resume
         // and cross-source appends consistent).
@@ -1407,7 +1455,6 @@ fn pump_thread(pump: Arc<PumpState>, stream_format: (u32, u16)) {
             continue;
         }
 
-        let ch_file = d.channels.max(1);
         // The pump publishes into the same SharedOutput clock that the
         // controller thread and the UI poll read (wired up in RodioOutput::new).
         let shared_for_chunk = match pump.shared.as_ref() {
@@ -1415,10 +1462,19 @@ fn pump_thread(pump: Arc<PumpState>, stream_format: (u32, u16)) {
             None => Arc::new(SharedOutput::default()),
         };
         let buffer = slice_to_buffer(&d, cursor, next_end, stream_format);
+        // BUGFIX (playhead races ahead of the audio): `MeteredSource` taps
+        // samples for the meter in STREAM units but must publish the true
+        // audible position in FILE frames. The channel count used for the
+        // clock division therefore has to be the STREAM channel count
+        // (`stream_format.1`) — `slice_to_buffer` already up/down-mixed the
+        // data to it — while the meter's L/R split below tracks the same
+        // interleaving. The file sample rate is carried per source so
+        // `publish()` can undo the resampling ratio exactly.
         let metered = MeteredSource {
             inner: buffer,
-            channels: ch_file,
+            channels: stream_format.1.max(1),
             shared: shared_for_chunk,
+            file_sample_rate: d.sample_rate.max(1),
             local_idx: 0,
             rms_sum_l: 0.0,
             rms_sum_r: 0.0,
@@ -1432,6 +1488,15 @@ fn pump_thread(pump: Arc<PumpState>, stream_format: (u32, u16)) {
         sink.append(metered);
         queued_chunks.fetch_add(1, Ordering::AcqRel);
         pump.cursor_frame.store(next_end, Ordering::Relaxed);
+        // BUGFIX (playhead races ahead of the audio; cursor stalls at the
+        // right edge while a short file keeps playing): publish the fed-up-to
+        // frame with Release ordering so the UI poll's clamp
+        // (`SharedOutput::fed_until_frame`) never lags behind what was really
+        // handed to the Sink and never lets the wall-clock extrapolation run
+        // ahead of the audible stream.
+        if let Some(sh) = pump.shared.as_ref() {
+            sh.pumped_to_frame.store(next_end, Ordering::Release);
+        }
         LAST_FED_CURSOR.with(|c| c.set(next_end));
     }
 }
