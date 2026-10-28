@@ -253,14 +253,34 @@ impl Controller {
         // between the stored position and EOF must not drag the display
         // backwards mid-session.
         let stored = self.current_frame;
-        let rewound = frame < stored;
-        let est = self.position_at(u64::MAX);
-        if rewound || frame >= est {
-            self.current_frame = frame;
-            // Keep the resume point following the live position (§5.3 pause
-            // resumes where playback actually is).
-            self.resume_frame = frame;
+        // BUGFIX (elapsed time wrong during playback, very visible on short
+        // files): a hardware sample that lands at or below the last ACCEPTED
+        // sample while no legitimate rewind happened carries ZERO new forward
+        // progress — it only lags behind wall time by the sink buffer depth.
+        // Re-anchoring the estimate at such a sample used to erase the true
+        // elapsed time since the last accepted sample and re-start counting
+        // from the stale clock reading: every poll whose sample did not beat
+        // the running estimate silently reset the anchor, so the displayed
+        // position crawled far slower than real time (a 2 s clip showed a
+        // few hundred ms of "elapsed" after two seconds). Only an advancing
+        // or a legitimately rewound sample may move the anchor now; anything
+        // else leaves the smooth wall-clock extrapolation undisturbed.
+        // The comparison base is `resume_frame` (the last accepted sample),
+        // NOT `current_frame`: while Playing, getters extrapolate ahead of
+        // `current_frame` between polls, and comparing against that moving
+        // estimate would reject every regular hardware sample.
+        let last_accepted = self.resume_frame;
+        if frame < stored && frame >= last_accepted {
+            // A sample inside the gap between the last accepted one and the
+            // extrapolated display position: keep the smooth motion alive.
+            return;
         }
+        // Fresh forward sample (or a legitimate rewind — seek / loop wrap /
+        // session restart): adopt it verbatim and re-base the estimate here.
+        self.current_frame = frame;
+        // Keep the resume point following the live position (§5.3 pause
+        // resumes where playback actually is).
+        self.resume_frame = frame;
         self.session_clock_at = std::time::Instant::now();
         self.playhead.set_position_samples(self.current_frame);
     }
@@ -285,8 +305,27 @@ impl Controller {
     /// Freeze the resume point at an externally measured position (pause).
     /// The output thread performs this AFTER `pause()`, overwriting the
     /// wall-clock snapshot with the exact hardware-clock position (§5.3).
+    ///
+    /// BUGFIX (elapsed time wrong during playback, very visible on short
+    /// files): while Playing this hook used to jump `current_frame` straight
+    /// onto the raw audio clock and re-anchor the wall-clock estimate there.
+    /// That clock always lags real time by the sink buffer depth (~150 ms),
+    /// so every replay of it dragged the displayed elapsed time backwards —
+    /// the position kept snapping back to "hardware clock − buffer lag" and
+    /// had to crawl that lag out again, making elapsed time run visibly slow
+    /// (a whole short clip appeared to take several times its real length).
+    /// Now a lagging sample (one at or behind the running estimate) never
+    /// moves the live position while Playing; only Pause/Stop snapshots may
+    /// be overwritten with the exact hardware value.
     pub fn freeze_resume_at(&mut self, frame: u64, sample_rate: u32) {
         self.played_sr = sample_rate.max(1);
+        if self.state == TransportState::Playing {
+            // Live session: adopt the sample only if it is genuinely ahead
+            // of the wall-clock estimate (or marks a legitimate rewind) —
+            // exactly like `sync_playback_position`.
+            self.sync_playback_position_in(frame, None);
+            return;
+        }
         self.current_frame = frame; self.resume_frame = frame;
         self.session_clock_at = std::time::Instant::now();
         self.playhead.set_position_samples(frame);
@@ -519,7 +558,11 @@ mod tests {
     fn natural_end_of_non_loop_session_rewinds_and_stops() {
         let (mut c, doc) = controller_with_doc(1000, 1);
         c.play(&doc, Some((0, 500)));
-        c.freeze_resume_at(500, 1000);
+        // The session is live (Playing) here, so the hardware-clock sample
+        // must not snap the estimate backwards — it only re-bases when it
+        // genuinely advances past it (see `lagging_audio_clock_never_drags_
+        // elapsed_backwards`). Finish the session explicitly afterwards.
+        c.sync_playback_position(500);
         // Output-thread hook: natural completion rewinds to session start.
         c.finish_session_at(c.start_frame());
         assert_eq!(c.state(), TransportState::Stopped);
@@ -707,5 +750,70 @@ mod tests {
         assert_eq!(capped, 199, "estimate over-ran the short session end: {capped}");
         let secs = c.current_secs(doc.sample_rate);
         assert!(secs <= 0.2 + 1e-9, "current_secs exceeded duration: {secs}");
+    }
+
+    /// Helper: simulate `ms` of playback by advancing the stored frame at the
+    /// nominal rate and re-anchoring the wall-clock estimate exactly like the
+    /// real hooks do (`tick` does the same with real durations). Lets timing
+    /// tests run deterministically without sleeping.
+    fn advance_playing(c: &mut Controller, ms: u64) {
+        let delta = ms * (c.played_sr.max(1) as u64) / 1000;
+        c.current_frame = c.current_frame.saturating_add(delta);
+        c.resume_frame = c.current_frame;
+        c.session_clock_at = std::time::Instant::now();
+    }
+
+    #[test]
+    fn lagging_sink_samples_never_reset_the_wall_clock_anchor() {
+        // BUGFIX regression (elapsed time wrong during playback, very visible
+        // on short files): the UI polls the raw audio clock every 50 ms. That
+        // clock lags wall time by the sink buffer depth, so each sample sits
+        // BEHIND the running estimate. The old code adopted such samples and
+        // unconditionally re-anchored the extrapolation there — erasing the
+        // true elapsed time on every poll, so the displayed position crawled
+        // far slower than real time. Samples that carry no new forward
+        // progress must now leave the estimate completely undisturbed.
+        let (mut c, doc) = controller_with_doc(10_000, 1); // sr=1000 → 1 fr/ms
+        c.play(&doc, Some((0, 10_000)));
+        for _ in 0..10 {
+            advance_playing(&mut c, 50); // 50 ms of real playback per poll
+            // The hardware clock is stuck ~150 frames behind the estimate
+            // (buffer lag) but still creeping forward between polls.
+            let hw = c.current_frame - 150;
+            c.sync_playback_position(hw);
+        }
+        // 500 ms of playback must be reflected after 10 × 50 ms polls — the
+        // lagging samples may not shave the elapsed time off.
+        let pos = c.current_frame_in(&doc);
+        assert!((pos as i64 - 500).abs() <= 5, "lagging clock reset the anchor: pos={pos}, expected ≈500");
+    }
+
+    #[test]
+    fn playhead_update_events_do_not_snap_elapsed_backwards() {
+        // BUGFIX regression: while Playing, app.rs feeds every raw
+        // PlayheadUpdate (a lagging hardware-clock snapshot) into
+        // freeze_resume_at. That used to teleport current_frame back onto the
+        // stale clock and restart counting from it — repeatedly losing the
+        // buffered lead (~150 ms per event), which made elapsed time run
+        // visibly slow and non-monotonic, most noticeable on short files.
+        let (mut c, doc) = controller_with_doc(10_000, 1);
+        c.play(&doc, Some((0, 10_000)));
+        let mut last_pos = 0u64;
+        for _ in 0..10 {
+            advance_playing(&mut c, 50);
+            let hw = c.current_frame - 150; // lagging event payload
+            c.freeze_resume_at(hw, doc.sample_rate);
+            let pos = c.current_frame_in(&doc);
+            assert!(pos >= last_pos, "elapsed jumped backwards: {last_pos} -> {pos}");
+            last_pos = pos;
+        }
+        let pos = c.current_frame_in(&doc);
+        assert!((pos as i64 - 500).abs() <= 5, "event replay ate the elapsed time: pos={pos}");
+        // Paused/stopped snapshots must still land exactly on the measured
+        // hardware position (the documented purpose of the hook).
+        c.pause();
+        c.freeze_resume_at(777, doc.sample_rate);
+        assert_eq!(c.current_frame(), 777);
+        assert_eq!(c.resume_frame(), 777);
     }
 }
