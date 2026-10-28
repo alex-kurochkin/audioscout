@@ -1216,6 +1216,23 @@ impl eframe::App for AudioScoutApp {
                 self.meter_hold.peak_l *= k; self.meter_hold.peak_r *= k;
             }
         }
+        // BUGFIX (wheel zoom in the player stopped working): the scroll delta
+        // is consumed inside the audio-view panel below, but egui's InputState
+        // only reports a NON-ZERO `smooth_scroll_delta` while the pointer is
+        // actually hovering some widget. After playback starts the mouse sits
+        // still over the waveform and egui stops emitting hover updates for
+        // widgets whose area did not change (`hovered_widget` keeps its stale
+        // rect from the previous frame), so `smooth_scroll_delta.y` reads 0
+        // and neither the Ctrl+wheel zoom nor plain wheel horizontal scroll
+        // fires until the user moves the mouse again. Force a repaint on every
+        // real scroll event so the input state — and with it the pointer
+        // position used by the zoom handler — is re-evaluated each frame.
+        ctx.on_request_repaint(move |_, data| {
+            if data.input(|i| i.smooth_scroll_delta != egui::Vec2::ZERO) {
+                data.request_repaint();
+            }
+        });
+
         self.process_events(ctx);
         self.handle_keyboard(ctx);
         // 50 ms playhead poll (§1.2/§5.3): with a live output the position
