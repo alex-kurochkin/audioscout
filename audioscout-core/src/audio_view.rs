@@ -80,7 +80,15 @@ impl AudioView {
         let new_start = (self.view_range.start_frame as i64 + delta).max(0).min(self.total_frames as i64 - len) as u64;
         self.view_range = ViewRange::new(new_start, new_start + len as u64);
     }
-    pub fn scroll_horizontal(&mut self, fraction: f64) { let delta = (self.view_range.len() as f64 * fraction) as i64; self.pan(delta); }
+    /// Horizontal pan by a fraction of the visible window. The old version
+    /// moved the view by `len * fraction` FRAMES, which at any reasonable
+    /// zoom is effectively zero (e.g. 100 k visible frames × 0.01 wheel notch
+    /// = 1 frame — "scrolling does nothing"). A notch now moves ~25% of the
+    /// screen, matching a normal scrollbar page-step feel.
+    pub fn scroll_horizontal(&mut self, fraction: f64) {
+        let delta = (self.view_range.len() as f64 * fraction * 25.0) as i64;
+        self.pan(delta);
+    }
     pub fn set_cursor(&mut self, frame: u64) { self.cursor_frame = frame.min(self.total_frames); }
     pub fn auto_scroll_to_cursor(&mut self) {
         if !self.auto_scroll { return; }

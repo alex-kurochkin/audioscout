@@ -141,17 +141,15 @@ pub struct AudioScoutApp {
     playhead_fed_ceiling: Option<u64>,
     /// BUGFIX (wheel zoom in the player stopped working): raw vertical wheel
     /// delta (`MouseWheel` events, in points) snapshotted at the start of
-    /// `update()` — before any ScrollArea can consume `smooth_scroll_delta` —
-    /// and taken by the audio-view panel when the pointer hovers it. See the
-    /// handler in `update()` for the full rationale.
-    pending_wheel_delta: Option<f32>,
+    /// `update()` — before any ScrollArea can consume `smooth_scroll_delta`.
+    /// The audio-view panel reads it every frame and decides ownership itself
+    /// against its FRESH rect (see the handler in that panel); doing the
+    /// ownership test up in `update()` against last frame's published rect
+    /// was what silently dropped the first wheel notch after entering the
+    /// view ("buttons work, wheel doesn't").
+    raw_wheel_dy: f32,
     /// Rect of the audio-view content area, recorded by the panel itself on
-    /// every frame. The wheel handler at the top of `update()` tests the live
-    /// pointer against THIS rect to decide who owns `pending_wheel_delta`.
-    /// (Previous attempts used `Memory::area_rect(Id::new("audio_view"))`,
-    /// which never matched the inner `Ui`'s id and always returned `None` —
-    /// so the audio view never claimed the delta and wheel zoom silently did
-    /// nothing while the +/- buttons kept working.)
+    /// every frame (kept for diagnostics / future hit-tests).
     audio_view_rect: Option<egui::Rect>,
 }
 
@@ -257,7 +255,7 @@ impl AudioScoutApp {
             // No session engaged yet — the pump publishes the real ceiling
             // after its first append (see `poll_playhead`).
             playhead_fed_ceiling: None,
-            pending_wheel_delta: None,
+            raw_wheel_dy: 0.0,
             audio_view_rect: None,
         };
 
@@ -1281,48 +1279,21 @@ impl eframe::App for AudioScoutApp {
                 self.meter_hold.peak_l *= k; self.meter_hold.peak_r *= k;
             }
         }
-        // BUGFIX (wheel zoom / wheel pan in the player stopped working):
-        // egui's `InputState::smooth_scroll_delta` is CONSUMED by whichever
-        // ScrollArea runs first in the frame — the file list's vertical
-        // ScrollArea sits in the CentralPanel, which egui processes BEFORE
-        // the bottom panels are laid out. Once the file list has eaten the
-        // delta, the audio-view handler below read 0 and neither Ctrl+wheel
-        // zoom nor plain-wheel horizontal pan fired (the +/- buttons kept
-        // working because they call `zoom_in()/zoom_out()` directly). The
-        // raw wheel events are untouched by consumption, so snapshot them
-        // here — at the very start of `update`, before any panel can drain
-        // the stream — and hand the delta to the audio view via
-        // `pending_wheel_delta`. A second copy of the same snapshot covers
-        // the case where the pointer hovers nothing scrollable at all.
-        //
-        // IMPORTANT: ownership of the delta is decided HERE, against the
-        // live pointer position and the audio-view panel rect, not inside
-        // the panel via `response.hovered()`. `Response::hovered()` reports
-        // the PREVIOUS frame's hover state; when a MouseWheel event arrives
-        // in the very same frame as the mouse-move that entered the view
-        // (the common "move mouse over the wave, start scrolling" case),
-        // the panel still believes the pointer is elsewhere, never calls
-        // `take()`, and the zoom silently does nothing. Checking the actual
-        // pointer coords against the panel rect removes that one-frame race.
-        //
-        // BUGFIX (wheel zoom stopped working AGAIN): the rect lookup used to
-        // go through `Memory::area_rect(Id::new("audio_view"))`, but egui
-        // registers areas under the *inner Ui's* generated id, not under the
-        // panel's string id — so the lookup returned `None` on every frame,
-        // `pointer_over_audio_view` was always false, `pending_wheel_delta`
-        // stayed `None`, and the wheel handler inside the panel never saw a
-        // delta (the +/- buttons kept working because they call
-        // `zoom_in()/zoom_out()` directly). The audio-view panel now records
-        // its exact content rect into `self.audio_view_rect` every frame
-        // (see the panel below); we test the pointer against that rect. It
-        // is one frame stale at most — during continuous scrolling it is
-        // exact, and even the first wheel notch after entering the view is
-        // handled because the pointer had to move (triggering a repaint)
-        // before it could scroll there.
-        let audio_view_rect = self.audio_view_rect;
-        let (wheel_dy, pointer_over_audio_view) = ctx.input(|i| {
-            let dy = i
-                .events
+        // BUGFIX (wheel zoom in the player stopped working; the +/- buttons
+        // kept working): egui's `InputState::smooth_scroll_delta` is CONSUMED
+        // by whichever ScrollArea runs first in the frame — the file list's
+        // vertical ScrollArea sits in the CentralPanel, which egui lays out
+        // BEFORE the bottom audio-view panel. By the time the panel read the
+        // smooth delta it was always 0, so no zoom/pan ever fired from there.
+        // Raw `MouseWheel` events are not consumed by scrolling, so snapshot
+        // their sum here — at the very start of `update()`, before any panel
+        // can drain them — into `self.raw_wheel_dy`. The audio-view panel
+        // then decides ownership itself against its FRESH rect inside its own
+        // closure; deciding it up here against last frame's published rect
+        // was the other half of the bug (the first notch after moving into
+        // the view hit a stale/absent rect and was silently dropped).
+        self.raw_wheel_dy = ctx.input(|i| {
+            i.events
                 .iter()
                 .filter_map(|e| match e {
                     egui::Event::MouseWheel { unit, delta, .. } => match unit {
@@ -1332,31 +1303,13 @@ impl eframe::App for AudioScoutApp {
                     },
                     _ => None,
                 })
-                .sum::<f32>();
-            let over_view = dy != 0.0
-                && i.pointer.hover_pos().is_some_and(|p| {
-                    audio_view_rect.is_some_and(|r| r.contains(p))
-                });
-            (dy, over_view)
+                .sum::<f32>()
         });
-        // Only claim the delta when the pointer actually hovers the audio
-        // view; otherwise drop it so the file list / other scroll areas
-        // keep their normal wheel behaviour and stale deltas from earlier
-        // frames never leak into a later zoom action.
-        self.pending_wheel_delta = pointer_over_audio_view.then_some(wheel_dy);
-        // BUGFIX (wheel zoom "works once, then stops working"): egui only
-        // repaints when something interesting happens, and by default a
-        // MouseWheel event does NOT schedule a repaint on its own — only
-        // events that touch an interactive widget do (scroll areas, buttons,
-        // …). The audio view's `Sense::click_and_drag` response ignores the
-        // wheel, so without this call the first notch after entering the
-        // view is processed (the preceding pointer move scheduled the frame)
-        // but every following notch arrives in a frame that was never
-        // requested — the OS delivers the events, nobody redraws, and zoom
-        // appears to "stop working" until the mouse moves again. Requesting
-        // a repaint whenever we claimed a delta keeps the wheel responsive
-        // for continuous scrolling with a stationary pointer.
-        if pointer_over_audio_view {
+        if self.raw_wheel_dy != 0.0 {
+            // egui does not schedule a repaint for wheel events that no
+            // interactive widget consumed; without this, consecutive notches
+            // with a stationary pointer arrived in frames nobody requested
+            // and zoom looked like it "stopped working after one notch".
             ctx.request_repaint();
         }
 
@@ -1696,58 +1649,55 @@ impl eframe::App for AudioScoutApp {
                 }
             }
 
-            // BUGFIX (wheel zoom / horizontal wheel pan stopped working):
-            // `ui.input(|i| i.smooth_scroll_delta)` used to be read here,
-            // but by the time this bottom panel runs, the file list's
-            // ScrollArea in the CentralPanel has already CONSUMED the delta
-            // for its own scrolling — the value arrived as 0 and neither
-            // Ctrl+wheel zoom nor plain-wheel pan reacted (the +/- buttons
-            // kept working). `pending_wheel_delta` is snapshotted at the top
-            // of `update()` from the raw MouseWheel events, before any panel
-            // can drain them; ownership was already decided there against
-            // the LIVE pointer position and this panel's rect (see the
-            // handler in `update()`), so here we simply take it — reading
-            // `response.hovered()` instead would use last frame's hover
-            // state and swallow the delta whenever a wheel event arrives in
-            // the same frame the pointer entered the view (zoom "stopped
-            // working" regression).
             // UX: pointing-hand cursor while the pointer is over the audio
             // view (it accepts clicks-to-seek and drags — same affordance as
-            // the buttons). The wheel handler below may consume this frame's
-            // delta; the hand must still show when merely hovering, so it is
-            // driven by the live pointer position against `rect`, not by
-            // `response.hovered()` (last-frame state).
+            // the buttons). Driven by the live pointer position against
+            // `rect`, not by `response.hovered()` (last-frame state).
             if ctx.input(|i| i.pointer.hover_pos().is_some_and(|p| rect.contains(p))) {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
             }
 
-            let wheel_dy = self.pending_wheel_delta.take();
-            if let Some(dy) = wheel_dy {
-                // BUGFIX (wheel zoom stopped working AGAIN, second half):
-                // zoom used to be gated behind Ctrl. On Linux/Wayland/X11
-                // egui reports the wheel with `MouseWheelUnit::Line` and no
-                // modifier, so plain scrolling never reached `zoom_at_x` at
-                // all — it only panned, which on a fully zoomed-out view is
-                // a visual no-op ("zoom does nothing, buttons work"). The
-                // documented interaction (§3.5) is plain-wheel zoom in the
-                // player window; handle every claimed notch as zoom centered
-                // on the pointer, and keep horizontal pan for the Shift key
-                // (the conventional "wheel scrolls sideways" modifier).
-                let shift = ctx.input(|i| i.modifiers.shift);
+            // BUGFIX (wheel zoom in the player stopped working, buttons kept
+            // working): two independent breakages were stacked here.
+            //  1. The delta was read from `smooth_scroll_delta` *inside* this
+            //     bottom panel, but egui lays out the CentralPanel first and
+            //     the file list's ScrollArea CONSUMES the smooth delta before
+            //     we ever see it -> always 0. Raw `MouseWheel` events are not
+            //     consumed; `self.raw_wheel_dy` snapshots their sum at the top
+            //     of `update()`, before any panel runs.
+            //  2. Ownership used to be decided up there against
+            //     `self.audio_view_rect` — the PREVIOUS frame's rect. On the
+            //     first notch after entering the view (or right after a panel
+            //     resize) the stale/absent rect failed the containment test,
+            //     the delta was never claimed, and the notch was silently
+            //     dropped. Now the handler lives INSIDE the panel closure and
+            //     tests the live pointer against THIS frame's fresh `rect`;
+            //     when the pointer is elsewhere the delta is ignored so the
+            //     file list / sliders keep normal wheel scrolling.
+            let dy = self.raw_wheel_dy;
+            let live_over =
+                ctx.input(|i| i.pointer.hover_pos().is_some_and(|p| rect.contains(p)));
+            if live_over && dy != 0.0 {
+                let mods = ctx.input(|i| (i.modifiers.ctrl, i.modifiers.shift));
                 let pos = ctx.input(|i| i.pointer.hover_pos());
-                if shift {
+                let x_ratio = pos
+                    .map(|p| ((p.x - rect.left()) / rect.width()).clamp(0.0, 1.0))
+                    .unwrap_or(0.5_f32) as f64;
+                // TZ §9.1: Shift+wheel pans horizontally; Ctrl+wheel zooms
+                // around the pointer X (step 1.25x). Plain wheel also zooms —
+                // the historical default here, keeping scroll-to-zoom for
+                // users who never touch Ctrl.
+                if mods.1 {
                     self.audio_view.scroll_horizontal(-dy as f64 * 0.01);
                 } else if dy > 0.0 {
-                    if let Some(pos) = pos {
-                        let x_ratio = ((pos.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
-                        self.audio_view.zoom_at_x(1.25, x_ratio as f64);
-                    }
-                } else if dy < 0.0 {
-                    if let Some(pos) = pos {
-                        let x_ratio = ((pos.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
-                        self.audio_view.zoom_at_x(1.0 / 1.25, x_ratio as f64);
-                    }
+                    self.audio_view.zoom_at_x(1.25, x_ratio);
+                } else {
+                    self.audio_view.zoom_at_x(1.0 / 1.25, x_ratio);
                 }
+                // Zoom/pan must schedule its own repaint: egui does not redraw
+                // for wheel events that no interactive widget consumed, which
+                // made consecutive notches look frozen until the mouse moved.
+                ctx.request_repaint();
             }
         });
 
