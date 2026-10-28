@@ -10,7 +10,7 @@ use audioscout_core::db::Database;
 use audioscout_core::audio_io::PcmFile;
 use audioscout_core::disk::DiskProvider;
 use audioscout_core::preview_worker::{PreviewWorker, PreviewJob};
-use audioscout_core::{Document, EventChannel, Marker, PreviewMode, UiEvent, is_editable_file};
+use audioscout_core::{Document, EventChannel, Marker, PreviewMode, UiEvent, is_audio_file, is_editable_file};
 use crossbeam_channel::Receiver;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -89,6 +89,30 @@ pub struct AudioScoutApp {
     /// thread is the primary source of PlayheadUpdate events; this throttle
     /// only drives the cursor when no real audio device is available).
     last_playhead_poll: std::time::Instant,
+    /// BUGFIX (playback freezes ~0.5 s after start): set once per detected
+    /// audio-stream stall so the status-bar message is shown a single time
+    /// and re-armed when playback resumes (`poll_playhead` clears it on
+    /// every non-stalled tick).
+    stall_notified: bool,
+    /// BUGFIX (cursor jumps ahead then snaps back while playing): the real
+    /// audio clock (`consumed_samples`) lags behind wall time by the size of
+    /// the sink/pump buffer (~150 ms) plus one 50 ms poll quantum. If the UI
+    /// paints that raw lagging value, every poll tick moves the cursor in
+    /// discrete steps and any transient over-forward position (e.g. a
+    /// PlayheadUpdate event racing ahead of the hardware clock) must be
+    /// "corrected" backwards on the next tick — the visible jump-ahead /
+    /// snap-back oscillation, which grows as the buffered lead accumulates
+    /// and is most noticeable on short files. Instead the UI extrapolates
+    /// the clock forward between polls at exactly the nominal playback rate
+    /// (never past the session end), so motion is smooth and monotonic; the
+    /// small extrapolation error (< one poll quantum) is absorbed gradually
+    /// because the estimate is always kept >= the true clock.
+    playhead_est_frame: u64,
+    /// Wall-clock instant that corresponds to `playhead_est_frame`.
+    playhead_est_at: std::time::Instant,
+    /// Session bounds [start,end) currently being played — used to clamp the
+    /// extrapolated cursor so it can never run past the end of a short file.
+    playhead_session: Option<(u64, u64)>,
 }
 
 impl AudioScoutApp {
@@ -147,6 +171,12 @@ impl AudioScoutApp {
         // kept alive for the whole session (tz §5.2). Without an audio device
         // RodioOutput::new returns None and playback is silently unavailable.
         let output = RodioOutput::new(player.clone(), event_tx.clone());
+        // DEBUG (playback diagnostics): a None here means the audio device
+        // never opened — Play can then only run the state machine, no sound.
+        match &output {
+            Some(_) => tracing::info!("[app] audio output initialized OK"),
+            None => tracing::error!("[app] NO AUDIO OUTPUT (RodioOutput::new returned None) — playback will be silent; check '[output]' error lines above and libasound2/cpal device availability"),
+        }
         let undo_dir = config_dir.join("undo");
         let undo_stack = UndoStack::new(undo_dir, config_store.config().undo_depth, config_store.config().undo_disk_limit_mb);
         let preview_worker = PreviewWorker::new(event_tx.clone());
@@ -177,6 +207,10 @@ impl AudioScoutApp {
             view_spectro_key: None,
             document_generation: 0,
             last_playhead_poll: std::time::Instant::now(),
+            stall_notified: false,
+            playhead_est_frame: 0,
+            playhead_est_at: std::time::Instant::now(),
+            playhead_session: None,
         };
 
         // Restore the two independent Waveform/Spectrogram toggles from the
@@ -371,9 +405,24 @@ impl AudioScoutApp {
                     if self.output.is_some() && self.player_state() == TransportState::Playing {
                         let mut ctrl = self.player.lock().unwrap_or_else(|p| p.into_inner());
                         ctrl.freeze_resume_at(frame);
+                        drop(ctrl);
+                        // BUGFIX (cursor jump-ahead / snap-back): this event
+                        // carries the raw hardware clock, which LAGS wall time
+                        // by the sink buffer depth. Feeding it straight into
+                        // `set_cursor` made the painted cursor jump ahead
+                        // (poll tick extrapolation) and then snap back here
+                        // (stale true clock) every cycle. During live playback
+                        // the poll in `poll_playhead` is the single source of
+                        // truth for the visible cursor; this path only keeps
+                        // the controller's resume point fresh.
+                        if self.playhead_session.is_none() {
+                            self.audio_view.set_cursor(frame);
+                            self.audio_view.auto_scroll_to_cursor();
+                        }
+                    } else {
+                        self.audio_view.set_cursor(frame);
+                        self.audio_view.auto_scroll_to_cursor();
                     }
-                    self.audio_view.set_cursor(frame);
-                    self.audio_view.auto_scroll_to_cursor();
                 }
                 UiEvent::PlaybackFinished => { self.status_message = "Playback finished".to_string(); }
                 UiEvent::VolumeMeterUpdate { peak_l, peak_r, rms_l, rms_r } => {
@@ -405,11 +454,25 @@ impl AudioScoutApp {
     }
 
     fn load_file(&mut self, path: &Path) {
-        if !is_editable_file(path) { self.status_message = "File format not editable".to_string(); return; }
+        // All supported audio formats load into the player (§3.4: playback must
+        // work for non-editable files too). "Editable" (PCM read/write) only
+        // gates destructive edit operations (mute/normalize/save), never
+        // loading or playback — see `apply_mute`/`apply_normalize`.
+        if !is_audio_file(path) {
+            self.status_message = "Unsupported file format".to_string();
+            return;
+        }
         self.transport_stop();
         self.player.lock().unwrap_or_else(|p| p.into_inner()).reset();
         match audioscout_core::audio_io::load_audio(path) {
             Ok((samples, sr, ch, st)) => {
+                // DEBUG (playback diagnostics): frames==0 here means the file
+                // decoded to an empty buffer — Play would compute end==start
+                // and drop the append.
+                tracing::info!("[load] OK {path:?} samples={} sr={sr} ch={ch} frames={}", samples.len(), samples.len() / (ch.max(1) as usize));
+                // BUGFIX (sticky "not editable" message): a successful load
+                // must clear any stale status from a previously rejected file.
+                self.status_message.clear();
                 self.document = Document {
                     samples, sample_rate: sr, channels: ch, markers: Vec::new(),
                     source_path: path.to_path_buf(), temp_path: None, dirty: false, sample_type: st,
@@ -433,7 +496,7 @@ impl AudioScoutApp {
                 // Build peaks tree cache for fast waveform rendering
                 self.rebuild_peaks_cache();
             }
-            Err(e) => { self.status_message = format!("Load failed: {}", e); }
+            Err(e) => { tracing::error!("[load] FAILED {path:?}: {e}"); self.status_message = format!("Load failed: {}", e); }
         }
     }
 
@@ -647,7 +710,12 @@ impl AudioScoutApp {
         if state == TransportState::Playing {
             // Pause: freeze position + in-flight PCM (§5.3). Without a real
             // output device the state machine alone carries the semantics.
+            tracing::debug!("[play] pause pressed (state={state:?})");
             if let Some(out) = &self.output { out.pause(); }
+            // BUGFIX (cursor jump-ahead / snap-back): stop extrapolating while
+            // paused; freeze the estimate at the true hardware clock so a
+            // later resume re-arms it from a consistent point.
+            self.playhead_session = None;
             let mut ctrl = self.player.lock().unwrap_or_else(|p| p.into_inner());
             ctrl.pause();
         } else {
@@ -655,10 +723,39 @@ impl AudioScoutApp {
             let start = sel.map(|(a, _)| a).unwrap_or_else(|| {
                 self.player.lock().unwrap_or_else(|p| p.into_inner()).resume_frame()
             });
-            let end = sel.map(|(_, b)| b).unwrap_or(0);
+            // BUGFIX (play never starts): with no selection the session must
+            // run to EOF. Passing 0 here made Cmd::Play compute `e > s` as
+            // false for every start==0 file and silently drop the append —
+            // the button toggled but nothing played.
+            let end = sel.map(|(_, b)| b).unwrap_or(self.document.total_frames());
+            // DEBUG (playback diagnostics): the full decision context at the
+            // exact moment the user presses Play/Space. If playback does not
+            // start, one of these values names the culprit:
+            //   output=None          → audio device failed to open at startup
+            //                          (see "[output] ... FAILED" lines),
+            //   total_frames=0       → the document is empty/not loaded,
+            //   e <= s               → degenerate range, dropped by apply_play.
+            tracing::info!(
+                "[play] pressed state={state:?} sel={sel:?} start={start} end={end} \
+                 total_frames={} sr={} ch={} output={} path={:?}",
+                self.document.total_frames(),
+                self.document.sample_rate,
+                self.document.channels,
+                self.output.is_some(),
+                self.active_file,
+            );
             if let Some(out) = &self.output {
                 out.play(start, end);
             }
+            // BUGFIX (cursor jump-ahead / snap-back): (re)arm the UI-side
+            // extrapolation exactly at the session start. The hardware clock
+            // will read ~start for the next ~150 ms while the sink buffer
+            // drains; without this re-arming the stale estimate from the
+            // previous run would be blended in and the cursor would visibly
+            // jump back to `start` after having shown a later position.
+            self.playhead_est_frame = start;
+            self.playhead_est_at = std::time::Instant::now();
+            self.playhead_session = if end > start { Some((start, end)) } else { Some((start, self.document.total_frames())) };
             let mut ctrl = self.player.lock().unwrap_or_else(|p| p.into_inner());
             if self.output.is_some() {
                 // With a live output the state machine must not advance on its
@@ -672,12 +769,22 @@ impl AudioScoutApp {
 
     fn transport_stop(&mut self) {
         if let Some(out) = &self.output { out.stop(); }
+        // BUGFIX (cursor jump-ahead / snap-back): Stop rewinds the hardware
+        // clock to the session start; drop any live extrapolation so the next
+        // Play re-arms it from a consistent point.
+        self.playhead_session = None;
         let mut ctrl = self.player.lock().unwrap_or_else(|p| p.into_inner());
         ctrl.stop();
     }
 
     fn transport_seek(&mut self, frame: u64, source: audioscout_core::player::CursorSource) {
         if let Some(out) = &self.output { out.seek(frame, source); }
+        // BUGFIX (cursor jump-ahead / snap-back): a seek teleports the true
+        // clock; move the extrapolation anchor with it immediately, otherwise
+        // the cursor keeps sliding away from the new position at nominal rate
+        // until the next poll drags it back.
+        self.playhead_est_frame = frame;
+        self.playhead_est_at = std::time::Instant::now();
         let mut ctrl = self.player.lock().unwrap_or_else(|p| p.into_inner());
         ctrl.seek(frame, &self.document, source);
     }
@@ -709,7 +816,7 @@ impl AudioScoutApp {
     /// machine advances on its own clock via `Controller::tick`) and simply
     /// refreshes the cursor from the controller otherwise. `last_playhead_poll`
     /// throttles the work to one poll per 50 ms tick.
-    fn poll_playhead(&mut self) {
+    fn poll_playhead(&mut self, ctx: &egui::Context) {
         if self.player_state() != TransportState::Playing {
             return;
         }
@@ -719,8 +826,86 @@ impl AudioScoutApp {
         }
         self.last_playhead_poll = now;
         if self.output.is_some() {
-            // Real playback position arrives through PlayheadUpdate events —
-            // nothing to advance here, the event handler owns the cursor.
+            // BUGFIX (playback freezes ~0.5 s after start, no sound): the
+            // audio stream can be killed by PulseAudio/ALSA while the app
+            // still thinks it is Playing — then neither the cursor nor the
+            // meter ever move again. `poll_stall` watches the real sample
+            // clock and pauses the transport on a >1 s freeze; surface that
+            // to the user once per stall instead of letting the UI hang in a
+            // fake playing state.
+            let stalled = self
+                .output
+                .as_mut()
+                .map(|out| out.poll_stall())
+                .unwrap_or(false);
+            if stalled {
+                self.stall_notified = true;
+                // BUGFIX (regression "controller thread is gone"): a stall
+                // reported while the transport still claims Playing must also
+                // stop the state machine — otherwise poll_playhead returns at
+                // its very first `player_state() != Playing` guard and never
+                // runs again, leaving the UI frozen in a fake playing state.
+                // `poll_stall` already paused the controller on clock-freeze;
+                // do it here too so every stall path (including the dead-
+                // controller one) leaves the app in Paused and Play can
+                // restart the session.
+                {
+                    let mut ctrl = self.player.lock().unwrap_or_else(|p| p.into_inner());
+                    if ctrl.state() == TransportState::Playing {
+                        ctrl.pause();
+                    }
+                }
+                self.status_message = "Playback stalled: audio stream was dropped \
+                                       by the system (PulseAudio/ALSA). Press Play \
+                                       to retry."
+                    .to_string();
+                ctx.request_repaint();
+                return;
+            }
+            if self.stall_notified && self.player_state() == TransportState::Playing {
+                // A fresh play attempt after a stall — clear the warning.
+                self.stall_notified = false;
+            }
+            // BUGFIX (Play/Pause restarts from 0): the state machine's
+            // current_frame must follow the real audio clock, otherwise
+            // Pause freezes resume_frame at a stale value and every repeated
+            // Play re-appends the slice from the session start. Read the
+            // clock directly from SharedOutput every poll tick (tz §5.3: пул
+            // позиции ±50 мс) — PlayheadUpdate events stay as an additional
+            // fresher update path.
+            let shared = self.output.as_ref().expect("output present").shared.clone();
+            let ch = self.document.channels.max(1);
+            let true_frame = shared.current_frame(ch);
+            // BUGFIX (cursor jump-ahead / snap-back): paint an extrapolated
+            // position instead of the raw hardware clock. The clock lags wall
+            // time by the sink buffer (~150 ms) plus up to one 50 ms poll
+            // quantum; drawing it directly makes the cursor crawl in coarse
+            // steps and any transient forward reading gets snapped back on
+            // the next tick — oscillation that accumulates with playback and
+            // is very visible on short files. Estimate = max(true clock,
+            // anchor advanced at the nominal rate), clamped to the session
+            // end so a short file can never be over-run by the estimate.
+            let sr = self.document.sample_rate.max(1) as f64;
+            let elapsed = self.playhead_est_at.elapsed().as_secs_f64().clamp(0.0, 0.25);
+            let est = self
+                .playhead_est_frame
+                .saturating_add((elapsed * sr) as u64)
+                .max(true_frame);
+            let frame = match self.playhead_session {
+                Some((_s, e)) => est.min(e.saturating_sub(1)),
+                None => est,
+            };
+            self.playhead_est_frame = frame;
+            self.playhead_est_at = std::time::Instant::now();
+            {
+                let mut ctrl = self.player.lock().unwrap_or_else(|p| p.into_inner());
+                ctrl.sync_playback_position(true_frame);
+            }
+            self.audio_view.set_cursor(frame);
+            self.audio_view.auto_scroll_to_cursor();
+            // Keep the 50 ms poll cadence alive even when egui would idle the
+            // window (no input events during hands-free playback).
+            ctx.request_repaint_after(std::time::Duration::from_millis(50));
             return;
         }
         // Device-less degradation: advance the state machine's simulated
@@ -957,7 +1142,7 @@ impl eframe::App for AudioScoutApp {
         // 50 ms playhead poll (§1.2/§5.3): with a live output the position
         // arrives via PlayheadUpdate events; without one this fallback tick
         // advances the state machine's clock so the cursor still moves.
-        self.poll_playhead();
+        self.poll_playhead(ctx);
         if self.player_state() == TransportState::Playing { ctx.request_repaint_after(std::time::Duration::from_millis(50)); }
 
         // Preview pump: while any thumbnail is still missing, keep draining
@@ -1119,6 +1304,15 @@ impl eframe::App for AudioScoutApp {
             ui.painter().rect_filled(rect, 0.0, egui::Color32::from_rgb(25, 25, 30));
 
             if !self.document.samples.is_empty() {
+                let num_tracks = self.cached_channels.len();
+                // BUGFIX (cursor drawn behind the waveform): the playhead line
+                // used to be painted BEFORE the spectrogram image / waveform
+                // columns, so it ended up underneath them and was only visible
+                // through gaps. Track where overlays must start: everything
+                // below is drawn on top of the audio content (§3.5 — курсор
+                // поверх дорожек).
+                let overlay_start_y = rect.top();
+
                 // Spectrogram mode: draw the pre-rendered widget-resolution
                 // image first; markers/selection/cursor overlay on top of it.
                 if self.audio_view.mode == AudioViewMode::Spectrogram {
@@ -1128,7 +1322,6 @@ impl eframe::App for AudioScoutApp {
                     }
                 }
 
-                let num_tracks = self.cached_channels.len();
                 // Draw center line only for mono (1 track)
                 // For stereo/multichannel, separator lines are drawn in the waveform rendering loop
                 // (In spectrogram mode the image already contains them.)
@@ -1137,26 +1330,19 @@ impl eframe::App for AudioScoutApp {
                     ui.painter().line_segment([egui::pos2(rect.left(), mid_y), egui::pos2(rect.right(), mid_y)], egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(60, 60, 65)));
                 }
 
-                // Cursor
-                let cursor_x = self.audio_view.frame_to_x(self.audio_view.cursor_frame, rect.width() as u32);
-                let cursor_screen_x = rect.left() + cursor_x;
-                if cursor_screen_x >= rect.left() && cursor_screen_x <= rect.right() {
-                    ui.painter().line_segment([egui::pos2(cursor_screen_x, rect.top()), egui::pos2(cursor_screen_x, rect.bottom())], egui::Stroke::new(1.5_f32, egui::Color32::RED));
-                }
-
                 // Markers
                 for (idx, marker) in self.document.markers.iter().enumerate() {
                     let mx = self.audio_view.frame_to_x(marker.time_samples, rect.width() as u32);
                     let screen_x = rect.left() + mx;
                     if screen_x >= rect.left() && screen_x <= rect.right() {
                         let color = if self.audio_view.active_marker == Some(idx) { egui::Color32::YELLOW } else { egui::Color32::from_rgb(100, 180, 255) };
-                        let mut y = rect.top();
+                        let mut y = overlay_start_y;
                         while y < rect.bottom() {
                             let seg_end = (y + 4.0).min(rect.bottom());
                             ui.painter().line_segment([egui::pos2(screen_x, y), egui::pos2(screen_x, seg_end)], egui::Stroke::new(1.0_f32, color));
                             y += 8.0;
                         }
-                        ui.painter().text(egui::pos2(screen_x + 2.0, rect.top() + 2.0), egui::Align2::LEFT_TOP, &marker.name, egui::FontId::proportional(10.0), color);
+                        ui.painter().text(egui::pos2(screen_x + 2.0, overlay_start_y + 2.0), egui::Align2::LEFT_TOP, &marker.name, egui::FontId::proportional(10.0), color);
                     }
                 }
 
@@ -1164,7 +1350,7 @@ impl eframe::App for AudioScoutApp {
                 if let Some(sel) = self.audio_view.selection_range() {
                     let x1 = rect.left() + self.audio_view.frame_to_x(sel.0, rect.width() as u32);
                     let x2 = rect.left() + self.audio_view.frame_to_x(sel.1, rect.width() as u32);
-                    let sel_rect = egui::Rect::from_min_max(egui::pos2(x1.max(rect.left()), rect.top()), egui::pos2(x2.min(rect.right()), rect.bottom()));
+                    let sel_rect = egui::Rect::from_min_max(egui::pos2(x1.max(rect.left()), overlay_start_y), egui::pos2(x2.min(rect.right()), rect.bottom()));
                     ui.painter().rect_filled(sel_rect, 0.0, egui::Color32::from_rgba_premultiplied(80, 120, 255, 60));
                 }
 
@@ -1173,7 +1359,6 @@ impl eframe::App for AudioScoutApp {
                 let start_frame = self.audio_view.view_range.start_frame;
                 let end_frame = self.audio_view.view_range.end_frame;
                 let view_frames = end_frame.saturating_sub(start_frame);
-                let num_tracks = self.cached_channels.len();
 
                 if view_frames > 0 && num_tracks > 0 && self.audio_view.mode == AudioViewMode::Waveform {
                     let track_height = rect.height() / num_tracks as f32;
@@ -1207,6 +1392,32 @@ impl eframe::App for AudioScoutApp {
                             );
                         }
                     }
+                }
+
+                // Cursor — BUGFIX (отрисовку надо переместить наверх, сейчас
+                // курсор находится за waveform): the playhead is painted LAST
+                // inside this panel, i.e. on top of the spectrogram image,
+                // the waveform columns and the selection highlight, so it is
+                // always fully visible while tracking playback (§3.5).
+                let cursor_x = self.audio_view.frame_to_x(self.audio_view.cursor_frame, rect.width() as u32);
+                let cursor_screen_x = rect.left() + cursor_x;
+                if cursor_screen_x >= rect.left() && cursor_screen_x <= rect.right() {
+                    ui.painter().line_segment([egui::pos2(cursor_screen_x, overlay_start_y), egui::pos2(cursor_screen_x, rect.bottom())], egui::Stroke::new(1.5_f32, egui::Color32::RED));
+                    // Small "handle" triangle at the very TOP of the view —
+                    // the user asked for the cursor to sit above everything;
+                    // the marker makes it readable even over dense waveforms.
+                    ui.painter().add(egui::Shape::convex_polygon(
+                        vec![
+                            egui::pos2(cursor_screen_x - 4.0, overlay_start_y),
+                            egui::pos2(cursor_screen_x + 4.0, overlay_start_y),
+                            egui::pos2(cursor_screen_x, overlay_start_y + 6.0),
+                        ],
+                        // Color32 already satisfies `Into<Color32>`; the `.into()` call made
+                        // the target type ambiguous (E0283) since Color32 converts into Hsva,
+                        // Rgba and others too.
+                        egui::Color32::RED,
+                        egui::Stroke::NONE,
+                    ));
                 }
             }
 

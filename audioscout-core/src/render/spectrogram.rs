@@ -334,7 +334,7 @@ mod tests {
         // Pure sine at bin 8 of a 64-point FFT → peak magnitude at index 8.
         let n = 64;
         let mut re: Vec<f32> = (0..n)
-            .map(|i| ((core::f32::consts::TAU * 8.0 * i as f32 / n as f32).cos()))
+            .map(|i| (core::f32::consts::TAU * 8.0 * i as f32 / n as f32).cos())
             .collect();
         let mut im = vec![0.0f32; n];
         fft_radix2(&mut re, &mut im);

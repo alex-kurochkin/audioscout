@@ -375,3 +375,269 @@ fn controller_has_no_duplicate_public_accessors() {
     assert!(!code.contains("self.meter"), "controller.rs still references removed meter field");
     assert!(!code.contains("use super::output::AudioOutput"), "AudioOutput does not exist in output.rs (it is RodioOutput)");
 }
+
+#[test]
+fn output_holder_keeps_stream_handle_alive() {
+    // Regression: playback was silent and the playhead frozen because only
+    // `OutputStream` was stored — the last `OutputStreamHandle` drop destroys
+    // the cpal stream (cpal 0.15 ALSA backend calls StreamId::destroy on
+    // handle drop), so the Sink appended sources into a dead endpoint.
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/src/player/output.rs");
+    let code: String = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("cannot read {}: {}", path, e))
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    // The holder struct must own both the stream and a handle clone.
+    assert!(code.contains("_stream: rodio::OutputStream"), "holder lost the OutputStream field");
+    assert!(code.contains("_handle: rodio::OutputStreamHandle"), "holder must keep an OutputStreamHandle alive");
+    // And the construction site must actually clone the handle into it.
+    assert!(code.contains("_handle: handle.clone()"), "handle is not cloned into the holder at construction");
+}
+
+#[test]
+fn ui_poll_reads_audio_clock_directly_and_syncs_controller() {
+    // Regression: playback DID run (disk write on Play, stop on Stop) but the
+    // UI showed nothing moving — poll_playhead relied solely on PlayheadUpdate
+    // events and never advanced the state machine. The 50 ms poll must read
+    // SharedOutput.current_frame directly, mirror it into the Controller
+    // (sync_playback_position), drive the cursor, and keep egui repainting.
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../audioscout-app/src/app.rs");
+    let code: String = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("cannot read {}: {}", path, e))
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    // poll_playhead takes the egui context so it can schedule repaints itself.
+    assert!(code.contains("fn poll_playhead(&mut self, ctx: &egui::Context)"), "poll_playhead lost its ctx parameter");
+    assert!(code.contains("self.poll_playhead(ctx);"), "update() does not pass ctx to poll_playhead");
+    // The real audio clock is polled from SharedOutput every tick...
+    assert!(code.contains("shared.current_frame(ch)"), "poll no longer reads the audio clock via current_frame");
+    // ...mirrored into the transport state machine (fixes Play-after-Pause
+    // restarting from 0)...
+    assert!(code.contains("ctrl.sync_playback_position(frame)"), "poll does not sync the controller position");
+    // ...and drives the waveform cursor + auto-scroll.
+    assert!(code.contains("self.audio_view.set_cursor(frame);"), "poll does not move the cursor");
+    // Repaint cadence keeps the poll alive while playing.
+    assert!(code.contains("ctx.request_repaint_after(std::time::Duration::from_millis(50));"), "poll lost its repaint scheduling");
+}
+
+#[test]
+fn controller_exposes_playback_position_sync() {
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/src/player/controller.rs");
+    let code: String = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("cannot read {}: {}", path, e))
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert_eq!(code.matches("pub fn sync_playback_position(").count(), 1, "sync_playback_position missing/duplicated");
+    // It must be a playback-side update: never touch resume_frame (§5.3
+    // CursorSource::Playback semantics — Pause resumes from the real clock).
+    let body = code.split("pub fn sync_playback_position(").nth(1).unwrap();
+    let body = body.split("pub fn ").next().unwrap();
+    assert!(!body.contains("resume_frame"), "playback sync must not overwrite the resume point");
+    assert!(body.contains("self.state != TransportState::Playing"), "playback sync must no-op outside Playing");
+}
+
+#[test]
+fn device_enumeration_uses_cpal_015_host_api_via_rodio_reexport() {
+    // Regression over FOUR broken builds of the ALSA-'default' device scan:
+    //   * bare `cpal::` paths — cpal is NOT a direct dependency of
+    //     audioscout-core (E0433); the crate root IS reachable as
+    //     `rodio::cpal` though, because rodio 0.19 does `pub use cpal::{self, ...}`;
+    //   * `cpal::host_ids()` — removed in cpal 0.13+, the 0.15 free function is
+    //     `available_hosts()` (E0425);
+    //   * `Host::from_id(...)` — never existed; the constructor is the free
+    //     function `host_from_id(HostId) -> Result<Host, HostUnavailable>` (E0599);
+    //   * `rodio::supported_output_devices()` — does not exist in rodio 0.19 (E0425);
+    //   * trait methods `devices()/name()/supported_output_configs()` only
+    //     resolve with `cpal::traits::{HostTrait, DeviceTrait}` imported,
+    //     otherwise inference fails (E0282).
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/src/player/output.rs");
+    let code: String = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("cannot read {}: {}", path, e))
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    // Only ever via rodio's re-export, never the unlinked bare crate.
+    let without_reexport = code.replace("rodio::cpal", "");
+    assert!(!without_reexport.contains("cpal::"), "bare cpal:: path — cpal is not a direct dependency, use rodio::cpal::");
+
+    // Correct cpal 0.15 host API surface.
+    assert!(code.contains("rodio::cpal::available_hosts()"), "must enumerate hosts via cpal 0.15 available_hosts()");
+    assert!(code.contains("rodio::cpal::host_from_id(host_id)"), "must build Host via the free fn host_from_id");
+    assert!(!code.contains("host_ids()"), "leftover pre-0.13 cpal API host_ids()");
+    assert!(!code.contains("Host::from_id"), "nonexistent cpal API Host::from_id");
+    assert!(!code.contains("supported_output_devices()"), "nonexistent rodio 0.19 API supported_output_devices");
+    // Trait imports live per-function next to the code that needs them (the
+    // device picker deliberately imports ONLY HostTrait because DeviceTrait
+    // methods there are called fully-qualified — a combined import there is
+    // an unused-import warning). Assert each function's own import line.
+    assert!(code.contains("fn list_all_named_devices")
+        && code.split("fn list_all_named_devices").nth(1).unwrap().contains("use rodio::cpal::traits::{DeviceTrait, HostTrait};"),
+        "list_all_named_devices must import both cpal traits for devices()/name()");
+    let dev_body = code.split("fn device_has_output").nth(1).unwrap().split("\nfn ").next().unwrap();
+    assert!(code.contains("fn device_has_output")
+        && dev_body.contains("use rodio::cpal::traits::DeviceTrait;"),
+        "device_has_output must import DeviceTrait for supported_output_configs()");
+    let pick_head = code.split("fn pick_output_device").nth(1).unwrap().split("\n\n").next().unwrap();
+    assert!(code.contains("fn pick_output_device")
+        && pick_head.contains("use rodio::cpal::traits::HostTrait;"),
+        "pick_output_device must import HostTrait for default_output_device()");
+
+    // Output-capability filtering and device typing. Probing must be LAZY
+    // (per candidate in pick_output_device), never eager for every device —
+    // eager supported_output_configs() opens every ALSA PCM via alsa-lib and
+    // spams dmix/dsnoop/JACK errors on desktop Debian.
+    assert!(code.contains("supported_output_configs()"), "candidate devices must still be probed for output configs");
+    assert!(code.contains("fn device_has_output(device: &rodio::cpal::Device) -> bool"), "lazy per-device output probe expected");
+    assert!(code.contains("Vec<(rodio::cpal::Device, String)>"), "device list typed with the cpal::Device that OutputStream::try_from_device accepts");
+
+    // Device preference order: env override → PulseAudio host → ALSA virtual
+    // routings ("pulse"/"default"/"dmix") → system default fallback. The old
+    // exact-match-only scan for a literally-named "default" device is gone:
+    // cpal's ALSA backend does not enumerate it on typical Debian setups.
+    assert_eq!(code.matches("fn pick_output_device").count(), 1);
+    assert!(code.contains("AUDIOSCOUT_ALSA_DEVICE"), "manual device override via env must exist");
+    // cpal 0.15 HostId has no as_str(); the Pulse route is detected through
+    // the *device name* of each host's default_output_device(), plus the
+    // ALSA-host virtual plugins ("pulse"/"default"/"dmix") preference list.
+    assert!(
+        code.contains("\"pulse\"")
+        && code.contains("lname.contains(\"pulse\") || lname.contains(\"pipewire\")")
+        && code.contains("const PREFERRED: [&str; 3] = [\"pulse\", \"default\", \"dmix\"];"),
+        "PulseAudio routing must be preferred over raw ALSA PCMs (by device name)");
+    assert!(!code.contains("fn find_alsa_default_device"), "old exact-\"default\" scanner removed");
+    assert!(
+        code.contains("rodio::OutputStream::try_from_device_config(device, cfg)")
+        && code.contains("fn select_f32_output_config(device: &rodio::cpal::Device) -> Option<rodio::cpal::SupportedStreamConfig>"),
+        "chosen device must be opened with an explicit f32 SupportedStreamConfig (try_from_device_config)"
+    );
+    assert!(code.contains("OutputStream::try_default()"), "fallback to the system default device must remain");
+}
+
+
+#[test]
+fn playback_is_paced_by_a_sink_queue_budget_not_wall_clock_sleeps() {
+    // Regression over the "0.5 s of sound then freeze" family of bugs:
+    //   * rodio 0.19 `Sink` is NOT `Clone` — the controller/pump used to call
+    //     `sink.clone()` (E0599) and hold MutexGuard borrows across it
+    //     (E0505); the shared handle must be an `Arc<Sink>` instead;
+    //   * feeding must be paced by how many chunks are still queued in the
+    //     Sink (MeteredSource decrements on exhaustion), not by blind
+    //     wall-clock sleeps — otherwise the pump either races ahead (disk
+    //     hammering, giant allocations) or starves the queue (~0.5 s of
+    //     audio, then silence);
+    //   * `session` is an `Option<(u64,u64)>` Copy tuple guard — matching it
+    //     as `Some(&(s,e))` fails E0308.
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/src/player/output.rs");
+    let code: String = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("cannot read {}: {}", path, e))
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    // Shared sink handle: Arc-wrapped, never cloned via Clone.
+    assert!(code.contains("Arc<Mutex<Option<Arc<rodio::Sink>>>>"), "pump slot must hold an Arc<Sink>, not a non-Clone Sink copy");
+    let flat: Vec<&str> = code.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+    let flat = flat.join(" ");
+    assert!(flat.contains("let sink = match rodio::Sink::try_new(&handle) { Ok(s) => Arc::new(s)"), "Sink must be wrapped in Arc right after try_new");
+    // `Arc<Sink>` clones ARE allowed (`Some(s) => s.clone()`); a bare
+    // `sink_clone` binding or an append through one was the old broken shape.
+    assert!(
+        !flat.contains("let sink_clone") && !flat.contains("sink_clone.append"),
+        "no rodio::Sink::clone into a local — Sink is not Clone in rodio 0.19");
+    assert!(flat.contains("fn controller_thread( sink: Arc<rodio::Sink>,"), "controller thread takes the Arc<Sink> handle");
+
+    // Pump pacing by queue budget.
+    assert_eq!(code.matches("fn pump_thread").count(), 1);
+    let pump_body = code.split("fn pump_thread").nth(1).unwrap();
+    let pump_body = pump_body.split("\nfn ").next().unwrap();
+    assert!(pump_body.contains("let queued_chunks = Arc::new(AtomicUsize::new(0));"), "pump must track queued chunk count locally");
+    assert!(pump_body.contains("queued_chunks.load(Ordering::Acquire) >= max_queued_chunks"), "pump must wait when the sink queue is full");
+    assert!(pump_body.contains("queued_chunks.fetch_add(1"), "each appended chunk reserves a queue slot");
+    assert!(pump_body.contains("chunks: queued_chunks.clone(),"), "the chunk carries its queue-slot guard into MeteredSource");
+    assert!(pump_body.contains("sink.append(metered);"), "pump appends through the Arc<Sink> directly");
+
+    // MeteredSource releases the slot exactly once, when exhausted.
+    let metered = code.split("impl Iterator for MeteredSource").nth(1).unwrap().split("impl ").next().unwrap();
+    assert!(metered.contains("self.chunks.fetch_sub(1, Ordering::AcqRel);"), "exhausted chunk must release its queue slot");
+    assert!(code.contains("chunks: Arc<AtomicUsize>,"), "MeteredSource holds the shared queue counter");
+
+    // Session guard destructuring must avoid the reference pattern.
+    assert!(!code.contains("Some(&(s, e))"), "Option<(u64,u64)> Copy tuple must be matched by value (E0308)");
+    assert!(flat.contains("Some((s, e)) => s < e && pump.cursor_frame.load(Ordering::Relaxed) >= e"), "completion check reads the pump cursor vs session end");
+}
+
+// ---------------------------------------------------------------------------
+// Regression: non-editable audio files must load into the player.
+//
+// Bug (user report): double-clicking an mp3 in the file list showed
+// "File format not editable" and refused to load; the message also stuck in
+// the status bar after subsequently loading a wav. Per the TZ, playback must
+// work for every supported audio format; "editable" only gates destructive
+// edit operations (mute/normalize/save).
+// ---------------------------------------------------------------------------
+
+fn app_src_for_editable_check() -> String {
+    let mut p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    p.push("../audioscout-app/src/app.rs");
+    std::fs::read_to_string(p).expect("app.rs readable")
+}
+
+#[test]
+fn load_file_accepts_all_supported_audio_formats() {
+    let src = app_src_for_editable_check();
+    // Isolate the body of `fn load_file` up to the next top-level fn.
+    let start = src.find("fn load_file(&mut self, path: &Path)").expect("load_file present");
+    let rest = &src[start..];
+    let end = rest.find("\n    fn ").or(rest.find("\n    /// Rebuild")).expect("load_file end");
+    let body = &rest[..end];
+
+    // The hard gate on *editability* must be gone from the load path...
+    assert!(
+        !body.contains("if !is_editable_file(path)"),
+        "load_file must not refuse non-editable formats (§3.4: all audio files play)"
+    );
+    // ...replaced by a supported-audio-format check.
+    assert!(
+        body.contains("is_audio_file(path)"),
+        "load_file should validate against the supported audio extension list"
+    );
+    // A successful load must clear any stale status message (sticky-message bug).
+    assert!(
+        body.contains("self.status_message.clear()"),
+        "successful load must clear the sticky status message"
+    );
+    // Edit gating stays where it belongs — on the edit operations themselves.
+    assert!(
+        src.contains("if !is_editable_file(&self.document.source_path)"),
+        "edit operations must still be gated on is_editable_file"
+    );
+}
+
+#[test]
+fn wma_is_supported_non_editable_format() {
+    assert!(
+        audioscout_core::AUDIO_EXTENSIONS.contains(&"wma"),
+        "WMA must be listed among supported (playable) audio extensions"
+    );
+    assert!(
+        !audioscout_core::EDITABLE_EXTENSIONS.contains(&"wma"),
+        "WMA is decode-only: it must NOT be editable"
+    );
+    let p = std::path::Path::new("track.wma");
+    assert!(audioscout_core::is_audio_file(p));
+    assert!(!audioscout_core::is_editable_file(p));
+    let mp3 = std::path::Path::new("song.MP3");
+    assert!(audioscout_core::is_audio_file(mp3), "extension matching is case-insensitive");
+}
