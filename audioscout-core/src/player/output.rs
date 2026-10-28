@@ -838,7 +838,7 @@ fn controller_thread(
                     sink.play();
                     shared.session_epoch.fetch_add(1, Ordering::Release);
                     let mut ctrl = controller.lock().unwrap_or_else(|p| p.into_inner());
-                    ctrl.mark_playing(s, e);
+                    ctrl.mark_playing(s, e, d.sample_rate);
                     sink.set_volume(ctrl.volume());
                     loop_enabled = ctrl.is_looping();
                     drop(ctrl);
@@ -947,7 +947,8 @@ fn controller_thread(
                     // raw counter back to a file-frame index for the state
                     // machine (see stream_frame_of).
                     let f = stream_frame_of(&shared.consumed_samples.load(Ordering::Relaxed), doc.as_deref(), ch, stream_format);
-                    ctrl.freeze_resume_at(f);
+                    let sr = doc.as_ref().map(|d| d.sample_rate).unwrap_or(44100);
+                    ctrl.freeze_resume_at(f, sr);
                 }
             }
             Some(Cmd::Stop) => {

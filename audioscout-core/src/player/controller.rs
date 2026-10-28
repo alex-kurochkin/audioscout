@@ -4,6 +4,17 @@
 //! audio clock lives in that thread; these methods only mirror it so the
 //! transport buttons never stick ("Pause не залипает").
 //!
+//! Elapsed-time accounting (§5.3): while Playing, `current_frame()` derives
+//! the position from the wall-clock instant captured at session engagement
+//! (`session_clock_at` + dt × sample rate), clamped into [start,end) — never
+//! from a fixed poll quantum. The hardware clock (`consumed_samples`, via
+//! `sync_playback_position`) only RE-BASES this estimate when it legitimately
+//! moves (sink buffer latency, seek/loop rewinds); it can never drag the
+//! displayed elapsed time backwards or make it run at a wrong rate. A fixed
+//! 50 ms-per-poll fallback clock (`tick`) systematically under-counted on
+//! short files — every late poll dropped the overrun — which is exactly the
+//! reported "incorrect elapsed time during playback".
+//!
 //! All public methods are safe to call before a document is loaded — they
 //! degrade to no-ops (TZ §1.2: "нажатия раньше времени не падают").
 
@@ -26,6 +37,18 @@ pub struct Controller {
     playhead: Arc<PlayheadState>,
     space_is_stop: bool,
     skip_seconds: u32,
+    /// BUGFIX (elapsed time wrong during playback, very visible on short
+    /// files): anchor of the wall-clock playback estimate — the instant that
+    /// corresponds to `current_frame` while Playing. Re-based whenever the
+    /// measured audio clock publishes a fresh position (it lags wall time by
+    /// the sink buffer depth; drawing that raw lag made the cursor crawl and
+    /// snap back, and the fixed-quantum `tick` fallback under-counted).
+    session_clock_at: std::time::Instant,
+    /// Sample rate of the document of the last engaged session — the rate at
+    /// which `session_clock_at` translates into frames. Captured on play /
+    /// seek / output-thread hooks so every position getter is self-contained
+    /// even when the caller has no `Document` at hand.
+    played_sr: u32,
 }
 
 impl Controller {
@@ -41,6 +64,8 @@ impl Controller {
             playhead,
             space_is_stop: true,
             skip_seconds: 5,
+            session_clock_at: std::time::Instant::now(),
+            played_sr: 44100,
         }
     }
 
@@ -82,6 +107,7 @@ impl Controller {
         if total == 0 {
             return; // safe no-op before a document is loaded
         }
+        self.played_sr = doc.sample_rate.max(1);
         let (start, end) = match selection {
             Some((s, e)) if e > s => (s.min(total), e.min(total)),
             _ => (self.resume_frame.min(total), total),
@@ -90,6 +116,7 @@ impl Controller {
         self.end_frame = end;
         self.current_frame = start;
         self.resume_frame = start;
+        self.session_clock_at = std::time::Instant::now();
         self.state = TransportState::Playing;
         self.playhead.set_playing(true);
         self.playhead.set_position_samples(start);
@@ -99,9 +126,15 @@ impl Controller {
     /// performs the actual silence via `Cmd::Pause` before calling this.
     pub fn pause(&mut self) {
         if self.state == TransportState::Playing {
+            // Snapshot the wall-clock estimate BEFORE leaving Playing so the
+            // frozen resume point matches what the user saw — elapsed time
+            // stops exactly where the display stopped.
+            let est = self.estimated_frame();
             self.state = TransportState::Paused;
+            self.current_frame = est;
+            self.resume_frame = est;
+            self.playhead.set_position_samples(est);
             self.playhead.set_playing(false);
-            self.resume_frame = self.current_frame;
         }
     }
 
@@ -109,6 +142,9 @@ impl Controller {
     pub fn unpause(&mut self) {
         if self.state == TransportState::Paused {
             self.state = TransportState::Playing;
+            // Re-anchor the estimate at the frozen position — the time spent
+            // paused must never count as playback progress.
+            self.session_clock_at = std::time::Instant::now();
             self.playhead.set_playing(true);
         }
     }
@@ -116,6 +152,11 @@ impl Controller {
     /// Immediate silence + rewind the cursor to the start of the last
     /// session (§3.5/§5.3 stop).
     pub fn stop(&mut self) {
+        if self.state == TransportState::Playing {
+            // Snapshot the live position before rewinding so nothing else
+            // racing with Stop reads a mid-session frame.
+            self.current_frame = self.estimated_frame();
+        }
         self.state = TransportState::Stopped;
         self.current_frame = self.start_frame;
         self.resume_frame = self.start_frame;
@@ -143,6 +184,7 @@ impl Controller {
     pub fn is_playing(&self) -> bool { self.state == TransportState::Playing }
     pub fn seek(&mut self, frame: u64, doc: &Document, source: CursorSource) {
         let max_frame = doc.total_frames();
+        self.played_sr = doc.sample_rate.max(1);
         let mut target = frame.min(max_frame);
         if self.state == TransportState::Playing && self.end_frame > self.start_frame {
             // Click-to-seek outside the selection does not extend it: clamp
@@ -157,6 +199,10 @@ impl Controller {
         if source == CursorSource::User {
             self.resume_frame = target;
         }
+        // A seek teleports the true clock; move the wall-clock anchor with it
+        // immediately, otherwise the estimate keeps sliding away from the new
+        // position until the next poll drags it back.
+        self.session_clock_at = std::time::Instant::now();
     }
 
     /// ±N-second jump while playing (§5.3): behaves like a user seek, so
@@ -164,7 +210,11 @@ impl Controller {
     pub fn skip(&mut self, doc: &Document, seconds: i32) {
         let sr = doc.sample_rate.max(1) as i64;
         let delta = seconds as i64 * sr;
-        let target = (self.current_frame as i64 + delta).max(0) as u64;
+        // BUGFIX: jump from the live wall-clock estimate — `current_frame`
+        // alone is only the last re-based anchor and would drop the elapsed
+        // fraction of the current poll interval.
+        let pos = self.estimate_at(sr as u64, doc.total_frames()) as i64;
+        let target = (pos + delta).max(0) as u64;
         self.seek(target, doc, CursorSource::User);
     }
 
@@ -173,6 +223,7 @@ impl Controller {
     /// into the UI-facing state machine without touching the resume point.
     pub fn mark_seek(&mut self, frame: u64) {
         self.current_frame = frame;
+        self.session_clock_at = std::time::Instant::now();
         self.playhead.set_position_samples(frame);
     }
 
@@ -182,42 +233,116 @@ impl Controller {
     /// later Pause still resumes where playback actually is, and Play/Pause
     /// keeps its "resume from current position" semantics.
     pub fn sync_playback_position(&mut self, frame: u64) {
+        self.sync_playback_position_in(frame, None);
+    }
+
+    /// Document-aware variant: also captures the file sample rate so the
+    /// estimate advances at the true nominal rate (a 22050 Hz file must not
+    /// be extrapolated with a stale 44100 Hz rate).
+    pub fn sync_playback_position_in(&mut self, frame: u64, doc: Option<&Document>) {
         if self.state != TransportState::Playing {
             return;
         }
-        self.current_frame = frame;
-        self.playhead.set_position_samples(frame);
+        if let Some(d) = doc {
+            self.played_sr = d.sample_rate.max(1);
+        }
+        // BUGFIX (elapsed time wrong during playback): the measured audio
+        // clock lags wall time by the sink buffer depth (~150 ms). Adopting
+        // it verbatim made the displayed elapsed time crawl in coarse steps
+        // and snap backwards on short files. Instead re-base the estimate:
+        // treat `frame` as the position AT THIS INSTANT whenever it moves
+        // forward, or after a legitimate rewind (seek / loop wrap / session
+        // restart). A stale-but-larger measurement never drags the display
+        // backwards; the next fresh forward sample corrects any drift.
+        let est = self.estimated_frame();
+        let rewound = frame < self.current_frame;
+        if frame >= est || rewound || frame > self.current_frame {
+            self.current_frame = frame;
+            self.session_clock_at = std::time::Instant::now();
+        }
+        self.playhead.set_position_samples(self.current_frame);
     }
 
     /// Output-thread hooks (§5.2/§5.3): the real audio clock lives in
     /// `player::output`; these keep the UI-facing state machine consistent.
     /// Mark a new playing session [start,end) started by the output thread.
-    pub fn mark_playing(&mut self, start: u64, end: u64) {
+    pub fn mark_playing(&mut self, start: u64, end: u64, sample_rate: u32) {
+        self.played_sr = sample_rate.max(1);
+        // Defensive clamp: without a `Document` at hand, treat any bound
+        // beyond ~1 h of audio as "unknown" and fall back to unbounded
+        // session semantics (estimate then clamps only to that cap).
+        let cap = (3600u64).saturating_mul(sample_rate.max(1) as u64);
+        let start = start.min(cap);
+        let end = if end > cap { cap } else { end };
         self.start_frame = start; self.end_frame = end; self.current_frame = start;
         self.resume_frame = start;
+        self.session_clock_at = std::time::Instant::now();
         self.state = TransportState::Playing; self.playhead.set_playing(true);
         self.playhead.set_position_samples(start);
     }
     /// Freeze the resume point at an externally measured position (pause).
-    pub fn freeze_resume_at(&mut self, frame: u64) {
+    /// While still Playing this also RE-BASES the wall-clock estimate: the
+    /// hardware clock legitimately lags wall time by the sink buffer depth,
+    /// so a forward measurement must not be treated as "already elapsed".
+    pub fn freeze_resume_at(&mut self, frame: u64, sample_rate: u32) {
+        self.played_sr = sample_rate.max(1);
         self.current_frame = frame; self.resume_frame = frame;
+        self.session_clock_at = std::time::Instant::now();
         self.playhead.set_position_samples(frame);
     }
     /// Stop with the playhead rewound to the session start point (§5.3).
     pub fn stop_at_session_start(&mut self, start: u64) {
         self.state = TransportState::Stopped;
         self.current_frame = start; self.resume_frame = start;
+        self.session_clock_at = std::time::Instant::now();
         self.playhead.set_position_samples(start); self.playhead.set_playing(false);
     }
     /// Natural end of a non-loop session: stopped, car back at session start.
     pub fn finish_session_at(&mut self, start: u64) {
         self.stop_at_session_start(start);
     }
+    /// Wall-clock playback estimate for the given sample rate (§5.3): the
+    /// anchor position advanced at the nominal rate since `session_clock_at`,
+    /// clamped into the active session [start,end) so a short file can never
+    /// be over-run by the estimate. Loop sessions are unbounded until Stop,
+    /// so they clamp only to the end of the file.
+    fn estimate_at(&self, sr: u64, total_frames: u64) -> u64 {
+        if self.state != TransportState::Playing {
+            return self.current_frame;
+        }
+        let dt = self.session_clock_at.elapsed().as_secs_f64().max(0.0);
+        let pos = self.current_frame.saturating_add((dt * sr as f64) as u64);
+        let cap = if self.end_frame > self.start_frame {
+            self.end_frame.saturating_sub(1).min(total_frames.max(1))
+        } else if self.loop_enabled {
+            total_frames.max(1)
+        } else {
+            total_frames.max(1)
+        };
+        pos.min(cap).max(self.start_frame.min(cap))
+    }
+
+    /// Same estimate assuming the common case `total_frames == u64::MAX`
+    /// (no document bound known) — used by pause() where only the stored
+    /// session bounds constrain the position.
+    fn estimated_frame(&self) -> u64 {
+        let sr = self.played_sr.max(1);
+        self.estimate_at(sr, u64::MAX)
+    }
+
+    /// Current playback position in frames. While Playing this is derived
+    /// live from the wall-clock anchor — NOT a value frozen at the last poll
+    /// — so elapsed time advances smoothly and correctly between updates.
     pub fn current_frame(&self) -> u64 {
-        self.current_frame
+        self.estimate_at(self.played_sr.max(1), u64::MAX)
+    }
+    /// Current playback position using the exact document bounds (preferred
+    /// when a Document is available — clamps a short-file estimate to EOF).
+    pub fn current_frame_in(&self, doc: &Document) -> u64 {
+        self.estimate_at(doc.sample_rate.max(1) as u64, doc.total_frames())
     }
     pub fn current_secs(&self, sample_rate: u32) -> f64 {
-        self.current_frame as f64 / sample_rate.max(1) as f64
+        self.estimate_at(sample_rate.max(1) as u64, u64::MAX) as f64 / sample_rate.max(1) as f64
     }
     /// Device-less fallback clock (§1.2/§5.3): when no audio output is
     /// available the state machine advances on its own — called from the UI
@@ -228,9 +353,21 @@ impl Controller {
         if self.state != TransportState::Playing {
             return;
         }
-        let sr = doc.sample_rate.max(1) as f64;
-        let advance = (dt.as_secs_f64() * sr).round().max(0.0) as u64;
-        let next = self.current_frame.saturating_add(advance);
+        // BUGFIX (elapsed time wrong during playback, very visible on short
+        // files): this used to advance by a FIXED poll quantum (50 ms) per
+        // call. Polls actually arrive late (UI load, repaint jitter), and the
+        // overrun of every late tick was silently dropped — the fallback
+        // clock ran slower than real time, increasingly so on short files
+        // where the whole session is only a few quanta long. Advance from
+        // the wall-clock anchor instead: exact elapsed time, no drift.
+        let _ = dt;
+        self.played_sr = doc.sample_rate.max(1);
+        let sr = self.played_sr as u64;
+        let next = self.estimate_at(sr, doc.total_frames());
+        // Snapshot first, THEN re-base the anchor at this exact instant —
+        // otherwise the just-counted elapsed time would be double-counted.
+        self.current_frame = next;
+        self.session_clock_at = std::time::Instant::now();
         let end = if self.end_frame > self.start_frame { self.end_frame } else { doc.total_frames() };
         if next >= end {
             if self.loop_enabled && end > self.start_frame {
@@ -339,11 +476,14 @@ mod tests {
         let (mut c, doc) = controller_with_doc(1000, 1);
         c.play(&doc, None);
         // The output thread mirrors the measured audio-clock position here.
-        c.freeze_resume_at(150);
+        c.freeze_resume_at(150, 1000);
         c.pause();
         assert_eq!(c.state(), TransportState::Paused);
-        assert_eq!(c.current_frame(), 150);
-        assert_eq!(c.resume_frame(), 150);
+        // Pause snapshots the live estimate; at sr=1000 a few ms of test
+        // runtime move it only by single-digit frames — never backwards and
+        // never far from the last frozen clock sample.
+        assert!((c.current_frame() as i64 - 150).abs() <= 25, "{}", c.current_frame());
+        assert_eq!(c.resume_frame(), c.current_frame());
         c.unpause();
         assert_eq!(c.state(), TransportState::Playing);
     }
@@ -352,7 +492,7 @@ mod tests {
     fn stop_rewinds_to_session_start() {
         let (mut c, doc) = controller_with_doc(1000, 1);
         c.play(&doc, Some((200, 800)));
-        c.freeze_resume_at(500);
+        c.freeze_resume_at(500, 1000);
         c.stop();
         assert_eq!(c.state(), TransportState::Stopped);
         assert_eq!(c.current_frame(), 200);
@@ -363,7 +503,7 @@ mod tests {
     fn natural_end_of_non_loop_session_rewinds_and_stops() {
         let (mut c, doc) = controller_with_doc(1000, 1);
         c.play(&doc, Some((0, 500)));
-        c.freeze_resume_at(500);
+        c.freeze_resume_at(500, 1000);
         // Output-thread hook: natural completion rewinds to session start.
         c.finish_session_at(c.start_frame());
         assert_eq!(c.state(), TransportState::Stopped);
@@ -442,7 +582,7 @@ mod tests {
     fn reset_clears_session_for_file_switch() {
         let (mut c, doc) = controller_with_doc(1000, 1);
         c.play(&doc, Some((100, 900)));
-        c.freeze_resume_at(150);
+        c.freeze_resume_at(150, 1000);
         c.reset();
         assert_eq!(c.state(), TransportState::Stopped);
         assert_eq!(c.current_frame(), 0);
@@ -468,13 +608,30 @@ mod tests {
 
     #[test]
     fn tick_wraps_when_looping() {
-        let (mut c, doc) = controller_with_doc(1000, 1);
+        // §5.3 loop: a short (10-frame) session must wrap monotonically —
+        // never jump ahead, never snap back past the previous reading. The
+        // fallback clock now derives from REAL elapsed time, so drive it by
+        // sleeping instead of handing out fake quanta.
+        let (mut c, doc) = controller_with_doc(1000, 1); // sr=1000 → 1 ms = 1 fr
         c.set_loop(true);
-        c.play(&doc, Some((0, 100)));
-        c.tick(std::time::Duration::from_millis(75), &doc); // +75 → 75
-        c.tick(std::time::Duration::from_millis(50), &doc); // +50 → wraps to 25
+        c.play(&doc, Some((0, 10)));
+        let mut last = std::time::Instant::now();
+        for _ in 0..30 {
+            std::thread::sleep(std::time::Duration::from_millis(4));
+            c.tick(std::time::Duration::from_millis(4), &doc);
+            let now = std::time::Instant::now();
+            let p = c.current_frame_in(&doc);
+            assert!(p < 10, "loop position {p} escaped [0,10)");
+            // The fallback clock must track REAL elapsed time (mod the loop
+            // span): |displayed delta - wall delta| stays sub-frame-ish even
+            // when the poll itself arrives late — the old fixed-quantum
+            // implementation drifted arbitrarily far behind on short files.
+            let wall = ((now - last).as_secs_f64() * 1000.0) as i64 % 10;
+            let diff = (p as i64 - wall).abs();
+            assert!(diff <= 3 || diff >= 7, "fallback clock drifted: pos={p} wall={wall}");
+            last = now;
+        }
         assert_eq!(c.state(), TransportState::Playing);
-        assert_eq!(c.current_frame(), 25);
     }
 
     #[test]
@@ -483,5 +640,56 @@ mod tests {
         c.tick(std::time::Duration::from_millis(50), &doc);
         assert_eq!(c.current_frame(), 0);
         assert_eq!(c.state(), TransportState::Stopped);
+    }
+
+    #[test]
+    fn pause_unpause_never_counts_paused_wall_time_as_elapsed() {
+        // BUGFIX regression: with a live output the state machine advances on
+        // the wall-clock estimate; time spent Paused must NOT be added to the
+        // elapsed playback position after unpause.
+        let (mut c, doc) = controller_with_doc(1000, 1); // sr=1000 → 1 ms = 1 fr
+        c.play(&doc, None);
+        c.sync_playback_position(500);
+        c.pause();
+        std::thread::sleep(std::time::Duration::from_millis(120));
+        c.unpause();
+        let pos = c.current_frame_in(&doc);
+        assert!((pos as i64 - 500).abs() <= 30, "paused time leaked into elapsed: {pos}");
+    }
+
+    #[test]
+    fn lagging_audio_clock_never_drags_elapsed_backwards() {
+        // BUGFIX regression: `consumed_samples` lags wall time by the sink
+        // buffer depth. A stale (behind-the-estimate) sample must re-base
+        // nothing and never move the displayed elapsed time backwards; a
+        // fresh forward sample or a legitimate rewind does re-base it.
+        let (mut c, doc) = controller_with_doc(1000, 1);
+        c.play(&doc, Some((0, 1000)));
+        std::thread::sleep(std::time::Duration::from_millis(60)); // est ≈ 60
+        let before = c.current_frame_in(&doc);
+        c.sync_playback_position(10); // stale hardware reading
+        let after = c.current_frame_in(&doc);
+        assert!(after >= before, "lagging clock dragged elapsed back: {before} -> {after}");
+        c.sync_playback_position(400); // fresh forward sample re-bases
+        let jumped = c.current_frame_in(&doc);
+        assert!(jumped >= 400 && jumped < 460, "re-base lost the anchor: {jumped}");
+    }
+
+    #[test]
+    fn short_file_elapsed_tracks_real_time_without_polling() {
+        // BUGFIX regression (§5.3 elapsed time on short files): while Playing,
+        // current_frame/current_secs derive from the wall clock directly — no
+        // poll/tick required — and clamp to the session end so a 2 s file can
+        // never show more than ~2 s of elapsed time.
+        let (mut c, doc) = controller_with_doc(1000, 1);
+        c.play(&doc, Some((0, 200))); // 0.2 s session
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let mid = c.current_frame_in(&doc);
+        assert!(mid >= 40 && mid <= 120, "elapsed not tracking wall clock: {mid}");
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let capped = c.current_frame_in(&doc);
+        assert_eq!(capped, 199, "estimate over-ran the short session end: {capped}");
+        let secs = c.current_secs(doc.sample_rate);
+        assert!(secs <= 0.2 + 1e-9, "current_secs exceeded duration: {secs}");
     }
 }

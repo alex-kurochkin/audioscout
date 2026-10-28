@@ -404,7 +404,7 @@ impl AudioScoutApp {
                     // tz §5.3 CursorSource::Playback).
                     if self.output.is_some() && self.player_state() == TransportState::Playing {
                         let mut ctrl = self.player.lock().unwrap_or_else(|p| p.into_inner());
-                        ctrl.freeze_resume_at(frame);
+                        ctrl.freeze_resume_at(frame, self.document.sample_rate);
                         drop(ctrl);
                         // BUGFIX (cursor jump-ahead / snap-back): this event
                         // carries the raw hardware clock, which LAGS wall time
@@ -760,7 +760,7 @@ impl AudioScoutApp {
             if self.output.is_some() {
                 // With a live output the state machine must not advance on its
                 // own clock — the real playhead arrives via PlayheadUpdate.
-                ctrl.mark_playing(start, if end > start { end } else { self.document.total_frames() });
+                ctrl.mark_playing(start, if end > start { end } else { self.document.total_frames() }, self.document.sample_rate);
             } else {
                 ctrl.play(&self.document, sel);
             }
@@ -899,7 +899,7 @@ impl AudioScoutApp {
             self.playhead_est_at = std::time::Instant::now();
             {
                 let mut ctrl = self.player.lock().unwrap_or_else(|p| p.into_inner());
-                ctrl.sync_playback_position(true_frame);
+                ctrl.sync_playback_position_in(true_frame, Some(&self.document));
             }
             self.audio_view.set_cursor(frame);
             self.audio_view.auto_scroll_to_cursor();
