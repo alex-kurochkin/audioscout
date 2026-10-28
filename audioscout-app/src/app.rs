@@ -1402,7 +1402,10 @@ impl eframe::App for AudioScoutApp {
                             egui::pos2(cursor_screen_x + 4.0, overlay_start_y),
                             egui::pos2(cursor_screen_x, overlay_start_y + 6.0),
                         ],
-                        egui::Color32::RED.into(),
+                        // Color32 already satisfies `Into<Color32>`; the `.into()` call made
+                        // the target type ambiguous (E0283) since Color32 converts into Hsva,
+                        // Rgba and others too.
+                        egui::Color32::RED,
                         egui::Stroke::NONE,
                     ));
                 }

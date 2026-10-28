@@ -1175,14 +1175,14 @@ fn controller_thread(
 }
 
 // BUGFIX (playback dies ~0.5 s after start): pacing thread for the Sink.
-///
+//
 // The previous implementation appended the whole [start,end) session as one
 // giant `SamplesBuffer<f32>` inside `apply_play!`. For a 166 k-frame file
 // that is a ~60 MB allocation + memcpy storm (the disk hammering the user
 // observed was page-cache churn), and once the cpal hardware clock drained
 // the first pre-buffered period (~0.5 s at 44.1 kHz) there was nothing left
 // in the queue → silence.
-///
+//
 // The pump now owns all audible samples: it watches the audio clock advanced
 // by `MeteredSource` inside the cpal callback, and whenever the Sink has
 // consumed enough frames it appends the NEXT small chunk (≈0.5 s of audio)
