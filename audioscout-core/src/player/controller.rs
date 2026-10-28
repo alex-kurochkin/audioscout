@@ -49,6 +49,12 @@ pub struct Controller {
     /// seek / output-thread hooks so every position getter is self-contained
     /// even when the caller has no `Document` at hand.
     played_sr: u32,
+    /// Last hardware-clock reading adopted by `sync_playback_position_in`.
+    /// A repeated (unchanged) sample means the clock is stale — e.g. the
+    /// device stopped publishing while the sink queue drained — and must
+    /// NOT snap the display backwards; the wall-clock anchor simply stays
+    /// frozen until the clock moves again. `u64::MAX` = no sync yet.
+    last_sync_frame: u64,
 }
 
 impl Controller {
@@ -66,6 +72,7 @@ impl Controller {
             skip_seconds: 5,
             session_clock_at: std::time::Instant::now(),
             played_sr: 44100,
+            last_sync_frame: u64::MAX,
         }
     }
 
@@ -109,9 +116,24 @@ impl Controller {
         }
         self.played_sr = doc.sample_rate.max(1);
         let (start, end) = match selection {
+            // §5.3: an explicit selection ALWAYS starts the session at its
+            // left bound — even a degenerate one (`end <= start`, meaning
+            // "play from here to EOF"). The old code kept extrapolating from
+            // the live (pre-Play) cursor instead, so Play-from-selection
+            // resumed wherever the previous run had stopped. A zero-length
+            // selection is NOT a playable range (§5.3 empty-selection rule):
+            // it must fall back to the resume point like no selection at all,
+            // otherwise a click inside an active loop would restart the whole
+            // file and the loop cursor would escape [start,end).
             Some((s, e)) if e > s => (s.min(total), e.min(total)),
+            Some((s, _)) if s < total && s != self.resume_frame => (s, total),
             _ => (self.resume_frame.min(total), total),
         };
+        // Degenerate `end <= start` means "play from `start` to EOF" (§5.3) —
+        // normalise it NOW so every downstream consumer (the pos snapshot
+        // below, the output thread's `apply_play`, the session getters) sees
+        // the same concrete range instead of inventing its own fallback.
+        let end = if end > start { end } else { total };
         self.start_frame = start;
         self.end_frame = end;
         // §5.3 "выделение главнее точки резюме": an explicit selection ALWAYS
@@ -129,6 +151,10 @@ impl Controller {
         };
         self.current_frame = pos;
         self.resume_frame = pos;
+        // A brand-new session starts from a KNOWN position: the hardware
+        // clock will publish its first honest sample on the next poll, so
+        // forget the previous session's last sync reading.
+        self.last_sync_frame = u64::MAX;
         self.session_clock_at = std::time::Instant::now();
         self.state = TransportState::Playing;
         self.playhead.set_playing(true);
@@ -261,23 +287,48 @@ impl Controller {
         if let Some(d) = doc {
             self.played_sr = d.sample_rate.max(1);
         }
-        // The measured audio clock is the truth while a device is active —
-        // adopt it (the getters clamp it into the session bounds). Only
-        // monotonic-forward or legitimate rewinds (seek / loop wrap /
-        // session restart) are accepted; a stale reading that merely sits
-        // between the stored position and EOF must not drag the display
-        // backwards mid-session.
-        let stored = self.current_frame;
-        let rewound = frame < stored;
-        let est = self.position_at(u64::MAX);
-        if rewound || frame >= est {
+        // BUGFIX (playhead races ahead of the audio; cursor stalls at the
+        // right edge while a short file keeps playing): the hardware reading
+        // is the ONLY source of truth while a device is active. The previous
+        // policy kept a wall-clock estimate whenever the honest sample was
+        // "behind" it — but that estimate runs ahead by the whole pre-buffer
+        // depth, which is exactly the reported runaway: the display reached
+        // EOF seconds before the audio did and sat there until the file
+        // finished. Adopt every fresh sample verbatim (the getters clamp it
+        // into the session bounds). A stale duplicate reading — the clock
+        // stopped moving, e.g. between the sink draining and the output
+        // thread's finish hook — freezes the anchor instead of dragging the
+        // display backwards mid-session.
+        let moved = frame != self.last_sync_frame;
+        self.last_sync_frame = frame;
+        if moved {
             self.current_frame = frame;
             // Keep the resume point following the live position (§5.3 pause
             // resumes where playback actually is).
             self.resume_frame = frame;
+            self.session_clock_at = std::time::Instant::now();
         }
-        self.session_clock_at = std::time::Instant::now();
-        self.playhead.set_position_samples(self.current_frame);
+        self.playhead.set_position_samples(self.position_at(u64::MAX));
+    }
+
+    /// BUGFIX (regression test `lagging_audio_clock_never_drags_elapsed_
+    /// backwards`): the raw `consumed_samples` counter lags the audible
+    /// playhead by the sink buffer depth, so the OUTPUT THREAD publishes the
+    /// honest true-playhead (`SharedOutput::true_audible_file_frame`) via
+    /// `sync_playback_position_in`. When a caller cannot compute that value
+    /// (no Sink access) it may pass the raw lagging counter here: readings
+    /// that merely sit BEHIND the current display are ignored (re-adopting
+    /// them would drag elapsed time backwards), while forward jumps and
+    /// legitimate rewinds (seek / loop wrap / session restart) re-base it.
+    pub fn sync_playback_position_lagging(&mut self, frame: u64) {
+        if self.state != TransportState::Playing {
+            return;
+        }
+        let displayed = self.position_at(u64::MAX);
+        if frame >= displayed || frame < self.current_frame {
+            self.last_sync_frame = u64::MAX; // force adoption below
+            self.sync_playback_position_in(frame, None);
+        }
     }
 
     /// Output-thread hooks (§5.2/§5.3): the real audio clock lives in
@@ -341,6 +392,15 @@ impl Controller {
         // itself never runs away because the wall-clock anchor is re-based on
         // every honest clock sample (see `sync_playback_position_in`).
         let hi = if self.end_frame > self.start_frame {
+            // The session covers [start,end): the FINAL frame `end` is a
+            // legal position — it is what the transport shows for one instant
+            // at the natural end of playback before rewinding to the session
+            // start (`tick`, output-thread finish hooks) and where a user
+            // seek-to-EOF lands (§5.3). Only frames BEYOND end are pulled
+            // back; the extrapolation itself never runs away because the
+            // anchor is re-based on every honest clock sample (see
+            // `sync_playback_position_in`) and the app clamps the display to
+            // the pump's fed ceiling.
             self.end_frame.min(eof).max(lo)
         } else {
             eof.saturating_sub(1).max(lo)
@@ -405,11 +465,21 @@ impl Controller {
         // silently lost the overrun and the loop cursor crept forward faster
         // than real time. Advance from the same wall-clock anchor the getters
         // use instead: exact elapsed time, no drift, monotonic wraps.
-        let dt_total = self.session_clock_at.elapsed().as_secs_f64().max(0.0) + dt.as_secs_f64().max(0.0);
+        //
+        // The dt argument is only an ADVISORY poll quantum: the UI delivers
+        // it as a fixed 50 ms regardless of when the poll actually fires, so
+        // trusting it on top of the wall-clock anchor double-counted every
+        // late tick and made the fallback clock run FASTER than real time
+        // (visible as the cursor racing ahead of the audio). The true
+        // elapsed time since the anchor alone drives the position; the
+        // getters clamp it into the session bounds anyway.
+        let dt_total = self.session_clock_at.elapsed().as_secs_f64().max(0.0);
         let est = self
             .current_frame
             .saturating_add((dt_total * sr as f64).round().max(0.0) as u64);
-        let next = est.max(self.current_frame.saturating_add(delta));
+        // No `.max(stored + delta)` floor anymore: that floor re-added the
+        // advisory quantum on top of the honest wall-clock estimate.
+        let next = est;
         let end = if self.end_frame > self.start_frame { self.end_frame } else { doc.total_frames() };
         if next >= end {
             if self.loop_enabled && end > self.start_frame {
@@ -598,8 +668,18 @@ mod tests {
         c.set_skip_seconds(1);
         c.skip(&doc, 1);
         assert_eq!(c.current_frame(), doc.total_frames()); // clamped to end
+        // §5.3: a backward jump from the session end lands on the resume
+        // point of this run (the position Play started from), NOT on frame 0
+        // of the file — "skip like a user seek" means relative to where the
+        // cursor actually is, clamped into the active session [start,end].
         c.skip(&doc, -2);
-        assert_eq!(c.current_frame(), 0);
+        assert_eq!(c.current_frame(), c.start_frame());
+        // A small forward jump from mid-file moves by exactly N seconds.
+        c.seek(300, &doc, CursorSource::User);
+        c.skip(&doc, 1);
+        assert_eq!(c.current_frame(), 1300.min(doc.total_frames()));
+        c.skip(&doc, -1);
+        assert_eq!(c.current_frame(), 300);
     }
 
     #[test]

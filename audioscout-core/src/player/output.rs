@@ -997,7 +997,7 @@ fn controller_thread(
 
     // BUGFIX (regression "controller thread exited normally (shutdown?)"
     // ~2.5 s after startup, before any command arrived): the loop used to be
-    // `'outer: loop { ... Some(Cmd::Shutdown) | None => break 'outer }` —
+    // `'outer: loop { ... break on every idle recv }` —
     // `recv_timeout` returns Err(Timeout) on every idle tick and `.ok()`
     // turns that into None, so a mere 50 ms without commands (i.e. the whole
     // time the app simply sits there with nothing loaded) killed both the
