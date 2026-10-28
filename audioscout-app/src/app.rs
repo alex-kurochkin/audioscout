@@ -1311,7 +1311,7 @@ impl eframe::App for AudioScoutApp {
                 // through gaps. Track where overlays must start: everything
                 // below is drawn on top of the audio content (§3.5 — курсор
                 // поверх дорожек).
-                let mut overlay_start_y = rect.top();
+                let overlay_start_y = rect.top();
 
                 // Spectrogram mode: draw the pre-rendered widget-resolution
                 // image first; markers/selection/cursor overlay on top of it.

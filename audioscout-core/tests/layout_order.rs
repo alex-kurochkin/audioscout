@@ -481,15 +481,17 @@ fn device_enumeration_uses_cpal_015_host_api_via_rodio_reexport() {
     // device picker deliberately imports ONLY HostTrait because DeviceTrait
     // methods there are called fully-qualified — a combined import there is
     // an unused-import warning). Assert each function's own import line.
-    assert "fn list_all_named_devices" in code and \
-        "use rodio::cpal::traits::{DeviceTrait, HostTrait};" in code.split("fn list_all_named_devices")[1], \
-        "list_all_named_devices must import both cpal traits for devices()/name()"
-    assert "fn device_has_output" in code and \
-        "use rodio::cpal::traits::DeviceTrait;" in code.split("fn device_has_output")[1].split("\nfn ")[0], \
-        "device_has_output must import DeviceTrait for supported_output_configs()"
-    assert "fn pick_output_device" in code and \
-        "use rodio::cpal::traits::HostTrait;" in code.split("fn pick_output_device")[1].split("\n\n", 1)[0], \
-        "pick_output_device must import HostTrait for default_output_device()"
+    assert!(code.contains("fn list_all_named_devices")
+        && code.split("fn list_all_named_devices").nth(1).unwrap().contains("use rodio::cpal::traits::{DeviceTrait, HostTrait};"),
+        "list_all_named_devices must import both cpal traits for devices()/name()");
+    let dev_body = code.split("fn device_has_output").nth(1).unwrap().split("\nfn ").next().unwrap();
+    assert!(code.contains("fn device_has_output")
+        && dev_body.contains("use rodio::cpal::traits::DeviceTrait;"),
+        "device_has_output must import DeviceTrait for supported_output_configs()");
+    let pick_head = code.split("fn pick_output_device").nth(1).unwrap().split("\n\n").next().unwrap();
+    assert!(code.contains("fn pick_output_device")
+        && pick_head.contains("use rodio::cpal::traits::HostTrait;"),
+        "pick_output_device must import HostTrait for default_output_device()");
 
     // Output-capability filtering and device typing. Probing must be LAZY
     // (per candidate in pick_output_device), never eager for every device —
@@ -508,15 +510,15 @@ fn device_enumeration_uses_cpal_015_host_api_via_rodio_reexport() {
     // cpal 0.15 HostId has no as_str(); the Pulse route is detected through
     // the *device name* of each host's default_output_device(), plus the
     // ALSA-host virtual plugins ("pulse"/"default"/"dmix") preference list.
-    assert (
+    assert!(
         code.contains("\"pulse\"")
-        and code.contains("lname.contains(\"pulse\") || lname.contains(\"pipewire\")")
-        and 'const PREFERRED: [&str; 3] = ["pulse", "default", "dmix"];' in code
-    ), "PulseAudio routing must be preferred over raw ALSA PCMs (by device name)"
+        && code.contains("lname.contains(\"pulse\") || lname.contains(\"pipewire\")")
+        && code.contains("const PREFERRED: [&str; 3] = [\"pulse\", \"default\", \"dmix\"];"),
+        "PulseAudio routing must be preferred over raw ALSA PCMs (by device name)");
     assert!(!code.contains("fn find_alsa_default_device"), "old exact-\"default\" scanner removed");
     assert!(
         code.contains("rodio::OutputStream::try_from_device_config(device, cfg)")
-        and code.contains("fn select_f32_output_config(device: &rodio::cpal::Device) -> Option<rodio::cpal::SupportedStreamConfig>"),
+        && code.contains("fn select_f32_output_config(device: &rodio::cpal::Device) -> Option<rodio::cpal::SupportedStreamConfig>"),
         "chosen device must be opened with an explicit f32 SupportedStreamConfig (try_from_device_config)"
     );
     assert!(code.contains("OutputStream::try_default()"), "fallback to the system default device must remain");
@@ -551,7 +553,9 @@ fn playback_is_paced_by_a_sink_queue_budget_not_wall_clock_sleeps() {
     assert!(flat.contains("let sink = match rodio::Sink::try_new(&handle) { Ok(s) => Arc::new(s)"), "Sink must be wrapped in Arc right after try_new");
     // `Arc<Sink>` clones ARE allowed (`Some(s) => s.clone()`); a bare
     // `sink_clone` binding or an append through one was the old broken shape.
-    assert!("let sink_clone" not in flat and "sink_clone.append" not in flat, "no rodio::Sink::clone into a local — Sink is not Clone in rodio 0.19");
+    assert!(
+        !flat.contains("let sink_clone") && !flat.contains("sink_clone.append"),
+        "no rodio::Sink::clone into a local — Sink is not Clone in rodio 0.19");
     assert!(flat.contains("fn controller_thread( sink: Arc<rodio::Sink>,"), "controller thread takes the Arc<Sink> handle");
 
     // Pump pacing by queue budget.
