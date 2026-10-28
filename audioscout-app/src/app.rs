@@ -1100,9 +1100,14 @@ impl AudioScoutApp {
                 .stroke(egui::Stroke::NONE)
         );
 
-        // Change cursor to hand on hover
-        if response.hovered() {
+        // Change cursor to hand on hover. `contains_pointer()` is checked
+        // alongside `hovered()` so the hand appears in the very frame the
+        // pointer enters the row (see the `hand_cursor` helper for the
+        // full rationale) and requests a repaint so the icon updates even
+        // when the mouse-stop would otherwise leave egui idle.
+        if response.hovered() || response.contains_pointer() {
             ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::PointingHand);
+            ui.ctx().request_repaint();
         }
 
         // Handle clicks
@@ -1236,8 +1241,21 @@ impl eframe::App for AudioScoutApp {
         // the stream — and hand the delta to the audio view via
         // `pending_wheel_delta`. A second copy of the same snapshot covers
         // the case where the pointer hovers nothing scrollable at all.
-        let wheel_dy = ctx.input(|i| {
-            i.events
+        //
+        // IMPORTANT: ownership of the delta is decided HERE, against the
+        // live pointer position and the audio-view panel rect, not inside
+        // the panel via `response.hovered()`. `Response::hovered()` reports
+        // the PREVIOUS frame's hover state; when a MouseWheel event arrives
+        // in the very same frame as the mouse-move that entered the view
+        // (the common "move mouse over the wave, start scrolling" case),
+        // the panel still believes the pointer is elsewhere, never calls
+        // `take()`, and the zoom silently does nothing. Checking the actual
+        // pointer coords against `Memory::area_rect("audio_view")` removes
+        // that one-frame race entirely.
+        let audio_view_rect = ctx.memory(|m| m.area_rect(egui::Id::new("audio_view")));
+        let (wheel_dy, pointer_over_audio_view) = ctx.input(|i| {
+            let dy = i
+                .events
                 .iter()
                 .filter_map(|e| match e {
                     egui::Event::MouseWheel { unit, delta, .. } => match unit {
@@ -1247,9 +1265,18 @@ impl eframe::App for AudioScoutApp {
                     },
                     _ => None,
                 })
-                .sum::<f32>()
+                .sum::<f32>();
+            let over_view = dy != 0.0
+                && i.pointer.hover_pos().is_some_and(|p| {
+                    audio_view_rect.is_some_and(|r| r.contains(p))
+                });
+            (dy, over_view)
         });
-        self.pending_wheel_delta = (wheel_dy != 0.0).then_some(wheel_dy);
+        // Only claim the delta when the pointer actually hovers the audio
+        // view; otherwise drop it so the file list / other scroll areas
+        // keep their normal wheel behaviour and stale deltas from earlier
+        // frames never leak into a later zoom action.
+        self.pending_wheel_delta = pointer_over_audio_view.then_some(wheel_dy);
 
         self.process_events(ctx);
         self.handle_keyboard(ctx);
@@ -1281,14 +1308,26 @@ impl eframe::App for AudioScoutApp {
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             let ctx = ui.ctx().clone();
             let hand_cursor = |resp: &egui::Response| -> bool {
-                if resp.hovered() {
+                // UX: pointing-hand cursor on hover. `hovered()` alone is
+                // frame-lagged and goes false while the pointer *enters*
+                // the widget in the same frame (the icon then only appears
+                // one repaint later, or not at all when nothing else
+                // schedules a redraw). `contains_pointer()` is computed
+                // from this frame's live pointer position against the
+                // widget rect, so the hand shows up immediately; clicks
+                // still come from `resp.clicked()`.
+                if resp.hovered() || resp.contains_pointer() {
                     ctx.output_mut(|o| o.cursor_icon = egui::CursorIcon::PointingHand);
                 }
                 resp.clicked()
             };
             ui.horizontal(|ui| {
                 ui.label("Filter:");
-                ui.text_edit_singleline(&mut self.filter_text);
+                // UX: text fields get the I-beam cursor explicitly (egui's
+                // default style never changes the mouse cursor).
+                if ui.text_edit_singleline(&mut self.filter_text).hovered() {
+                    ctx.output_mut(|o| o.cursor_icon = egui::CursorIcon::Text);
+                }
                 if hand_cursor(&ui.button("✕")) { self.filter_text.clear(); }
                 ui.separator();
                 if hand_cursor(&ui.button("Columns")) { self.show_columns_dialog = true; }
@@ -1578,14 +1617,14 @@ impl eframe::App for AudioScoutApp {
             // Ctrl+wheel zoom nor plain-wheel pan reacted (the +/- buttons
             // kept working). `pending_wheel_delta` is snapshotted at the top
             // of `update()` from the raw MouseWheel events, before any panel
-            // can drain them; it is taken (and cleared) only while the
-            // pointer is over this view, so scrolling the file list with the
-            // mouse above it still behaves normally.
-            let wheel_dy = if response.hovered() {
-                self.pending_wheel_delta.take()
-            } else {
-                None
-            };
+            // can drain them; ownership was already decided there against
+            // the LIVE pointer position and this panel's rect (see the
+            // handler in `update()`), so here we simply take it — reading
+            // `response.hovered()` instead would use last frame's hover
+            // state and swallow the delta whenever a wheel event arrives in
+            // the same frame the pointer entered the view (zoom "stopped
+            // working" regression).
+            let wheel_dy = self.pending_wheel_delta.take();
             if let Some(dy) = wheel_dy {
                 let ctrl = ctx.input(|i| i.modifiers.ctrl);
                 if ctrl {
@@ -1624,7 +1663,15 @@ impl eframe::App for AudioScoutApp {
             ui.allocate_ui(egui::vec2(meter_rect.min.x - 6.0 - panel_rect.min.x, panel_rect.height()), |ui| {
             let ctx = ui.ctx().clone();
             let hand_cursor = |resp: &egui::Response| -> bool {
-                if resp.hovered() {
+                // UX: pointing-hand cursor on hover. `hovered()` alone is
+                // frame-lagged and goes false while the pointer *enters*
+                // the widget in the same frame (the icon then only appears
+                // one repaint later, or not at all when nothing else
+                // schedules a redraw). `contains_pointer()` is computed
+                // from this frame's live pointer position against the
+                // widget rect, so the hand shows up immediately; clicks
+                // still come from `resp.clicked()`.
+                if resp.hovered() || resp.contains_pointer() {
                     ctx.output_mut(|o| o.cursor_icon = egui::CursorIcon::PointingHand);
                 }
                 resp.clicked()
@@ -1647,7 +1694,11 @@ impl eframe::App for AudioScoutApp {
                 ui.separator();
                 ui.label("Vol:");
                 let mut vol = self.player.lock().unwrap_or_else(|p| p.into_inner()).volume() * 100.0;
-                if ui.add(egui::Slider::new(&mut vol, 0.0..=100.0)).changed() { self.transport_set_volume(vol / 100.0); }
+                {
+                    let slider_resp = ui.add(egui::Slider::new(&mut vol, 0.0..=100.0));
+                    if slider_resp.hovered() { ctx.output_mut(|o| o.cursor_icon = egui::CursorIcon::ResizeHorizontal); }
+                    if slider_resp.changed() { self.transport_set_volume(vol / 100.0); }
+                }
                 ui.separator();
                 let save_color = if self.document.dirty { egui::Color32::YELLOW } else { ui.visuals().text_color() };
                 let save_label = if self.document.dirty { "Save*" } else { "Save" };
@@ -1681,7 +1732,15 @@ impl eframe::App for AudioScoutApp {
         egui::TopBottomPanel::bottom("actions").default_height(40.0).show(ctx, |ui| {
             let ctx = ui.ctx().clone();
             let hand_cursor = |resp: &egui::Response| -> bool {
-                if resp.hovered() {
+                // UX: pointing-hand cursor on hover. `hovered()` alone is
+                // frame-lagged and goes false while the pointer *enters*
+                // the widget in the same frame (the icon then only appears
+                // one repaint later, or not at all when nothing else
+                // schedules a redraw). `contains_pointer()` is computed
+                // from this frame's live pointer position against the
+                // widget rect, so the hand shows up immediately; clicks
+                // still come from `resp.clicked()`.
+                if resp.hovered() || resp.contains_pointer() {
                     ctx.output_mut(|o| o.cursor_icon = egui::CursorIcon::PointingHand);
                 }
                 resp.clicked()
@@ -1689,7 +1748,10 @@ impl eframe::App for AudioScoutApp {
             ui.horizontal(|ui| {
                 if hand_cursor(&ui.button("Mute")) { self.mute_selection(); }
                 ui.label("Normalize:");
-                ui.add(egui::DragValue::new(&mut self.normalize_dbfs).range(-60.0..=0.0).suffix(" dBFS"));
+                {
+                    let dv_resp = ui.add(egui::DragValue::new(&mut self.normalize_dbfs).range(-60.0..=0.0).suffix(" dBFS"));
+                    if dv_resp.hovered() { ctx.output_mut(|o| o.cursor_icon = egui::CursorIcon::ResizeHorizontal); }
+                }
                 if hand_cursor(&ui.button("Apply")) { self.normalize_selection(); }
                 ui.separator();
                 if hand_cursor(&ui.button("Delete all markers")) { self.document.markers.clear(); }
@@ -2003,7 +2065,19 @@ impl eframe::App for AudioScoutApp {
                                     // row — the whole row is clickable
                                     // (single click selects, double click
                                     // loads), so it must look like a link.
-                                    if cell_response.hovered() {
+                                    // NOTE: `Response::hovered()` is false
+                                    // whenever some OTHER widget owns the
+                                    // hover this frame — e.g. the label or
+                                    // thumbnail inside the very same cell,
+                                    // which are allocated before this
+                                    // `interact()` call. Using it alone made
+                                    // the pointer stay an arrow over most of
+                                    // each row. `contains_pointer` ignores
+                                    // that priority contest and answers the
+                                    // real question ("is the mouse inside
+                                    // this row?"), so it drives the cursor
+                                    // here; `hovered()` still drives clicks.
+                                    if cell_response.hovered() || cell_response.contains_pointer() {
                                         any_row_hovered = true;
                                     }
 
@@ -2037,6 +2111,7 @@ impl eframe::App for AudioScoutApp {
                         // UX: pointing-hand cursor over file rows (hover).
                         if any_row_hovered {
                             ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::PointingHand);
+                            ui.ctx().request_repaint();
                         }
                     });
 
