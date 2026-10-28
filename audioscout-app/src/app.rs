@@ -139,6 +139,12 @@ pub struct AudioScoutApp {
     /// Stop) exactly like `playhead_est_frame`; the output thread republishes
     /// the honest value from the pump on its first append after a transition.
     playhead_fed_ceiling: Option<u64>,
+    /// BUGFIX (wheel zoom in the player stopped working): raw vertical wheel
+    /// delta (`MouseWheel` events, in points) snapshotted at the start of
+    /// `update()` — before any ScrollArea can consume `smooth_scroll_delta` —
+    /// and taken by the audio-view panel when the pointer hovers it. See the
+    /// handler in `update()` for the full rationale.
+    pending_wheel_delta: Option<f32>,
 }
 
 impl AudioScoutApp {
@@ -243,6 +249,7 @@ impl AudioScoutApp {
             // No session engaged yet — the pump publishes the real ceiling
             // after its first append (see `poll_playhead`).
             playhead_fed_ceiling: None,
+            pending_wheel_delta: None,
         };
 
         // Restore the two independent Waveform/Spectrogram toggles from the
@@ -1216,22 +1223,33 @@ impl eframe::App for AudioScoutApp {
                 self.meter_hold.peak_l *= k; self.meter_hold.peak_r *= k;
             }
         }
-        // BUGFIX (wheel zoom in the player stopped working): the scroll delta
-        // is consumed inside the audio-view panel below, but egui's InputState
-        // only reports a NON-ZERO `smooth_scroll_delta` while the pointer is
-        // actually hovering some widget. After playback starts the mouse sits
-        // still over the waveform and egui stops emitting hover updates for
-        // widgets whose area did not change (`hovered_widget` keeps its stale
-        // rect from the previous frame), so `smooth_scroll_delta.y` reads 0
-        // and neither the Ctrl+wheel zoom nor plain wheel horizontal scroll
-        // fires until the user moves the mouse again. Force a repaint on every
-        // real scroll event so the input state — and with it the pointer
-        // position used by the zoom handler — is re-evaluated each frame.
-        ctx.on_request_repaint(move |_, data| {
-            if data.input(|i| i.smooth_scroll_delta != egui::Vec2::ZERO) {
-                data.request_repaint();
-            }
+        // BUGFIX (wheel zoom / wheel pan in the player stopped working):
+        // egui's `InputState::smooth_scroll_delta` is CONSUMED by whichever
+        // ScrollArea runs first in the frame — the file list's vertical
+        // ScrollArea sits in the CentralPanel, which egui processes BEFORE
+        // the bottom panels are laid out. Once the file list has eaten the
+        // delta, the audio-view handler below read 0 and neither Ctrl+wheel
+        // zoom nor plain-wheel horizontal pan fired (the +/- buttons kept
+        // working because they call `zoom_in()/zoom_out()` directly). The
+        // raw wheel events are untouched by consumption, so snapshot them
+        // here — at the very start of `update`, before any panel can drain
+        // the stream — and hand the delta to the audio view via
+        // `pending_wheel_delta`. A second copy of the same snapshot covers
+        // the case where the pointer hovers nothing scrollable at all.
+        let wheel_dy = ctx.input(|i| {
+            i.events
+                .iter()
+                .filter_map(|e| match e {
+                    egui::Event::MouseWheel { unit, delta, .. } => match unit {
+                        egui::MouseWheelUnit::Line => Some(delta.y * 30.0),
+                        egui::MouseWheelUnit::Point => Some(delta.y),
+                        egui::MouseWheelUnit::Page => Some(delta.y * 400.0),
+                    },
+                    _ => None,
+                })
+                .sum::<f32>()
         });
+        self.pending_wheel_delta = (wheel_dy != 0.0).then_some(wheel_dy);
 
         self.process_events(ctx);
         self.handle_keyboard(ctx);
@@ -1251,13 +1269,28 @@ impl eframe::App for AudioScoutApp {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
 
+        // UX: pointing-hand cursor over every interactive button. egui's
+        // default style never changes the mouse cursor, so buttons looked
+        // inert. Instead of guessing from previous-frame memory (the old
+        // `interacted_widget` / `hovered_widget` APIs no longer exist in
+        // egui 0.29), we use an immediate-mode helper `hand_cursor(ui)`
+        // that sets `CursorIcon::PointingHand` whenever the returned
+        // response is hovered. Panels below call it for toolbars, player
+        // transport, file rows and folder tree items.
+        fn hand_cursor(ui: &egui::Ui, resp: &egui::Response) -> bool {
+            if resp.hovered() {
+                ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::PointingHand);
+            }
+            resp.clicked()
+        }
+
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.label("Filter:");
                 ui.text_edit_singleline(&mut self.filter_text);
-                if ui.button("✕").clicked() { self.filter_text.clear(); }
+                if hand_cursor(ui, &ui.button("✕")) { self.filter_text.clear(); }
                 ui.separator();
-                if ui.button("Columns").clicked() { self.show_columns_dialog = true; }
+                if hand_cursor(ui, &ui.button("Columns")) { self.show_columns_dialog = true; }
                 ui.separator();
                 // Table thumbnail style toggle (§3.1): the code to switch
                 // modes existed but had no control — this button exposes the
@@ -1267,7 +1300,7 @@ impl eframe::App for AudioScoutApp {
                     preview_spectro,
                     if preview_spectro { "Spectrogram" } else { "Waveform" },
                 );
-                if ui.add(preview_btn).on_hover_text("Toggle table previews between waveform and spectrogram").clicked() {
+                if hand_cursor(ui, &ui.add(preview_btn).on_hover_text("Toggle table previews between waveform and spectrogram")) {
                     self.toggle_preview_mode();
                 }
                 // NOTE: the second Waveform/Spectrogram toggle that used to sit
@@ -1275,7 +1308,7 @@ impl eframe::App for AudioScoutApp {
                 // audio-view display mode has exactly ONE control now, the one
                 // on the player panel below.
                 ui.separator();
-                if ui.button("Settings").clicked() { self.show_settings = true; }
+                if hand_cursor(ui, &ui.button("Settings")) { self.show_settings = true; }
             });
         });
 
@@ -1536,13 +1569,40 @@ impl eframe::App for AudioScoutApp {
                 }
             }
 
-            ui.input(|i| {
-                let scroll = i.smooth_scroll_delta;
-                if i.modifiers.ctrl {
-                    if scroll.y > 0.0 { if let Some(pos) = i.pointer.hover_pos() { let x_ratio = ((pos.x - rect.left()) / rect.width()).clamp(0.0, 1.0); self.audio_view.zoom_at_x(1.25, x_ratio as f64); } }
-                    else if scroll.y < 0.0 { if let Some(pos) = i.pointer.hover_pos() { let x_ratio = ((pos.x - rect.left()) / rect.width()).clamp(0.0, 1.0); self.audio_view.zoom_at_x(1.0 / 1.25, x_ratio as f64); } }
-                } else if scroll.y != 0.0 { self.audio_view.scroll_horizontal(-scroll.y as f64 * 0.01); }
-            });
+            // BUGFIX (wheel zoom / horizontal wheel pan stopped working):
+            // `ui.input(|i| i.smooth_scroll_delta)` used to be read here,
+            // but by the time this bottom panel runs, the file list's
+            // ScrollArea in the CentralPanel has already CONSUMED the delta
+            // for its own scrolling — the value arrived as 0 and neither
+            // Ctrl+wheel zoom nor plain-wheel pan reacted (the +/- buttons
+            // kept working). `pending_wheel_delta` is snapshotted at the top
+            // of `update()` from the raw MouseWheel events, before any panel
+            // can drain them; it is taken (and cleared) only while the
+            // pointer is over this view, so scrolling the file list with the
+            // mouse above it still behaves normally.
+            let wheel_dy = if response.hovered() {
+                self.pending_wheel_delta.take()
+            } else {
+                None
+            };
+            if let Some(dy) = wheel_dy {
+                let ctrl = ctx.input(|i| i.modifiers.ctrl);
+                if ctrl {
+                    if dy > 0.0 {
+                        if let Some(pos) = ctx.input(|i| i.pointer.hover_pos()) {
+                            let x_ratio = ((pos.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
+                            self.audio_view.zoom_at_x(1.25, x_ratio as f64);
+                        }
+                    } else if dy < 0.0 {
+                        if let Some(pos) = ctx.input(|i| i.pointer.hover_pos()) {
+                            let x_ratio = ((pos.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
+                            self.audio_view.zoom_at_x(1.0 / 1.25, x_ratio as f64);
+                        }
+                    }
+                } else if dy != 0.0 {
+                    self.audio_view.scroll_horizontal(-dy as f64 * 0.01);
+                }
+            }
         });
 
         // Player panel (transport controls) — declared after the audio view,
@@ -1561,21 +1621,27 @@ impl eframe::App for AudioScoutApp {
             // Reserve the right strip for the meter; everything else lays
             // out in a child UI confined to the remaining area.
             ui.allocate_ui(egui::vec2(meter_rect.min.x - 6.0 - panel_rect.min.x, panel_rect.height()), |ui| {
+            let hand_cursor = |ui: &egui::Ui, resp: &egui::Response| -> bool {
+                if resp.hovered() {
+                    ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::PointingHand);
+                }
+                resp.clicked()
+            };
             ui.horizontal(|ui| {
-                if ui.button("|<").clicked() { self.navigate_file(-1); }
+                if hand_cursor(ui, &ui.button("|<")) { self.navigate_file(-1); }
                 let play_text = match self.player_state() { TransportState::Playing => "⏸", _ => "▶" };
-                if ui.button(play_text).clicked() { self.transport_play_pause(); }
-                if ui.button("⏹").clicked() { self.transport_stop(); }
-                if ui.button(">|").clicked() { self.navigate_file(1); }
+                if hand_cursor(ui, &ui.button(play_text)) { self.transport_play_pause(); }
+                if hand_cursor(ui, &ui.button("⏹")) { self.transport_stop(); }
+                if hand_cursor(ui, &ui.button(">|")) { self.navigate_file(1); }
                 let (looping, playing_now) = {
                     let ctrl = self.player.lock().unwrap_or_else(|p| p.into_inner());
                     (ctrl.is_looping(), ctrl.state() == TransportState::Playing)
                 };
                 let loop_color = if looping && playing_now { egui::Color32::YELLOW } else if looping { egui::Color32::GREEN } else { ui.visuals().text_color() };
-                if ui.colored_label(loop_color, "🔁").clicked() { self.transport_toggle_loop(); }
+                if hand_cursor(ui, &ui.colored_label(loop_color, "🔁")) { self.transport_toggle_loop(); }
                 ui.separator();
-                if ui.button("+").clicked() { self.audio_view.zoom_in(); }
-                if ui.button("−").clicked() { self.audio_view.zoom_out(); }
+                if hand_cursor(ui, &ui.button("+")) { self.audio_view.zoom_in(); }
+                if hand_cursor(ui, &ui.button("−")) { self.audio_view.zoom_out(); }
                 ui.separator();
                 ui.label("Vol:");
                 let mut vol = self.player.lock().unwrap_or_else(|p| p.into_inner()).volume() * 100.0;
@@ -1583,7 +1649,7 @@ impl eframe::App for AudioScoutApp {
                 ui.separator();
                 let save_color = if self.document.dirty { egui::Color32::YELLOW } else { ui.visuals().text_color() };
                 let save_label = if self.document.dirty { "Save*" } else { "Save" };
-                if ui.colored_label(save_color, save_label).clicked() { self.save_file(); }
+                if hand_cursor(ui, &ui.colored_label(save_color, save_label)) { self.save_file(); }
                 ui.separator();
                 // Player-panel display-mode toggle (§3.5): reflects and flips
                 // the live `AudioView::mode` state (persisted in config.json).
@@ -1592,7 +1658,7 @@ impl eframe::App for AudioScoutApp {
                     view_spectro,
                     if view_spectro { "Spectrogram" } else { "Waveform" },
                 );
-                if ui.add(view_btn).on_hover_text("Toggle the visualization between waveform and spectrogram").clicked() {
+                if hand_cursor(ui, &ui.add(view_btn).on_hover_text("Toggle the visualization between waveform and spectrogram")) {
                     self.toggle_audio_view_mode();
                 }
             });
@@ -1611,13 +1677,19 @@ impl eframe::App for AudioScoutApp {
         // the player, i.e. docked *above* it: this is the panel the transport
         // controls must sit under (bug #1).
         egui::TopBottomPanel::bottom("actions").default_height(40.0).show(ctx, |ui| {
+            let hand_cursor = |ui: &egui::Ui, resp: &egui::Response| -> bool {
+                if resp.hovered() {
+                    ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::PointingHand);
+                }
+                resp.clicked()
+            };
             ui.horizontal(|ui| {
-                if ui.button("Mute").clicked() { self.mute_selection(); }
+                if hand_cursor(ui, &ui.button("Mute")) { self.mute_selection(); }
                 ui.label("Normalize:");
                 ui.add(egui::DragValue::new(&mut self.normalize_dbfs).range(-60.0..=0.0).suffix(" dBFS"));
-                if ui.button("Apply").clicked() { self.normalize_selection(); }
+                if hand_cursor(ui, &ui.button("Apply")) { self.normalize_selection(); }
                 ui.separator();
-                if ui.button("Delete all markers").clicked() { self.document.markers.clear(); }
+                if hand_cursor(ui, &ui.button("Delete all markers")) { self.document.markers.clear(); }
                 if let Some(path) = &self.active_file {
                     ui.separator();
                     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
@@ -1767,6 +1839,10 @@ impl eframe::App for AudioScoutApp {
                         // Collected inside the scroll closure, appended to
                         // `paths_to_load` after the closure returns.
                         let mut local_paths_to_load: Vec<PathBuf> = Vec::new();
+                        // UX: set once if the pointer hovers any file-row
+                        // cell this frame; checked after the grid closure to
+                        // switch the cursor icon to a pointing hand.
+                        let mut any_row_hovered = false;
 
                         let grid = egui::Grid::new("file_table")
                             .num_columns(visible_cols.len())
@@ -1920,6 +1996,14 @@ impl eframe::App for AudioScoutApp {
                                     let cell_id = ui.id().with(("file_cell", idx, ci));
                                     let cell_response = ui.interact(cell_rect, cell_id, egui::Sense::click());
 
+                                    // UX: hand cursor while hovering a file
+                                    // row — the whole row is clickable
+                                    // (single click selects, double click
+                                    // loads), so it must look like a link.
+                                    if cell_response.hovered() {
+                                        any_row_hovered = true;
+                                    }
+
                                     // Check if any cell in this row was clicked
                                     if cell_response.clicked() {
                                         row_clicked = true;
@@ -1946,6 +2030,11 @@ impl eframe::App for AudioScoutApp {
                         // Hand the collected double-click paths over to the
                         // outer `paths_to_load` (loaded after CentralPanel).
                         paths_to_load.append(&mut local_paths_to_load);
+
+                        // UX: pointing-hand cursor over file rows (hover).
+                        if any_row_hovered {
+                            ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::PointingHand);
+                        }
                     });
 
                 // A column title clicked in the header row: apply the sort
