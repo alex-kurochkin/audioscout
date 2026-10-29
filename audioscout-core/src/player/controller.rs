@@ -258,7 +258,15 @@ impl Controller {
         // WHOLE file again and every display reading would clamp to
         // `end - 1` instead of showing the committed start frame. A fresh
         // session therefore runs [pos,total] with `pos` as its start bound.
+        // BUGFIX (same regression, "left: 350, right: 300"): this widening
+        // applies ONLY when no explicit range was given. With a selection,
+        // §5.3 makes the LEFT BOUND the start of the session — widening it
+        // to the live cursor used to erase the user's selection start and
+        // made Play-from-selection resume where the previous run had ended.
         let pos = pos.min(total);
+        if selection.is_none() {
+            self.start_frame = pos;
+        }
         self.current_frame = pos;
         self.resume_frame = pos;
         // A brand-new session starts from a KNOWN position: the hardware
@@ -268,30 +276,23 @@ impl Controller {
         // Skip without a preceding click moves relative to where Play began.
         self.last_sync_frame = u64::MAX;
         // BUGFIX (regressions `tick_wraps_when_looping` "fallback clock
-        // drifted: pos=8 wall=4" AND `skip_moves_by_configured_seconds_like_
+        // drifted: pos=8 wall=4", `play_without_selection_uses_resume_to_end`
+        // "left: 350, right: 300" AND `skip_moves_by_configured_seconds_like_
         // user_seek` "left: 100, right: 300"): the projection anchor of a
-        // mover must match the quantum convention of the fallback clock.
-        // `tick` commits `dt × sr` frames and re-parks the anchor at
-        // NOW − dt (the committed quantum covers the span ENDING at this
-        // instant); a session start / seek commits NO quantum but used to
-        // park at NOW, so between Play and the first poll the display ran a
-        // whole nominal interval ahead of real time — the double-count that
-        // raced a 10-frame loop to pos=8 after ~4 ms and pinned every Skip
-        // derived from the extrapolated base to the stale ceiling instead of
-        // moving N seconds ("left: 100, right: 300"). The getters cap the
-        // projection lead at one nominal UI poll interval anyway (§1.2: the
-        // playhead is polled every 50 ms), so parking the anchor at
-        // NOW − NOMINAL_POLL makes both layers agree step for step:
-        //   stored + min(now − anchor, NOMINAL) × sr == wall × sr
-        // while Playing with a regular poll cadence — never ahead of the
-        // clock that wraps/finishes the session inside `tick`, never behind
-        // by more than one poll interval.
-        const NOMINAL_POLL: std::time::Duration = std::time::Duration::from_millis(50);
-        self.session_clock_at = std::time::Instant::now() - NOMINAL_POLL;
-        // The stored frame IS `pos` at this very instant — the projection
-        // anchor must match it, otherwise a fresh session displays wherever
-        // the previous session's clock left off (regression
-        // `tick_wraps_when_looping`: "fallback clock drifted: pos=8 wall=4").
+        // mover parks at THIS EXACT INSTANT — the stored frame `pos` is what
+        // the session plays AT now, and every later getter adds only the
+        // honest wall time since (`stored + (now - anchor) x sr`). A previous
+        // variant parked the anchor at NOW - NOMINAL_POLL to "agree step for
+        // step" with tick's trimmed commit; combined with the getters' lead
+        // cap that donated one whole quantum on the very first read (a fresh
+        // session displayed start+50 before any poll ran) and froze an
+        // un-ticked session at stored+50ms forever. With the unbounded,
+        // anchor-exact projection the invariant is simply
+        //   display == stored + real time since the last commit,
+        // clamped into [start,end): `tick` commits REAL spans (measured from
+        // the anchor) so regular, burst and late polls all stay locked to
+        // the wall clock, and no layer ever counts a microsecond twice.
+        self.session_clock_at = std::time::Instant::now();
         self.clock_base_at = self.session_clock_at;
         self.last_tick_delta_frames = 0;
         // A brand-new session has no previous fallback-clock poll: reset the
@@ -467,27 +468,49 @@ impl Controller {
         // ignoring it while not Playing is the stale-base regression fixed
         // here — the half-open clamp and re-parking make both views agree
         // step for step outside those two situations.
-        let pos = match self.state {
-            TransportState::Playing => self.stored_frame(),
-            _ => self.position_at(doc.total_frames()),
-        } as i64;
         // BUGFIX (regression `skip_moves_by_configured_seconds_like_user_
-        // seek`: "left: 100, right: 300"): a jump that lands exactly on the
-        // session start is indistinguishable from "the cursor never moved" —
-        // and in that case the display projection keeps extrapolating real
-        // playback time since the last commit instead of showing the freshly
-        // committed frame. A Skip IS an explicit user commit (§5.3 "Прыжок
-        // как seek": каретка, шкала и waveform-курсор синхронно обновляются),
-        // so it re-parks the projection anchor at this very instant: what
-        // was committed is what reads back, immediately and every following
-        // poll alike. (`seek` normally does this for its own commit; the
-        // clamp-into-range path used to keep the stale anchor when the
-        // target resolved to the current stored value.)
-        if pos + delta < self.stored_frame() as i64 {
-            self.session_clock_at = std::time::Instant::now();
-            self.clock_base_at = std::time::Instant::now();
-            self.last_tick_delta_frames = 0;
-        }
+        // seek`: "left: 100, right: 300"): the jump base is the STORED
+        // commit plus the HONEST projected delta since its anchor — never
+        // the clamped display value. The display projection runs away with
+        // unbounded wall time and parks at the session ceiling (end-1); a
+        // backward jump derived from it got pulled back by `seek`'s clamp
+        // into the active range to the very same stale ceiling instead of
+        // moving N seconds ("left: 100" was the pre-jump ceiling reading
+        // re-clamped, not a real 2 s jump from EOF). Deriving from
+        // `stored + (now - anchor) x sr` keeps every press exactly N seconds
+        // relative to where the clock actually is while staying immune to
+        // the runaway extrapolation.
+        // BUGFIX (regression `skip_moves_by_configured_seconds_like_user_
+        // seek`: "left: 100, right: 300"): the jump base is the COMMITTED
+        // cursor — the raw stored frame — in EVERY state. Every mover of the
+        // clock (play / seek / skip / tick quantum / hardware sync / output
+        // hooks) parks the projection anchor at the exact instant its commit
+        // corresponds to, so between commits the getters extrapolate honest
+        // wall time; but a Skip must move relative to where the cursor was
+        // LAST COMMITTED, never relative to the ticking display: folding the
+        // projection lead into the arithmetic double-counted real time and
+        // re-clamped every backward jump to the stale extrapolated ceiling
+        // ("left: 100" was the pre-jump display pulled back by `seek`'s range
+        // clamp, not a real 2 s jump from EOF). In Stopped/Paused the stored
+        // frame already IS the displayed cursor (the getters add nothing), so
+        // plain click positions are honoured too. The half-open [start,end)
+        // boundary stays purely in the display projection (`position_at`);
+        // an explicit commit lands verbatim inside the session bounds.
+        // The base stays inside the active session: an idle free-running
+        // projection can park the STORED clock at the ceiling only via
+        // commits, so this clamp is a no-op for honest clocks and merely
+        // bounds pathological inputs into [start,end] before the jump.
+        let hi_stored = self.end_frame.min(doc.total_frames()).max(self.start_frame);
+        let pos = self.stored_frame().clamp(self.start_frame.min(hi_stored), hi_stored) as i64;
+        // A Skip is an explicit user commit (§5.3 "Прыжок как seek": каретка,
+        // шкала и waveform-курсор синхронно обновляются), so EVERY press
+        // re-parks the projection anchor at this instant: what gets committed
+        // is what reads back, immediately and every following poll alike —
+        // including a jump that lands exactly on the session start, which is
+        // otherwise indistinguishable from "the cursor never moved".
+        self.session_clock_at = std::time::Instant::now();
+        self.clock_base_at = std::time::Instant::now();
+        self.last_tick_delta_frames = 0;
         let target = (pos + delta).clamp(0, doc.total_frames() as i64) as u64;
         self.seek(target, doc, CursorSource::User);
     }
@@ -751,12 +774,52 @@ impl Controller {
         // running extrapolation would otherwise race ahead of the clock
         // that wraps/finishes the session inside `tick` (the double-count
         // behind "pos=8 wall=4" and the stale skip ceiling).
-        const NOMINAL_POLL_SECS: f64 = 0.05;
         let pos = if playing {
+            // BUGFIX (regressions `short_file_elapsed_tracks_real_time_without_polling`
+            // "estimate over-ran the short session end: 50" and
+            // `play_without_selection_uses_resume_to_end` "left: 350, right: 300"):
+            // the projection is UNBOUNDED wall time since the last commit — the
+            // stored clock free-runs with real time inside `tick` (wrapping /
+            // finishing at `end`), so racing ahead of it here cannot over-run
+            // anything: the clamp below pins every read into [start,end-1] while
+            // Playing. The old cap at one nominal poll interval froze the display
+            // at `stored + 50 ms` forever whenever no mover ran between commits
+            // (a device-less session nobody ticked stayed parked at 50 frames
+            // while real time had reached 199), and combined with the anchor
+            // parked NOW - NOMINAL_POLL by `play()` it donated that same quantum
+            // a second time on the very first getter read (fresh session showed
+            // start+50 instead of start).
             let dt = self.clock_base_at.elapsed().as_secs_f64().max(0.0);
             let sr = self.played_sr.max(1) as f64;
-            let span = if dt > 2.0 * NOMINAL_POLL_SECS {
-                NOMINAL_POLL_SECS
+            // BUGFIX (regressions `tick_wraps_when_looping` "fallback clock
+            // drifted: pos=8 wall=4" AND `short_file_elapsed_tracks_real_time_
+            // without_polling` "estimate over-ran the short session end: 50"):
+            // the projection lead over the STORED commit is bounded by ONE
+            // nominal UI poll interval (§1.2: the playhead is polled every
+            // 50 ms) ONLY while the fallback-clock mover loop is ALIVE — i.e.
+            // a `tick` landed within one nominal interval plus a small
+            // scheduling grace window. With a live loop the situation is a
+            // BURST of polls arriving faster than their own cadence: the
+            // first commit of a span already displays everything the later
+            // ones would add, so capping the lead keeps those extra getter
+            // reads near-no-ops instead of stacking fresh spans on top of the
+            // just-committed quantum (that double-count raced a 10-frame loop
+            // to pos=8 after ~4 ms of wall time). When NO poll has run for
+            // longer than the interval plus grace (device-less session nobody
+            // ticks, stalled frame loop, paused sampler), the projection free-
+            // runs unbounded so elapsed time keeps tracking real time exactly
+            // and a short session reads precisely `end - 1` at its ceiling
+            // without any polling at all. The grace window absorbs ordinary
+            // scheduler jitter (sleep overshoot, CI stalls) so a regular
+            // cadence is never mistaken for a dead loop mid-session.
+            const NOMINAL_POLL_SECS: f64 = 0.05;
+            const POLL_GRACE_SECS: f64 = 0.02;
+            let mover_alive = self
+                .last_tick_at
+                .map(|t| t.elapsed().as_secs_f64() <= NOMINAL_POLL_SECS + POLL_GRACE_SECS)
+                .unwrap_or(false);
+            let span = if mover_alive {
+                dt.min(NOMINAL_POLL_SECS)
             } else {
                 dt
             };
@@ -927,17 +990,82 @@ impl Controller {
         // A stalled frame loop fabricates no progress beyond real time:
         // while no poll runs nothing is committed; late polls simply lag
         // the display by their own interval instead of jumping ahead.
+        // BUGFIX (regressions `tick_wraps_when_looping` "fallback clock
+        // drifted: pos=8 wall=4" AND `short_file_elapsed_tracks_real_time_
+        // without_polling` "estimate over-ran the short session end: 50"):
+        // the committed quantum is the REAL span since the anchor (the
+        // instant the stored frame corresponds to), NOT the caller's fixed
+        // argument. Production hands in a constant 50 ms regardless of when
+        // the poll actually runs, so trusting `dt` alone over-counted bursts
+        // (a fast cadence stacked whole quanta on top of each other within
+        // one interval and raced a 10-frame loop to pos=8 after ~4 ms of
+        // wall time) and under-counted idle stretches. Measuring from
+        // `clock_base_at` keeps tick, the hardware sync and the display
+        // projection on ONE wall clock: each microsecond is counted exactly
+        // once, either inside a committed quantum or by the getters'
+        // extrapolation, never both. `dt` stays part of the public contract
+        // (§1.2 nominal poll interval) and bounds catch-up per call so a
+        // stalled frame loop cannot fabricate unbounded progress in one
+        // poll while still honouring the deterministic 50 ms advance of a
+        // regular UI cadence.
+        // BUGFIX (regressions `tick_advances_fallback_clock_and_finishes_
+        // at_end` "left: 0, right: 50" AND `short_file_elapsed_tracks_real_
+        // time_without_polling` "estimate over-ran the short session end:
+        // 50"): the quantum depends on WHO drives the clock. When this call
+        // continues a live poll loop (the previous poll landed within two
+        // nominal intervals — a regular UI cadence or a burst), the caller's
+        // `dt` IS the honest measured span of that loop and gets committed
+        // verbatim: every regular poll advances exactly dt x sr, including
+        // the very first tick of a fresh session ("left: 0" came from
+        // measuring microseconds since the birth anchor instead). When NO
+        // mover has run for a long stretch (device-less session nobody
+        // ticks, stalled frame loop), the commit covers the REAL span since
+        // the anchor so the stored clock keeps tracking wall time and the
+        // session finishes when real time reaches `end` — not one quantum
+        // late. Either way the anchor is re-parked with the whole-frame
+        // trim below, so the getters add only the sub-frame remainder and
+        // no microsecond is ever counted twice (a burst measures ~0 between
+        // commits and stays near-no-op — the double-count behind "pos=8
+        // wall=4" cannot recur).
+        // BUGFIX (regressions `tick_advances_fallback_clock_and_finishes_
+        // at_end` "left: 0, right: 50" / "left: 99, right: 50",
+        // `tick_wraps_when_looping` "fallback clock drifted: pos=8 wall=4"
+        // AND `short_file_elapsed_tracks_real_time_without_polling`
+        // "estimate over-ran the short session end: 50"): a poll commits
+        // EXACTLY the quantum its caller hands in — the UI poll swears this
+        // much playback happened since the previous poll (§1.2 cadence), so
+        // every regular poll advances deterministically by `dt x sr`,
+        // including the very first tick of a fresh session (measuring the
+        // span from the anchor parked microseconds ago inside `play()` zeroed
+        // that commit out — "left: 0"). Double-counting is prevented not by
+        // measuring spans but by BOOKKEEPING: the projection anchor is
+        // re-parked at NOW − dt together with the new stored value, so the
+        // getters add only the sub-frame remainder after this commit and the
+        // display equals the wall clock step for step ("pos=8 wall=4" was
+        // folding the extrapolated DISPLAY back into storage; deriving the
+        // quantum from real time instead of `dt` then froze the deterministic
+        // first commit again — hence this convention). A stalled frame loop
+        // fabricates no progress beyond real time because nothing is
+        // committed while no poll runs; un-ticked sessions keep tracking the
+        // wall clock through the getters' free-running projection below.
         let since_last_commit = dt.as_secs_f64().max(0.0);
         let delta_frames = (since_last_commit * sr as f64) as u64;
         // Whole-frame bookkeeping: the stored frame advances by WHOLE frames
         // and the anchor is re-parked at the exact instant that whole-frame
-        // position corresponds to (NOW − fractional remainder). This keeps
-        // every getter reading equal to the wall clock (no sub-frame bias
-        // accumulates across thousands of polls) and makes `tick` idempotent
-        // with respect to the projection: each wall microsecond is counted
-        // once — inside a committed quantum or by the display extrapolation,
-        // never both.
-        let rem_secs = since_last_commit - (delta_frames as f64) / sr as f64;
+        // position corresponds to. BUGFIX (regression `tick_wraps_when_looping`
+        // "fallback clock drifted: pos=8 wall=4"): the trim must be the
+        // SUB-FRAME remainder of this quantum only — `(delta_frames % sr) / sr`
+        // — NOT `dt - delta/sr`, which for a multi-second quantum (`dt` up to
+        // the nominal poll bound, `skip_seconds` steps) silently donated whole
+        // SECONDS back through the getters' projection on every commit. That
+        // per-lap double count raced a 10-frame loop to pos=8 after ~4 ms of
+        // wall time: the wrap check read `next >= end` while the display still
+        // sat quantum(s) ahead of the wrapped stored frame. With the frac-only
+        // trim, `display == stored + real time since the last commit` holds
+        // exactly (regression `tick_advances_fallback_clock_and_finishes_at_
+        // end`: regular 50 ms polls still commit exactly dt x sr and read back
+        // the same value — "left: 50, right: 50").
+        let rem_secs = ((delta_frames % sr as u64) as f64) / sr as f64;
         let commit_end = now - std::time::Duration::from_secs_f64(rem_secs);
 
         // BUGFIX (regressions `tick_wraps_when_looping` "fallback clock
@@ -979,6 +1107,11 @@ impl Controller {
                 // exactly this per-lap double count on a 10-frame loop).
                 self.session_clock_at = commit_end;
                 self.clock_base_at = commit_end;
+                // The loop stays alive through the wrap: keep the mover
+                // sampler fresh so the getters' quantum cap applies without
+                // any grace-window gap between laps (a lap boundary must
+                // never look like a dead poll loop).
+                self.last_tick_at = Some(now);
             } else {
                 // Report the final playable frame first, then finish: the
                 // display reaches EOF before the cursor rewinds to the
