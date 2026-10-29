@@ -829,6 +829,7 @@ struct MeteredSource {
     /// frames requires adding this origin — without it every Seek/Loop pass
     /// would report positions relative to 0 and the UI ceiling clamp would
     /// fight the true clock.
+    #[allow(dead_code)] // kept for diagnostics; truth is now per-chunk (chunk_start_file_frame)
     session_start_file_frame: u64,
     /// Hard FILE-frame ceiling for this source's published truth: the frame
     /// the pump had fed up to when this chunk was appended. Guards against a
@@ -940,7 +941,9 @@ impl MeteredSource {
         // The clock BEFORE this window was flushed plus the samples produced
         // since the previous publish == absolute STREAM-sample position of the
         // window's end (the frame the hardware has just finished playing).
-        let consumed = self.shared.consumed_samples.load(Ordering::Relaxed)
+        // Kept for diagnostics only — the file-frame conversion below now
+        // works per chunk (`local_idx`), not off the session-wide clock.
+        let _consumed = self.shared.consumed_samples.load(Ordering::Relaxed)
             + self.rms_count as u64;
         // dst/src rates used to map this chunk's played stream samples back
         // into FILE frames (the same ratio `slice_to_buffer` resampled with:

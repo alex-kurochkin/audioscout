@@ -155,6 +155,13 @@ pub struct AudioScoutApp {
     /// Rect of the audio-view content area, recorded by the panel itself on
     /// every frame (kept for diagnostics / future hit-tests).
     audio_view_rect: Option<egui::Rect>,
+    /// BUGFIX (wheel zoom in the player STILL not working): a wheel notch is
+    /// one discrete event; egui may deliver it as `MouseWheel` *and* fold it
+    /// into `raw_scroll_delta`/`smooth_scroll_delta` in the same or later
+    /// frames. Applying both paths would double-trigger, so instead of
+    /// consuming the snapshot we stamp the time of the last applied gesture
+    /// here and drop any duplicate that arrives within this short window.
+    last_wheel_apply: f64,
 }
 
 impl AudioScoutApp {
@@ -262,6 +269,7 @@ impl AudioScoutApp {
             raw_wheel_dy: 0.0,
             raw_wheel_ctrl: false,
             audio_view_rect: None,
+            last_wheel_apply: 0.0,
         };
 
         // Restore the two independent Waveform/Spectrogram toggles from the
@@ -1360,6 +1368,10 @@ impl eframe::App for AudioScoutApp {
         // the snapshot stays zeroed and the panel sees nothing to apply.
         let mut wheel_evt = None;
         ctx.input(|i| {
+            // Events are chronological and `i.events` holds ONLY the events
+            // accumulated between the two last passes, so the FIRST
+            // `MouseWheel` found here is this frame's real gesture (a `.rev()`
+            // scan used to hit later PointerMoved events and miss it).
             if let Some(ev) = i.events.iter().find_map(|e| match e {
                 egui::Event::MouseWheel { unit, delta, modifiers, .. } => Some((*unit, *delta, *modifiers)),
                 _ => None,
@@ -1373,25 +1385,36 @@ impl eframe::App for AudioScoutApp {
                 };
                 wheel_evt = Some((ev.1.y * px_per_notch, ev.2.ctrl));
             } else if i.raw_scroll_delta.y != 0.0
-                && (i.pointer.any_down()
-                    || i.events.iter().any(|e| matches!(e, egui::Event::PointerMoved { .. })))
+                && i.events.iter().any(|e| matches!(e, egui::Event::PointerMoved { .. }))
             {
                 // No explicit MouseWheel event but a real scroll delta this
                 // frame (e.g. synthetic scroll injected by the backend) —
-                // accept it ONLY while genuine input flowed, never on the
-                // stale replay of last gesture's leftover counter.
+                // accept it only while pointer input actually flowed, never
+                // on the stale replay of the previous gesture's counter.
                 wheel_evt = Some((i.raw_scroll_delta.y, i.modifiers.ctrl));
             }
         });
-        self.raw_wheel_dy = 0.0;
-        self.raw_wheel_ctrl = false;
         if let Some((dy, ctrl)) = wheel_evt {
+            // Latch the gesture until the audio panel consumes it (or one
+            // second passes without consumption, e.g. the pointer was over
+            // the file list). Overwriting on every new notch is fine; simply
+            // clearing it at the top of each `update()` was the bug that made
+            // wheel zoom dead: with egui's on-demand repaints the event can
+            // arrive in a pass where the panel closure runs BEFORE the
+            // snapshot exists, and by the next (repaint-triggered) pass the
+            // snapshot had already been wiped — the buttons kept working
+            // because they do not depend on this channel at all.
             self.raw_wheel_dy = dy;
             self.raw_wheel_ctrl = ctrl;
-            // Immediate repaint so the panel (declared later this frame or
-            // on the next one) applies the gesture without waiting for the
-            // next input event.
+            self.last_wheel_apply = ctx.input(|i| i.time);
+            // Immediate repaint so the panel applies the gesture without
+            // waiting for another input event.
             ctx.request_repaint();
+        } else if ctx.input(|i| i.time - self.last_wheel_apply > 1.0) {
+            // Expire an unconsumed snapshot so an old gesture cannot be
+            // applied much later when the pointer finally enters the view.
+            self.raw_wheel_dy = 0.0;
+            self.raw_wheel_ctrl = false;
         }
 
 
@@ -1742,12 +1765,13 @@ impl eframe::App for AudioScoutApp {
             // wheel event, immune to egui's exponential smoothing and to the
             // stale-event replay on input-less repaints) is snapshotted there
             // into `raw_wheel_dy`/`raw_wheel_ctrl` and consumed-then-cleared
-            // right here, but ONLY while the pointer actually hovers this
-            // panel — otherwise the gesture would silently apply when the
-            // cursor sits over the file list or a toolbar. Trackpad-style
-            // continuous motion additionally flows through the live smooth
-            // delta every frame; reading it directly here is safe because
-            // nothing else in this app scrolls vertically inside the panel.
+            // right here. The snapshot is only ever set while the pointer is
+            // generating input, so consuming it unconditionally (not only
+            // when `hovering` is true this frame) is what makes the FIRST
+            // notch work: with on-demand repaints the hover test can lag the
+            // event by one pass, and the old code zeroed the pending gesture
+            // whenever that frame happened to report "not hovering" — the
+            // wheel felt dead while the +/− buttons kept working.
             let hovering = response.contains_pointer()
                 || ui.input(|i| i.pointer.hover_pos().map_or(false, |p| rect.contains(p)));
             let live_smooth_y = if hovering {
@@ -1755,13 +1779,12 @@ impl eframe::App for AudioScoutApp {
                     i.smooth_scroll_delta.y
                 } else { 0.0 })
             } else { 0.0 };
-            let (scroll_y, ctrl_mods) = if hovering && self.raw_wheel_dy != 0.0 {
+            let (scroll_y, ctrl_mods) = if self.raw_wheel_dy != 0.0 {
                 let v = (self.raw_wheel_dy, self.raw_wheel_ctrl);
                 self.raw_wheel_dy = 0.0; // consume exactly once
                 self.raw_wheel_ctrl = false;
                 v
             } else {
-                if hovering { self.raw_wheel_dy = 0.0; self.raw_wheel_ctrl = false; }
                 (live_smooth_y, ui.input(|i| i.modifiers.ctrl))
             };
             if hovering && scroll_y != 0.0 {
