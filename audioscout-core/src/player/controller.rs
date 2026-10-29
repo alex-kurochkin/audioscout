@@ -4,16 +4,24 @@
 //! audio clock lives in that thread; these methods only mirror it so the
 //! transport buttons never stick ("Pause не залипает").
 //!
-//! Elapsed-time accounting (§5.3): while Playing, `current_frame()` derives
-//! the position from the wall-clock instant captured at session engagement
-//! (`session_clock_at` + dt × sample rate), clamped into [start,end) — never
-//! from a fixed poll quantum. The hardware clock (`consumed_samples`, via
-//! `sync_playback_position`) only RE-BASES this estimate when it legitimately
-//! moves (sink buffer latency, seek/loop rewinds); it can never drag the
-//! displayed elapsed time backwards or make it run at a wrong rate. A fixed
-//! 50 ms-per-poll fallback clock (`tick`) systematically under-counted on
-//! short files — every late poll dropped the overrun — which is exactly the
-//! reported "incorrect elapsed time during playback".
+//! Elapsed-time accounting (§5.3) — two deliberately separate layers:
+//!  * THE STORED CLOCK: `current_frame` is the last frame actually COMMITTED
+//!    by a mover of the clock (play / seek / skip / `tick` quantum / hardware
+//!    sync / output-thread hooks). `current_frame()` returns that raw commit
+//!    verbatim — no extrapolation, no half-open clamp.
+//!  * THE DISPLAY PROJECTION: every time-projection and range restriction
+//!    lives exclusively in `position_at(total_frames)` behind the doc-aware
+//!    getter `current_frame_in(&doc)`: while Playing it derives the shown
+//!    position from the anchor (`clock_base_at` + dt × sample rate) plus at
+//!    most one nominal poll quantum of lead, clamped into the active session
+//!    with the half-open [start,end) boundary enforced (the exclusive stop
+//!    marker `end` is not a playable position while the session runs).
+//! The hardware clock (`consumed_samples`, via `sync_playback_position`) only
+//! RE-BASES the projection when it legitimately moves; it can never drag the
+//! displayed elapsed time backwards. Because arithmetic paths (skip base,
+//! tick quantum) read the raw stored frame while only the display projects,
+//! no wall microsecond is ever counted twice ("fallback clock drifted",
+//! "stale skip base" regressions).
 //!
 //! All public methods are safe to call before a document is loaded — they
 //! degrade to no-ops (TZ §1.2: "нажатия раньше времени не падают").
@@ -55,18 +63,6 @@ pub struct Controller {
     /// NOT snap the display backwards; the wall-clock anchor simply stays
     /// frozen until the clock moves again. `u64::MAX` = no sync yet.
     last_sync_frame: u64,
-    /// BUGFIX (regression `skip_moves_by_configured_seconds_like_user_seek`:
-    /// "left: 100, right: 300"): the frame the LAST user-side jump (seek /
-    /// skip) actually committed. While Playing, `current_frame` is also the
-    /// base of the wall-clock extrapolation, and `tick` keeps advancing it
-    /// with real time — but an explicit jump like Skip must move RELATIVE TO
-    /// THE TARGET THE USER PICKED, clamped into the active session, exactly
-    /// like a click-to-seek does (§5.3 "skip like a user seek"). Deriving the
-    /// jump base from the ticking clock instead made the test sequence
-    /// (seek → play → wait → skip) land wherever the fallback clock happened
-    /// to be; the ticked-forward position is still what the getters DISPLAY,
-    /// only the jump base comes from here. `u64::MAX` = no user jump yet.
-    last_user_target: u64,
     /// BUGFIX (regression `tick_wraps_when_looping`: "fallback clock drifted:
     /// pos=8 wall=4"): the instant the LAST `tick` poll was delivered. The
     /// fallback clock commits the REAL span between consecutive polls, not
@@ -117,7 +113,6 @@ impl Controller {
             session_clock_at: std::time::Instant::now(),
             played_sr: 44100,
             last_sync_frame: u64::MAX,
-            last_user_target: u64::MAX,
             last_tick_at: None,
             last_tick_delta_frames: 0,
             clock_base_at: std::time::Instant::now(),
@@ -234,19 +229,26 @@ impl Controller {
         // clamped what was already over-run), and every subsequent quantum
         // started from polluted storage. The live reading keeps advancing
         // from this instant via the capped projection below instead.
+        // LAYERING: the raw commit is `self.current_frame()`; the live
+        // (projected) reading is only consulted while NOT Playing — after a
+        // Paused stretch the committed frame lags the time actually played,
+        // so Play-from-current-position continues from the display value.
         let pos = if selection.is_some() {
             start
+        } else if self.state == TransportState::Playing {
+            // Already playing: the stored clock IS the playback clock — take
+            // it raw, never the extrapolation (double-count regression).
+            self.current_frame().max(start)
         } else {
-            self.current_frame.max(start)
+            self.position_at(total).max(start)
         };
         self.current_frame = pos;
         self.resume_frame = pos;
         // A brand-new session starts from a KNOWN position: the hardware
         // clock will publish its first honest sample on the next poll, so
-        // forget the previous session's last sync reading — and park the
-        // user-jump base at the session start so the first Skip without a
-        // preceding click moves relative to where Play actually began.
-        self.last_user_target = pos;
+        // forget the previous session's last sync reading. The stored frame
+        // itself is now the jump base for `skip` (layering), so the first
+        // Skip without a preceding click moves relative to where Play began.
         self.last_sync_frame = u64::MAX;
         self.session_clock_at = std::time::Instant::now();
         // The stored frame IS `pos` at this very instant — the projection
@@ -309,7 +311,6 @@ impl Controller {
         self.state = TransportState::Stopped;
         self.current_frame = self.start_frame;
         self.resume_frame = self.start_frame;
-        self.last_user_target = self.start_frame;
         self.clock_base_at = std::time::Instant::now();
         self.playhead.set_position_samples(self.current_frame);
         self.playhead.set_playing(false);
@@ -364,57 +365,39 @@ impl Controller {
     }
 
     /// ±N-second jump (§5.3): behaves like a user seek, so the position is
-    /// clamped into an active loop/selection range. The argument `seconds`
-    /// is already the number of seconds to move — the caller multiplies the
-    /// button direction by the configured `skipSeconds` step before calling
-    /// (see `app.rs`: `ctrl.skip(&doc, direction * config.skip_seconds)`),
-    /// so the maths here must NOT fold `skip_seconds` in again.
+    /// clamped into an active loop/selection range (by `seek` itself). The
+    /// argument `seconds` is already the number of seconds to move — the
+    /// caller multiplies the button direction by the configured `skipSeconds`
+    /// step before calling (see `app.rs`: `ctrl.skip(&doc, direction *
+    /// config.skip_seconds)`), so the maths here must NOT fold `skip_seconds`
+    /// in again.
     ///
     /// BUGFIX (regression `skip_moves_by_configured_seconds_like_user_seek`:
-    /// "left: 100, right: 300"): the jump base is the frame the USER last
-    /// parked the cursor on (`last_user_target`, maintained by every
-    /// user-side seek/skip and re-initialised at session start/wrap), never
-    /// the ticking display clock. Deriving the base from `position_at` folded
-    /// the live wall-clock projection into the arithmetic: between Play and
-    /// the first Skip the display had already run ahead toward the session
-    /// ceiling, so the forward jump clamped against the extrapolated end and
-    /// every following backward jump re-clamped to that same stale ceiling
-    /// instead of moving N seconds relative to where the cursor was actually
-    /// placed. Working off the committed target makes each ±N press move
-    /// exactly N seconds, clamped into the active session [start,end].
+    /// "left: 100, right: 300"): LAYERING — the jump base is the RAW STORED
+    /// COMMIT (`current_frame()` / `stored_frame()`), never the ticking
+    /// display clock. Deriving the base from `position_at` folded the live
+    /// wall-clock projection into the arithmetic: between Play and the first
+    /// Skip the display had already run ahead toward the session ceiling, so
+    /// the forward jump clamped against the extrapolated end and every
+    /// following backward jump re-clamped to that same stale ceiling instead
+    /// of moving N seconds relative to where the cursor actually is. Working
+    /// off the stored commit makes each ±N press move exactly N seconds; the
+    /// half-open [start,end) boundary stays purely in the display projection
+    /// (`current_frame_in`), so an explicit click-to-EOF commit still reads
+    /// back as EOF ("left: 999, right: 1000").
     pub fn skip(&mut self, doc: &Document, seconds: i32) {
         let sr = doc.sample_rate.max(1) as i64;
         let delta = (seconds as i64) * sr;
-        // Jump base: prefer the frame the USER last committed (`seek`/`skip`
-        // target). While Playing it may lag behind the live STORED clock if
-        // the fallback clock has been ticking ever since — a jump must then
-        // move relative to the actual current position, not the stale click
-        // point — so take max(user commit, stored). Never the extrapolated
-        // DISPLAY value: folding the getters' projection into the jump
-        // arithmetic double-counted wall time and pinned every subsequent
-        // backward jump to the same stale session ceiling ("left: 100,
-        // right: 300").
-        // BUGFIX (regression `skip_moves_by_configured_seconds_like_user_
-        // seek`: "left: 999, right: 1000"): a jump moves relative to what
-        // the user actually sees — the freshest of the stored clock, the
-        // last committed position and the live display reading. The
-        // projection's lead over the stored frame is bounded by one poll
-        // quantum (`position_at`), so honouring it here can no longer race
-        // the cursor ahead of real time or pin backward jumps to a stale
-        // extrapolated ceiling; ignoring it made a Skip start from behind
-        // the visible playhead.
-        let mut pos = self.stored_frame() as i64;
-        if self.last_user_target != u64::MAX {
-            pos = pos.max(self.last_user_target as i64);
-        }
-        pos = pos.max(self.position_at(doc.total_frames()) as i64);
-        // Outside an active session (Stopped/Paused, or a degenerate range)
-        // nothing advances the stored frame; honour the capped wall-clock
-        // reading so a jump moves relative to what the user sees. While an
-        // active session Plays this is a no-op: `tick` keeps the stored
-        // frame at/above the display, and the getters may only lead it by
-        // one poll quantum anyway — folding that lead into the jump base was
-        // the double-count behind "left: 100, right: 300".
+        // LAYERING (§5.3): the jump base is the RAW STORED COMMIT — never the
+        // extrapolated display value. The getters' projection may sit ahead
+        // of the stored clock by up to one poll quantum; folding that lead
+        // into the jump arithmetic double-counted wall time: on a short loop
+        // the cursor raced ahead ("pos=8 wall=4") and every backward jump
+        // re-clamped to the stale extrapolated ceiling instead of moving N
+        // seconds from where the cursor actually is ("left: 100, right: 300").
+        // `seek` commits its target verbatim into storage, so what gets
+        // committed here is exactly what `current_frame()` reports after.
+        let pos = self.stored_frame() as i64;
         let target = (pos + delta).clamp(0, doc.total_frames() as i64) as u64;
         self.seek(target, doc, CursorSource::User);
     }
@@ -549,7 +532,6 @@ impl Controller {
         let end = if end > cap { cap } else { end };
         self.start_frame = start; self.end_frame = end; self.current_frame = start;
         self.resume_frame = start;
-        self.last_user_target = start;
         self.session_clock_at = std::time::Instant::now();
         self.clock_base_at = std::time::Instant::now();
         self.last_tick_delta_frames = 0;
@@ -598,6 +580,9 @@ impl Controller {
     /// be over-run; the rewind to the session start happens only when the
     /// session actually finishes (the finish hook inside `tick`).
     fn position_at(&self, total_frames: u64) -> u64 {
+        // Layering (§5.3): this is the ONE display projection — extrapolation
+        // and half-open clamping live here and nowhere else. The raw stored
+        // commit is served by `current_frame()` without touching it.
         let eof = total_frames.max(1);
         let lo = self.start_frame.min(eof);
         // Half-open session [start,end): while PLAYING the final bound is
@@ -660,15 +645,26 @@ impl Controller {
         self.position_at(u64::MAX)
     }
 
-    /// Current playback position in frames.
+    /// Current playback position in frames — the RAW STORED COMMIT (§5.3
+    /// layering): exactly the frame the last mover of the clock committed
+    /// (play / seek / skip / `tick` quantum / hardware sync / output hook),
+    /// with NO wall-clock extrapolation and NO half-open clamp folded into
+    /// it. This is the value all internal arithmetic works off (`skip`'s jump
+    /// base, `tick`'s quantum). Anything that shows elapsed time to the user
+    /// must go through the doc-aware display projection `current_frame_in`.
     pub fn current_frame(&self) -> u64 {
-        self.position_at(u64::MAX)
+        self.stored_frame()
     }
-    /// Current playback position using the exact document bounds (preferred
-    /// when a Document is available — clamps the position to EOF).
+    /// Current playback position AS DISPLAYED: the only public entry point of
+    /// the time-projection layer — extrapolates the stored commit by real
+    /// elapsed time while Playing and clamps the result into the active
+    /// session [start,end) bounded by the document's exact EOF (preferred
+    /// whenever a Document is available).
     pub fn current_frame_in(&self, doc: &Document) -> u64 {
         self.position_at(doc.total_frames())
     }
+    /// Elapsed time in seconds as displayed — same projection layer as
+    /// `current_frame_in`, expressed in seconds at `sample_rate`.
     pub fn current_secs(&self, sample_rate: u32) -> f64 {
         self.position_at(u64::MAX) as f64 / sample_rate.max(1) as f64
     }
@@ -756,10 +752,9 @@ impl Controller {
                 let wrapped = self.start_frame + (next - self.start_frame) % span;
                 self.current_frame = wrapped;
                 self.resume_frame = wrapped;
-                // A wrapped loop restarts the user-jump base at the wrap
-                // point: the next Skip moves relative to where the cursor
+                // A wrapped loop re-parks the STORED clock at the wrap point,
+                // so the next Skip moves relative to where the cursor
                 // actually circled back to, not to the pre-wrap ceiling.
-                self.last_user_target = wrapped;
                 self.playhead.set_position_samples(wrapped);
                 // The loop restarts HERE, at this instant.
                 self.session_clock_at = now;
@@ -769,14 +764,12 @@ impl Controller {
                 // display reaches EOF before the cursor rewinds to the
                 // session start (§5.3 natural end).
                 self.current_frame = end.saturating_sub(1).min(doc.total_frames().max(1));
-                self.last_user_target = self.current_frame;
                 self.playhead.set_position_samples(self.current_frame);
                 self.finish_session_at(self.start_frame);
             }
         } else {
             self.current_frame = next;
             self.resume_frame = next;
-            self.last_user_target = next;
             // BUGFIX (regression `tick_wraps_when_looping`: "fallback clock
             // drifted: pos=8 wall=4"): the committed frame corresponds to
             // NOW − dt (the poll covers exactly its own quantum), so park
@@ -872,7 +865,7 @@ mod tests {
         assert_eq!(c.state(), TransportState::Playing);
         assert_eq!(c.start_frame(), 300);
         assert_eq!(c.end_frame(), doc.total_frames());
-        assert_eq!(c.current_frame(), 300);
+        assert_eq!(c.current_frame_in(&doc), 300);
     }
 
     #[test]
@@ -899,8 +892,8 @@ mod tests {
         // Pause snapshots the live estimate; at sr=1000 a few ms of test
         // runtime move it only by single-digit frames — never backwards and
         // never far from the last frozen clock sample.
-        assert!((c.current_frame() as i64 - 150).abs() <= 25, "{}", c.current_frame());
-        assert_eq!(c.resume_frame(), c.current_frame());
+        assert!((c.current_frame_in(&doc) as i64 - 150).abs() <= 25, "{}", c.current_frame_in(&doc));
+        assert_eq!(c.resume_frame(), c.current_frame_in(&doc));
         c.unpause();
         assert_eq!(c.state(), TransportState::Playing);
     }
@@ -912,7 +905,7 @@ mod tests {
         c.freeze_resume_at(500, 1000);
         c.stop();
         assert_eq!(c.state(), TransportState::Stopped);
-        assert_eq!(c.current_frame(), 200);
+        assert_eq!(c.current_frame_in(&doc), 200);
         assert_eq!(c.resume_frame(), 200);
     }
 
@@ -924,7 +917,7 @@ mod tests {
         // Output-thread hook: natural completion rewinds to session start.
         c.finish_session_at(c.start_frame());
         assert_eq!(c.state(), TransportState::Stopped);
-        assert_eq!(c.current_frame(), 0); // rewind to session start (§5.3)
+        assert_eq!(c.current_frame_in(&doc), 0); // rewind to session start (§5.3)
     }
 
     #[test]
@@ -943,9 +936,9 @@ mod tests {
         c.play(&doc, Some((200, 400)));
         // Click-to-seek outside the selection must not extend it (§5.3).
         c.seek(900, &doc, CursorSource::User);
-        assert_eq!(c.current_frame(), 400);
+        assert_eq!(c.current_frame_in(&doc), 400);
         c.seek(0, &doc, CursorSource::User);
-        assert_eq!(c.current_frame(), 200);
+        assert_eq!(c.current_frame_in(&doc), 200);
     }
 
     #[test]
@@ -959,24 +952,36 @@ mod tests {
 
     #[test]
     fn skip_moves_by_configured_seconds_like_user_seek() {
+        // LAYERING (§5.3): the JUMP ARITHMETIC works off the raw stored
+        // commit (`current_frame()` — no extrapolation, no half-open clamp),
+        // while the DISPLAYED position goes through the doc-aware projection
+        // `current_frame_in(&doc)` (extrapolation + [start,end) clamp). The
+        // asserts below check BOTH views of every jump.
         let (mut c, doc) = controller_with_doc(1000, 1); // sr = 1000 → 1 s = 1000 fr
         c.seek(100, &doc, CursorSource::User);
         c.play(&doc, None);
         c.set_skip_seconds(1);
         c.skip(&doc, 1);
-        assert_eq!(c.current_frame(), doc.total_frames()); // clamped to end
+        // Committed target: clamped to EOF by `skip` itself.
+        assert_eq!(c.current_frame(), doc.total_frames());
+        // Displayed: an explicit click-to-EOF commit shows exactly what was
+        // committed even while Playing.
+        assert_eq!(c.current_frame_in(&doc), doc.total_frames());
         // §5.3: a backward jump from the session end lands on the resume
         // point of this run (the position Play started from), NOT on frame 0
         // of the file — "skip like a user seek" means relative to where the
         // cursor actually is, clamped into the active session [start,end].
         c.skip(&doc, -2);
         assert_eq!(c.current_frame(), c.start_frame());
+        assert_eq!(c.current_frame_in(&doc), c.start_frame());
         // A small forward jump from mid-file moves by exactly N seconds.
         c.seek(300, &doc, CursorSource::User);
         c.skip(&doc, 1);
         assert_eq!(c.current_frame(), 1300.min(doc.total_frames()));
+        assert_eq!(c.current_frame_in(&doc), 1300.min(doc.total_frames()));
         c.skip(&doc, -1);
         assert_eq!(c.current_frame(), 300);
+        assert_eq!(c.current_frame_in(&doc), 300);
     }
 
     #[test]
@@ -1012,7 +1017,7 @@ mod tests {
         c.freeze_resume_at(150, 1000);
         c.reset();
         assert_eq!(c.state(), TransportState::Stopped);
-        assert_eq!(c.current_frame(), 0);
+        assert_eq!(c.current_frame_in(&doc), 0);
         assert_eq!(c.resume_frame(), 0);
         assert_eq!(c.start_frame(), 0);
         assert_eq!(c.end_frame(), 0);
@@ -1026,11 +1031,14 @@ mod tests {
         let (mut c, doc) = controller_with_doc(1000, 1); // sample_rate = 1000
         c.play(&doc, Some((0, 100)));
         c.tick(std::time::Duration::from_millis(50), &doc); // +50 frames
+        // Raw commit: exactly the quantum; display: same value (the anchor
+        // was parked at NOW − dt by the commit, so nothing is added twice).
         assert_eq!(c.current_frame(), 50);
+        assert_eq!(c.current_frame_in(&doc), 50);
         assert_eq!(c.state(), TransportState::Playing);
         c.tick(std::time::Duration::from_millis(50), &doc); // reaches end=100
         assert_eq!(c.state(), TransportState::Stopped);
-        assert_eq!(c.current_frame(), 0); // rewound to session start
+        assert_eq!(c.current_frame_in(&doc), 0); // rewound to session start
     }
 
     #[test]
@@ -1065,7 +1073,7 @@ mod tests {
     fn tick_is_noop_when_not_playing() {
         let (mut c, doc) = controller_with_doc(1000, 1);
         c.tick(std::time::Duration::from_millis(50), &doc);
-        assert_eq!(c.current_frame(), 0);
+        assert_eq!(c.current_frame_in(&doc), 0);
         assert_eq!(c.state(), TransportState::Stopped);
     }
 

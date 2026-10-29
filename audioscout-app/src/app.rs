@@ -1063,7 +1063,9 @@ impl AudioScoutApp {
         let frame = {
             let mut ctrl = self.player.lock().unwrap_or_else(|p| p.into_inner());
             ctrl.tick(std::time::Duration::from_millis(50), &self.document);
-            ctrl.current_frame()
+            // Display path: the doc-aware projection (extrapolation + session
+            // clamp) — `current_frame()` is the raw stored commit now.
+            ctrl.current_frame_in(&self.document)
         };
         self.audio_view.set_cursor(frame);
         self.audio_view.auto_scroll_to_cursor();
@@ -1282,6 +1284,8 @@ impl AudioScoutApp {
                             let target = {
                                 let mut ctrl = self.player.lock().unwrap_or_else(|p| p.into_inner());
                                 ctrl.skip(&self.document, direction * config.skip_seconds as i32);
+                                // The committed jump target (raw stored frame)
+                                // is what gets re-seeked and shown.
                                 ctrl.current_frame()
                             };
                             self.transport_seek(target, audioscout_core::player::CursorSource::User);
