@@ -1468,9 +1468,9 @@ impl eframe::App for AudioScoutApp {
                 Self::hover_hand(ui, &r_x);
                 if r_x.clicked() { self.filter_text.clear(); }
                 ui.separator();
-                let r_Columns = ui.button("Columns");
-                Self::hover_hand(ui, &r_Columns);
-                if r_Columns.clicked() { self.show_columns_dialog = true; }
+                let r_columns = ui.button("Columns");
+                Self::hover_hand(ui, &r_columns);
+                if r_columns.clicked() { self.show_columns_dialog = true; }
                 ui.separator();
                 // Table thumbnail style toggle (§3.1): the code to switch
                 // modes existed but had no control — this button exposes the
@@ -1488,9 +1488,9 @@ impl eframe::App for AudioScoutApp {
                 // audio-view display mode has exactly ONE control now, the one
                 // on the player panel below.
                 ui.separator();
-                let r_Settings = ui.button("Settings");
-                Self::hover_hand(ui, &r_Settings);
-                if r_Settings.clicked() { self.show_settings = true; }
+                let r_settings = ui.button("Settings");
+                Self::hover_hand(ui, &r_settings);
+                if r_settings.clicked() { self.show_settings = true; }
             });
         });
 
