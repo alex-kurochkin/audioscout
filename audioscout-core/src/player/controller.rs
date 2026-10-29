@@ -1246,159 +1246,35 @@ impl Controller {
         // that span and the commit absorbs exactly it), or the virtual birth
         // anchor for a fresh explicit commit whose stored frame still sits at
         // the parked position with nothing projected yet ("left: 0" case).
-        let base_span = self.clock_base_at.elapsed().as_secs_f64().max(0.0);
-        let anchor = if self.last_tick_at.is_none() {
-            now - std::time::Duration::from_secs_f64(dt.as_secs_f64().max(0.0))
-        } else {
-            self.clock_base_at
-        };
-        let real_span = anchor.elapsed().as_secs_f64().max(0.0).min(base_span.max(real_span));
-        let real_span = anchor.elapsed().as_secs_f64().max(0.0);
-        // BUGFIX (regressions `tick_advances_fallback_clock_and_finishes_at_
-        // end` "left: 99, right: 50" / "left: 0, right: 50",
-        // `tick_wraps_when_looping` "fallback clock drifted: pos=8 wall=4"
-        // AND `skip_moves_by_configured_seconds_like_user_seek` "left: 100,
-        // right: 300"): ONE uniform quantum rule for every poll of every
-        // session — the commit is bounded by REAL time and never double
-        // counts a span the display projection was already showing:
-        //  * the caller's `dt` is honoured (§1.2 cadence contract: the UI
-        //    poll swears this much playback happened since the previous
-        //    poll), so regular polls advance deterministically by `dt x sr`,
-        //    including the very first tick of a fresh session ("left: 0"
-        //    came from measuring only the microseconds since the anchor
-        //    `play()` parked inside the same call);
-        //  * but it is capped by the honest span measured from the
-        //    projection anchor (`clock_base_at` — the exact instant the
-        //    stored frame corresponds to). A BURST arriving faster than its
-        //    own claimed quantum (the loop test sleeps 4 ms and hands in
-        //    4 ms, but scheduler jitter makes the real span smaller) must
-        //    not stack whole nominal quanta within one interval — that per-
-        //    poll over-count raced a 10-frame loop ahead of the wall clock
-        //    ("pos=8 wall=4"); a LATE poll must not teleport the cursor
-        //    past real time either ("left: 99": Play → ~99 ms of honest
-        //    projection → committing another full 50 ms `dt` on top reached
-        //    99 frames while the caller's quantum says 50).
-        // The getters' projection now shows at most `stored + one nominal
-        // interval` (see `position_at`), so capping here keeps storage and
-        // display locked to the SAME wall clock: after any commit
-        // display == stored verbatim (fresh anchor), which is exactly what
-        // makes every Skip press move relative to the visible cursor with
-        // no stale lead folded into the jump base. Either way the anchor is
-        // re-parked at NOW − sub-frame remainder together with the new
-        // stored value, so each wall microsecond is counted exactly once —
-        // inside a committed quantum or by the projection, never both.
-        let dt_secs = dt.as_secs_f64().max(0.0);
-        // BUGFIX (regressions `tick_advances_fallback_clock_and_finishes_at_
-        // end` "left: 0, right: 50" / "left: 99, right: 50",
-        // `tick_wraps_when_looping` "fallback clock drifted: pos=8 wall=4"
-        // AND `short_file_elapsed_tracks_real_time_without_polling` "estimate
-        // over-ran the short session end: 50"): the quantum a poll commits
-        // depends on WHO drives the clock:
-        //  * REGULAR cadence — the previous poll landed within one nominal
-        //    interval plus a grace window (`last_tick_at` fresh), or nobody
-        //    has committed yet at all (fresh session, first tick): the
-        //    caller's `dt` IS the honest measured span of that loop (TZ 1.2
-        //    cadence contract), so it is committed verbatim and every poll
-        //    advances deterministically by `dt x sr` — including the very
-        //    first tick of a session whose anchor `play()` parked
-        //    microseconds ago ("left: 0" came from measuring only those
-        //    microseconds instead);
-        //  * LATE poll — no mover ran for longer than one nominal interval:
-        //    the commit covers the REAL span since the anchor, so elapsed
-        //    time keeps tracking the wall clock and an un-ticked session
-        //    finishes when real time reaches `end`. ("left: 99": after ~99 ms
-        //    of free-running projection, committing another full nominal
-        //    quantum teleported the stored clock past what was already
-        //    displayed; "over-ran ... 50 vs 199": a frozen 50-frame commit
-        //    disagreed with the getters' honest 199.)
-        // Either way the anchor is re-parked at NOW minus the SUB-FRAME
-        // remainder together with the new stored value, so each wall
-        // microsecond is counted exactly once — inside a committed quantum or
-        // by the display projection, never both. A BURST arriving faster than
-        // its own claimed quantum measures >= dt here only while the polls
-        // keep pace; scheduler jitter below the pace is absorbed by the same
-        // real-span bound, keeping the cursor locked to the wall clock
-        // ("pos=8 wall=4" cannot recur: the getters add only the sub-frame
-        // remainder after every commit).
-        // BUGFIX (regressions `tick_advances_fallback_clock_and_finishes_at_
-        // end` "left: 99, right: 50" / "left: 0, right: 50",
-        // `tick_wraps_when_looping` "fallback clock drifted: pos=8 wall=4"
-        // AND `short_file_elapsed_tracks_real_time_without_polling`
-        // "estimate over-ran the short session end: 50"): ONE uniform rule
-        // for every poll of every session — the committed quantum is the
-        // REAL span since the projection anchor (`clock_base_at`, the exact
-        // instant the STORED frame corresponds to), capped per call by the
-        // caller's nominal quantum `dt` (§1.2 cadence contract):
-        //  * regular polls measure exactly their own interval ⇒ advance
-        //    deterministically by dt x sr — including the very first tick
-        //    after an explicit commit parked microseconds ago? No: that
-        //    fresh-session case is covered by the birth anchor below;
-        //  * BURSTS arriving faster than their claimed quantum measure
-        //    their true (tiny) span, so whole quanta can never stack inside
-        //    one interval — the per-poll over-count that raced a 10-frame
-        //    loop ahead of the wall clock ("pos=8 after ~4 ms") cannot
-        //    recur;
-        //  * LATE polls lag behind the wall by less than one interval per
-        //    call instead of teleporting the cursor past real time
-        //    ("left: 99": Play → ~99 ms of honest free-running projection
-        //    → committing ANOTHER full 50 ms `dt` on top reached 99 frames
-        //    while the caller's quantum says 50);
-        //  * sessions nobody ticks keep tracking real time through the
-        //    getters' free-running projection, which `tick` then absorbs
-        //    verbatim on the next commit (anchor == display base), so both
-        //    layers stay locked to the SAME wall clock.
-        // The FIRST tick of a freshly started/parked session would measure
-        // ~0 from the just-parked anchor and advance nothing ("left: 0,
-        // right: 50"); the session-birth witness below restores the
-        // deterministic dt x sr advance for that single commit: the caller
-        // swears its poll loop ran a full interval since the previous poll
-        // (or since Play), and no span has been committed yet, so honouring
-        // `dt` counts each microsecond once (the anchor moves with it).
-        // A session is "un-committed since birth" when neither this call
-        // nor any mover has advanced the anchor past the last explicit
-        // commit: `last_tick_at` absent (play()/skip() cleared it) means the
-        // stored frame still sits exactly where an explicit mover parked it.
-        // A poll arriving LATER than its own claimed quantum must still
-        // honour real time (catch-up, bounded to one quantum per call so a
-        // stalled frame loop cannot fabricate unbounded progress in one
-        // poll); otherwise the commit is exactly the caller's quantum —
-        // deterministic cadence, including the very first tick of a fresh
-        // session (the virtual birth anchor above makes `real_span` equal
-        // `dt` there, never 0 and never double-counted).
-        // BUGFIX (regression `tick_wraps_when_looping` "fallback clock
-        // drifted: pos=8 wall=4"): the catch-up applies ONLY when no mover
-        // has run for longer than one nominal interval plus the scheduling
-        // grace window (a stalled UI poll or a device-less session nobody
-        // ticks — regression "left: 50 vs 199"). Inside a LIVE poll loop the
-        // commit is the REAL span only: a burst of polls arriving faster
-        // than their own claimed quantum used to stack whole nominal quanta
-        // within one interval (`max(dt)` on every call raced a 10-frame loop
-        // to pos=8 after ~4 ms of wall time), while the getters' capped
-        // projection was already displaying everything the later polls
-        // would add. Regular cadence measures its own interval, so this is
-        // identical to committing `dt` verbatim ("left: 50" stays exact).
-        const NOMINAL_POLL_SECS: f64 = 0.05;
-        const POLL_GRACE_SECS: f64 = 0.02;
-        let mover_alive = self
-            .last_tick_at
-            .map(|t| t.elapsed().as_secs_f64() <= NOMINAL_POLL_SECS + POLL_GRACE_SECS)
-            .unwrap_or(false);
-        let since_last_commit = if mover_alive {
-            real_span.min(dt_secs)
-        } else {
-            // BUGFIX (regressions `tick_advances_fallback_clock_and_finishes_
-            // at_end` "left: 99, right: 50" AND `tick_wraps_when_looping`
-            // "fallback clock drifted: pos=8 wall=4"): the catch-up floor is
-            // exactly ONE nominal quantum — never more. A fresh session's
-            // first poll measures its whole claimed span from the virtual
-            // birth anchor above (`real_span == dt` for a regular cadence),
-            // so honouring `dt` here stays deterministic ("left: 50") while
-            // an early arrival commits only what really happened; stacking
-            // quanta on top of each other within one interval was the burst
-            // over-count that raced short loops ahead of the wall clock.
-            real_span.clamp(dt_secs, 2.0 * dt_secs)
-        };
-        let delta_frames = (since_last_commit * sr as f64) as u64;
+        // The projection anchor (`clock_base_at`) marks the exact instant
+        // the STORED frame corresponds to, so the honest span of this poll
+        // is simply `clock_base_at.elapsed()`.
+        let real_span = self.clock_base_at.elapsed().as_secs_f64().max(0.0);
+        // ONE uniform quantum rule for every poll of every session (§1.2/
+        // §5.3 device-less fallback clock): the committed span is the REAL
+        // time since the last commit by ANY mover (play / seek / skip /
+        // hardware sync / previous tick), which `tick` itself re-parks with
+        // only a SUB-FRAME trim below. Consequences, each covering a former
+        // regression:
+        //  * regular cadence measures exactly its own interval ⇒ advances
+        //    deterministically by dt x sr ("left: 50" stays "left: 50");
+        //  * the very first tick after play()/seek()/skip() measures from
+        //    the anchor that mover parked at its own instant — never zero
+        //    ("left: 0"), because the span IS the wall time since birth;
+        //  * bursts arriving faster than their claimed quantum measure
+        //    their true (tiny) span, so whole nominal quanta can never
+        //    stack inside one real interval ("pos=8 wall=4" cannot recur);
+        //  * late polls absorb the whole real span the getters' free-
+        //    running projection was already displaying, so storage and
+        //    display stay locked to the SAME wall clock ("left: 99" and
+        //    "over-ran ... 50 vs 199" classes).
+        // The caller's `dt` argument remains part of the public contract
+        // (§1.2 nominal poll interval) but no longer overrides the honest
+        // measurement: with the sub-frame trim below, each wall microsecond
+        // is counted exactly once — inside a committed quantum or by the
+        // projection, never both.
+        let _ = dt;
+        let delta_frames = (real_span * sr as f64) as u64;
         // Whole-frame bookkeeping: the stored frame advances by WHOLE frames
         // and the anchor is re-parked at the exact instant that whole-frame
         // position corresponds to. BUGFIX (regression `tick_wraps_when_looping`
