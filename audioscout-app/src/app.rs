@@ -1330,6 +1330,7 @@ impl eframe::App for AudioScoutApp {
             ctx.request_repaint();
         }
 
+
         self.process_events(ctx);
         self.handle_keyboard(ctx);
         // 50 ms playhead poll (§1.2/§5.3): with a live output the position
@@ -2147,18 +2148,6 @@ impl eframe::App for AudioScoutApp {
                                     if cell_response.double_clicked() {
                                         row_double_clicked = true;
                                     }
-                                }
-
-                                // Hand cursor while the pointer is over a
-                                // file row (single click selects, double
-                                // click opens — §3.1): `ui.interact` with
-                                // `Sense::click()` above makes every cell a
-                                // real hover target, so `hovered()` is the
-                                // authoritative signal. The check runs per
-                                // cell but only mutates the global cursor
-                                // icon, so it is idempotent.
-                                if cell_response.hovered() {
-                                    ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::PointingHand);
                                 }
 
                                 // Handle row selection

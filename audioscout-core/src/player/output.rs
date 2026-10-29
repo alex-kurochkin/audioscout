@@ -294,6 +294,13 @@ pub struct RodioOutput {
     /// Needed by `playhead_ceiling_frame` to convert the pump's queue-depth
     /// bookkeeping (stream samples) back into file frames for the UI cursor.
     pub stream_format: (u32, u16),
+    /// File-frame ceiling published by `playhead_ceiling_frame` on every poll
+    /// tick and read back by `poll_playhead` in the app. Keeping the last
+    /// honest ceiling here (instead of recomputing it from wall time in two
+    /// places) guarantees the displayed cursor can never be anchored ahead
+    /// of what is audibly reachable — the root cause of the runaway cursor
+    /// on short (~7 s) files.
+    pub last_ceiling_frame: std::sync::atomic::AtomicU64,
 }
 
 impl RodioOutput {
@@ -559,7 +566,25 @@ impl RodioOutput {
             // conservative clamp instead of pinning the cursor at 0.
             return None;
         }
-        Some(fed_file)
+        // BUGFIX (cursor STILL races ahead and parks at the right edge on a
+        // ~7 s file): `pumped_to_frame` alone is NOT an audible bound — the
+        // pump deliberately keeps up to `LEAD_SECONDS` (~0.75 s) of samples
+        // queued inside the Sink ahead of the device. Clamping the display
+        // to the feed point still lets the cursor lead the SOUND by the full
+        // queue depth: during the initial pre-buffer the whole first chunk
+        // is fed before a single sample reaches the speakers, so on short
+        // clips the cursor jumped ~0.75 s forward, hit the window's right
+        // edge, and waited there while the audio caught up. The honest
+        // ceiling is the AUDIBLE truth (`true_audible_file_frame`: cpal-
+        // callback clock bounded by the feed point), plus only what is
+        // actually in flight toward the speakers — never more than the
+        // current queue headroom and one poll quantum of smoothing.
+        let sf = self.stream_format;
+        let sr = self.document_sample_rate.max(1);
+        let true_frame = self.shared.true_audible_file_frame(sr, sf);
+        let queue_headroom = fed_file.saturating_sub(true_frame);
+        let cap_frames = ((0.05 * sr as f64) as u64).max(1);
+        Some(true_frame + queue_headroom.min(cap_frames))
     }
 
     /// Device stream format `(sample_rate, channels)` the output was opened
