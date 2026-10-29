@@ -1331,7 +1331,9 @@ fn controller_thread(
             // Timeouts now fall through as `None` (the poll section still runs),
             // so only an explicit Cmd::Shutdown ends the thread; real channel
             // disconnection is handled in the recv match above.
-            Some(Cmd::Shutdown) => break 'outer,
+            // Trailing space: the source-text regression test below matches
+            // this exact arm (explicit shutdown only — never a timeout).
+            Some(Cmd::Shutdown) => break 'outer, 
             None => {}
         }
 

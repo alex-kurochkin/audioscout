@@ -255,8 +255,13 @@ impl Controller {
     pub fn skip(&mut self, doc: &Document, seconds: i32) {
         let sr = doc.sample_rate.max(1) as i64;
         let delta = seconds as i64 * sr;
-        let pos = self.stored_frame() as i64;
-        let target = (pos + delta).max(0) as u64;
+        // The jump is relative to the VISIBLE cursor — the live position the
+        // user sees (wall-clock estimate while Playing), not the stored frame
+        // of the last committed clock sample. Reading only the stored value
+        // lost up to a whole poll quantum of elapsed time on every skip and
+        // made "skip forward at EOF" clamp straight back to the session end.
+        let pos = self.position_at(doc.total_frames()).max(self.start_frame) as i64;
+        let target = (pos + delta).clamp(0, doc.total_frames() as i64) as u64;
         self.seek(target, doc, CursorSource::User);
     }
 
@@ -302,11 +307,27 @@ impl Controller {
         let moved = frame != self.last_sync_frame;
         self.last_sync_frame = frame;
         if moved {
-            self.current_frame = frame;
-            // Keep the resume point following the live position (§5.3 pause
-            // resumes where playback actually is).
-            self.resume_frame = frame;
-            self.session_clock_at = std::time::Instant::now();
+            // BUGFIX (playhead races ahead of the audio; cursor stalls at the
+            // right edge while a short file keeps playing): never re-anchor
+            // BEHIND what the display already shows. A fresh hardware reading
+            // that sits below the current position is either the raw lagging
+            // counter or a clock that stalled — adopting it verbatim used to
+            // snap the cursor backwards (visible oscillation), and every poll
+            // then extrapolated a full quantum on top of the re-anchored
+            // value, so the lead over the device grew until it hit the pump/
+            // sink buffer depth: on a 7 s clip the cursor reached EOF seconds
+            // early and waited there while the tail was still audible. Only a
+            // forward move re-bases the anchor; a behind-the-display sample is
+            // ignored (the session bounds in `position_at` still clamp the
+            // result into [start,end]).
+            let displayed = self.position_at(u64::MAX);
+            if frame >= displayed {
+                self.current_frame = frame;
+                // Keep the resume point following the live position (§5.3 pause
+                // resumes where playback actually is).
+                self.resume_frame = frame;
+                self.session_clock_at = std::time::Instant::now();
+            }
         }
         self.playhead.set_position_samples(self.position_at(u64::MAX));
     }
@@ -325,8 +346,19 @@ impl Controller {
             return;
         }
         let displayed = self.position_at(u64::MAX);
-        if frame >= displayed || frame < self.current_frame {
+        // Forward sample → adopt it (relative to the STORED clock base, not
+        // to the extrapolated display, which always sits ahead while the
+        // device idles between polls).
+        if frame >= self.current_frame {
             self.last_sync_frame = u64::MAX; // force adoption below
+            self.sync_playback_position_in(frame, None);
+            return;
+        }
+        // Behind the stored clock: a genuine rewind (seek / loop wrap /
+        // session restart lands below the previously displayed position) must
+        // still re-base; a merely lagging stale sample is dropped.
+        if frame < displayed {
+            self.last_sync_frame = u64::MAX;
             self.sync_playback_position_in(frame, None);
         }
     }
@@ -406,8 +438,29 @@ impl Controller {
             eof.saturating_sub(1).max(lo)
         };
         let pos = if self.state == TransportState::Playing {
+            // BUGFIX (elapsed time wrong during playback; the cursor ran ahead
+            // of the audio and stalled at the right edge while a short file
+            // kept playing): the display used to be an UNBOUNDED wall-clock
+            // extrapolation from the last committed clock sample. Every poll
+            // that adopted a lagging hardware reading re-anchored the estimate
+            // AT that reading, so between polls the getters added another full
+            // quantum on top — the lead over the real device grew with each
+            // poll until it reached the sink/pump buffer depth (hundreds of ms
+            // — very visible on a 7 s clip: the cursor hit EOF seconds early
+            // and waited there for the sound). The extrapolation may now lead
+            // the last honest clock sample by at most one poll quantum; beyond
+            // that the display simply holds at `stored + cap` and resumes
+            // tracking as soon as the next fresh sample arrives. Real-time
+            // pacing is preserved (cap ≥ every legitimate inter-poll advance),
+            // monotonicity is preserved (never snaps backwards), and paused
+            // wall time stays out of the count (the anchor is re-based on
+            // Pause/Unpause/Seek exactly as before).
+            const MAX_LEAD_SECS: f64 = 0.05; // one UI playhead poll quantum
             let dt = self.session_clock_at.elapsed().as_secs_f64().max(0.0);
-            self.current_frame.saturating_add((dt * self.played_sr.max(1) as f64) as u64)
+            let sr = self.played_sr.max(1) as f64;
+            let adv = (dt * sr) as u64;
+            let cap = (MAX_LEAD_SECS * sr) as u64;
+            self.current_frame.saturating_add(adv.min(cap))
         } else {
             self.current_frame
         };
@@ -444,46 +497,29 @@ impl Controller {
     /// playhead poll every 50 ms while `state == Playing`. Honours loop and
     /// session bounds; a non-loop session finishes at `end_frame` back at
     /// the session start, exactly like the real output thread does.
+    ///
+    /// `dt` is the REAL time since the previous committed clock sample — the
+    /// caller passes the measured poll interval, not a fixed quantum. The
+    /// stored frame advances by exactly `dt × sample rate` and the anchor is
+    /// then re-based, so `tick` is idempotent with respect to the wall-clock
+    /// getters (`position_at`): committing here never double-counts the time
+    /// the getters were already extrapolating, and a late poll never loses
+    /// its overrun (both were the source of the wrong elapsed time on short
+    /// files).
     pub fn tick(&mut self, dt: std::time::Duration, doc: &Document) {
         if self.state != TransportState::Playing {
             return;
         }
-        // BUGFIX (elapsed time wrong during playback, very visible on short
-        // files): this used to advance by a FIXED poll quantum (50 ms) per
-        // call. Polls actually arrive late (UI load, repaint jitter), and the
-        // overrun of every late tick was silently dropped — the fallback
-        // clock ran slower than real time, increasingly so on short files
-        // where the whole session is only a few quanta long. Advance from
-        // the wall-clock anchor instead: exact elapsed time, no drift.
         let sr = doc.sample_rate.max(1);
-        // `delta` is kept for debug tracing only: the actual position advance
-        // below comes from the wall-clock anchor (dt_total), never from this
-        // advisory quantum — trusting it double-counted late ticks and made
-        // the fallback clock run faster than real time.
-        let _delta = ((dt.as_secs_f64().max(0.0)) * sr as f64).round().max(0.0) as u64;
         self.played_sr = sr.max(1);
-        // BUGFIX (loop position drifted ahead of real time on short files):
-        // `tick` used to advance the STORED frame by the handed-out quantum —
-        // but polls arrive late, and every getter in between already showed a
-        // wall-clock extrapolation ahead of that stored value, so each wrap
-        // silently lost the overrun and the loop cursor crept forward faster
-        // than real time. Advance from the same wall-clock anchor the getters
-        // use instead: exact elapsed time, no drift, monotonic wraps.
-        //
-        // The dt argument is only an ADVISORY poll quantum: the UI delivers
-        // it as a fixed 50 ms regardless of when the poll actually fires, so
-        // trusting it on top of the wall-clock anchor double-counted every
-        // late tick and made the fallback clock run FASTER than real time
-        // (visible as the cursor racing ahead of the audio). The true
-        // elapsed time since the anchor alone drives the position; the
-        // getters clamp it into the session bounds anyway.
-        let dt_total = self.session_clock_at.elapsed().as_secs_f64().max(0.0);
-        let est = self
-            .current_frame
-            .saturating_add((dt_total * sr as f64).round().max(0.0) as u64);
-        // No `.max(stored + delta)` floor anymore: that floor re-added the
-        // advisory quantum on top of the honest wall-clock estimate.
-        let next = est;
+        // Advance the STORED frame by the real elapsed quantum. Previously
+        // this derived from `session_clock_at.elapsed()` WITHOUT re-basing
+        // the anchor on the non-wrap path, so every getter in between had
+        // already been extrapolating past the stored value and each commit
+        // double-counted the same wall time (the fallback clock raced ahead
+        // of real time / drifted on loops).
+        let delta = (dt.as_secs_f64().max(0.0) * sr as f64).round().max(0.0) as u64;
+        let next = self.current_frame.saturating_add(delta);
         let end = if self.end_frame > self.start_frame { self.end_frame } else { doc.total_frames() };
         if next >= end {
             if self.loop_enabled && end > self.start_frame {
