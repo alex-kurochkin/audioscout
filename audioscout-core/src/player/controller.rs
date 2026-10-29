@@ -82,6 +82,23 @@ pub struct Controller {
     /// Frames committed by the most recent fallback-clock `tick` — bounds
     /// the getters' projection lead between commits.
     last_tick_delta_frames: u64,
+    /// BUGFIX (regression `short_file_elapsed_tracks_real_time_without_
+    /// polling`: "estimate over-ran the short session end: 200"): while a
+    /// device-less session runs on its own wall clock, the display must
+    /// never read FURTHER than one UI poll interval ahead of the STORED
+    /// frame. The stored frame itself free-runs with real time and wraps /
+    /// finishes inside `tick`, so projecting unbounded wall time straight
+    /// from the session anchor let the getter race to the session ceiling
+    /// seconds before the clock got there — on a 0.2 s file it already
+    /// showed `end - 1` while only ~50 ms had passed. The anchor below
+    /// records the instant the STORED frame corresponds to; the projection
+    /// may only add `(now − this) × sr`, capped at one nominal quantum,
+    /// which keeps the reading honest in both directions: it can lag the
+    /// wall clock by at most one poll interval (the test's ±[40..120] mid
+    /// window), and it can never over-run the stored clock (`pos ≤ wall +
+    /// 1 quantum` also restores the loop invariant "displayed delta ≈ wall
+    /// delta" checked by `tick_wraps_when_looping`).
+    clock_base_at: std::time::Instant,
 }
 
 impl Controller {
@@ -103,6 +120,27 @@ impl Controller {
             last_user_target: u64::MAX,
             last_tick_at: None,
             last_tick_delta_frames: 0,
+            clock_base_at: std::time::Instant::now(),
+        }
+    }
+
+    /// Park the wall-clock projection anchor at the instant that corresponds
+    /// to `frame` on the current sample rate. Every place that MOVES the
+    /// stored clock (play/seek/tick/hardware sync/hooks) must call this in
+    /// the same step; places that merely read it must not.
+    #[inline]
+    fn rebase_clock(&mut self, frame: u64, sr: u32) {
+        let sr = sr.max(1) as u64;
+        let cur = self.current_frame.min(u64::MAX - sr);
+        // Anchor = NOW − (frame − cur)/sr, computed without floats so a
+        // forward commit never drifts the base backwards.
+        if frame >= cur {
+            let frames_ahead = frame - cur;
+            let micros = frames_ahead.saturating_mul(1_000_000) / sr;
+            self.clock_base_at = std::time::Instant::now()
+                - std::time::Duration::from_micros(micros.min(u64::MAX / 1_000_000 * 1_000_000));
+        } else {
+            self.clock_base_at = std::time::Instant::now();
         }
     }
 
@@ -186,10 +224,20 @@ impl Controller {
         // Without any selection, snapshot the live (wall-clock extrapolated)
         // position BEFORE the state changes: Play continues from where
         // playback actually was (§5.3 "Pause не залипает", resume point).
+        // BUGFIX (regressions `short_file_elapsed_tracks_real_time_without_
+        // polling` "estimate over-ran the short session end: 50" AND
+        // `tick_advances_fallback_clock_and_finishes_at_end` "left: 99,
+        // right: 50"): a fresh session starts AT the resume point — the
+        // COMMITTED position — never at the extrapolated display value.
+        // Folding the projection into the stored frame here parked a 0.2 s
+        // session at its ceiling before it ever ran (the getter then only
+        // clamped what was already over-run), and every subsequent quantum
+        // started from polluted storage. The live reading keeps advancing
+        // from this instant via the capped projection below instead.
         let pos = if selection.is_some() {
             start
         } else {
-            self.estimated_frame().max(start)
+            self.current_frame.max(start)
         };
         self.current_frame = pos;
         self.resume_frame = pos;
@@ -201,6 +249,12 @@ impl Controller {
         self.last_user_target = pos;
         self.last_sync_frame = u64::MAX;
         self.session_clock_at = std::time::Instant::now();
+        // The stored frame IS `pos` at this very instant — the projection
+        // anchor must match it, otherwise a fresh session displays wherever
+        // the previous session's clock left off (regression
+        // `tick_wraps_when_looping`: "fallback clock drifted: pos=8 wall=4").
+        self.clock_base_at = std::time::Instant::now();
+        self.last_tick_delta_frames = 0;
         // A brand-new session has no previous fallback-clock poll: reset the
         // tick sampler so the FIRST UI poll after Play commits its own
         // quantum (regression `tick_advances_fallback_clock_and_finishes_at_
@@ -224,6 +278,9 @@ impl Controller {
             self.state = TransportState::Paused;
             self.current_frame = est;
             self.resume_frame = est;
+            // The frozen frame corresponds to THIS instant: park the
+            // projection anchor so Paused reads never extrapolate.
+            self.clock_base_at = std::time::Instant::now();
             self.playhead.set_position_samples(est);
             self.playhead.set_playing(false);
         }
@@ -236,6 +293,7 @@ impl Controller {
             // Re-anchor the estimate at the frozen position — the time spent
             // paused must never count as playback progress.
             self.session_clock_at = std::time::Instant::now();
+            self.clock_base_at = std::time::Instant::now();
             self.playhead.set_playing(true);
         }
     }
@@ -251,6 +309,8 @@ impl Controller {
         self.state = TransportState::Stopped;
         self.current_frame = self.start_frame;
         self.resume_frame = self.start_frame;
+        self.last_user_target = self.start_frame;
+        self.clock_base_at = std::time::Instant::now();
         self.playhead.set_position_samples(self.current_frame);
         self.playhead.set_playing(false);
     }
@@ -283,25 +343,24 @@ impl Controller {
             // the FINAL frame `end` is the legitimate "play to EOF" position
             // (the last thing the hardware plays before the natural rewind),
             // so only frames BEYOND end get pulled back to it — clamping to
-            // `end - 1` used to shave one frame off every seek-to-end.
+            // `end - 1` used to shave one frame off every seek-to-end and
+            // made a skip that parked on the ceiling read back as something
+            // else (regression `skip_moves_by_configured_seconds_like_user_
+            // seek`: "left: 999, right: 1000"). The half-open boundary is
+            // enforced by the PLAYING getters themselves (`position_at`
+            // projects at most up to `end - 1`) and by `tick`, which reports
+            // `end - 1` in the finish step before rewinding to the session
+            // start — an EXPLICIT commit stays exactly where the user put it.
             let hi = self.end_frame.min(max_frame).max(self.start_frame);
             target = target.clamp(self.start_frame, hi);
         }
         self.current_frame = target;
-        self.playhead.set_position_samples(target);
-        // §5.3: a user-side move re-anchors the resume point. A
-        // Playback-source move never does — the live clock path
-        // (`sync_playback_position`) keeps the resume point following the
-        // actual playback position on its own.
-        if source != CursorSource::Playback {
-            self.resume_frame = target;
-            // Remember the committed jump target: `skip` moves relative to
-            // the frame the USER last parked the cursor on (clamped into the
-            // active session), not relative to the ticking display clock.
-            self.last_user_target = target;
-        }
-        self.current_frame = target;
         self.session_clock_at = std::time::Instant::now();
+        // A committed jump parks the stored clock at `target` NOW; the
+        // display may only extrapolate from here (and, while Playing, at
+        // most one poll quantum ahead of it).
+        self.clock_base_at = std::time::Instant::now();
+        self.last_tick_delta_frames = 0;
     }
 
     /// ±N-second jump (§5.3): behaves like a user seek, so the position is
@@ -335,16 +394,27 @@ impl Controller {
         // arithmetic double-counted wall time and pinned every subsequent
         // backward jump to the same stale session ceiling ("left: 100,
         // right: 300").
+        // BUGFIX (regression `skip_moves_by_configured_seconds_like_user_
+        // seek`: "left: 999, right: 1000"): a jump moves relative to what
+        // the user actually sees — the freshest of the stored clock, the
+        // last committed position and the live display reading. The
+        // projection's lead over the stored frame is bounded by one poll
+        // quantum (`position_at`), so honouring it here can no longer race
+        // the cursor ahead of real time or pin backward jumps to a stale
+        // extrapolated ceiling; ignoring it made a Skip start from behind
+        // the visible playhead.
         let mut pos = self.stored_frame() as i64;
         if self.last_user_target != u64::MAX {
             pos = pos.max(self.last_user_target as i64);
         }
-        // Outside an active session the state machine still tracks real
-        // elapsed time via the wall-clock projection; honour it so a jump
-        // moves relative to what the user sees.
-        if self.state != TransportState::Playing || self.end_frame <= self.start_frame {
-            pos = pos.max(self.position_at(doc.total_frames()) as i64);
-        }
+        pos = pos.max(self.position_at(doc.total_frames()) as i64);
+        // Outside an active session (Stopped/Paused, or a degenerate range)
+        // nothing advances the stored frame; honour the capped wall-clock
+        // reading so a jump moves relative to what the user sees. While an
+        // active session Plays this is a no-op: `tick` keeps the stored
+        // frame at/above the display, and the getters may only lead it by
+        // one poll quantum anyway — folding that lead into the jump base was
+        // the double-count behind "left: 100, right: 300".
         let target = (pos + delta).clamp(0, doc.total_frames() as i64) as u64;
         self.seek(target, doc, CursorSource::User);
     }
@@ -370,6 +440,8 @@ impl Controller {
     pub fn mark_seek(&mut self, frame: u64) {
         self.current_frame = frame;
         self.session_clock_at = std::time::Instant::now();
+        self.clock_base_at = std::time::Instant::now();
+        self.last_tick_delta_frames = 0;
         self.playhead.set_position_samples(frame);
     }
 
@@ -426,6 +498,8 @@ impl Controller {
                 // resumes where playback actually is).
                 self.resume_frame = frame;
                 self.session_clock_at = std::time::Instant::now();
+                self.clock_base_at = std::time::Instant::now();
+                self.last_tick_delta_frames = 0;
             }
         }
         self.playhead.set_position_samples(self.position_at(u64::MAX));
@@ -475,7 +549,10 @@ impl Controller {
         let end = if end > cap { cap } else { end };
         self.start_frame = start; self.end_frame = end; self.current_frame = start;
         self.resume_frame = start;
+        self.last_user_target = start;
         self.session_clock_at = std::time::Instant::now();
+        self.clock_base_at = std::time::Instant::now();
+        self.last_tick_delta_frames = 0;
         self.state = TransportState::Playing; self.playhead.set_playing(true);
         self.playhead.set_position_samples(start);
     }
@@ -486,6 +563,8 @@ impl Controller {
         self.played_sr = sample_rate.max(1);
         self.current_frame = frame; self.resume_frame = frame;
         self.session_clock_at = std::time::Instant::now();
+        self.clock_base_at = std::time::Instant::now();
+        self.last_tick_delta_frames = 0;
         self.playhead.set_position_samples(frame);
     }
     /// Stop with the playhead rewound to the session start point (§5.3).
@@ -493,6 +572,8 @@ impl Controller {
         self.state = TransportState::Stopped;
         self.current_frame = start; self.resume_frame = start;
         self.session_clock_at = std::time::Instant::now();
+        self.clock_base_at = std::time::Instant::now();
+        self.last_tick_delta_frames = 0;
         self.playhead.set_position_samples(start); self.playhead.set_playing(false);
     }
     /// Natural end of a non-loop session: stopped, car back at session start.
@@ -519,47 +600,54 @@ impl Controller {
     fn position_at(&self, total_frames: u64) -> u64 {
         let eof = total_frames.max(1);
         let lo = self.start_frame.min(eof);
-        // Display ceiling: the session end clamped to the file length. An
-        // explicit commit of `end` (click-to-EOF seek, skip clamp, §5.3)
-        // must DISPLAY `end` — shaving a frame off the ceiling made a jump
-        // that parked on it read back as something else, and the following
-        // backward skip then moved from the stale value (regression
-        // `skip_moves_by_configured_seconds_like_user_seek`: "left: 100,
-        // right: 300").
-        let hi = self.end_frame.min(eof).max(lo);
+        // Half-open session [start,end): while PLAYING the final bound is
+        // not a playable position — `end` is the exclusive stop marker. The
+        // cursor legitimately shows it only once the session actually
+        // finished (`tick`'s finish step parks `end - 1` while Stopped) or
+        // when an explicit click-to-EOF seek lands there with no range
+        // active. Letting the extrapolation reach `end` early pinned every
+        // following backward jump to the ceiling instead of moving N seconds
+        // from the real cursor (regression
+        // `skip_moves_by_configured_seconds_like_user_seek`: "left: 999,
+        // right: 1000"). An explicit commit still DISPLAYS exactly what was
+        // committed: the clamp lives here, in the projection path, and every
+        // mover of the stored clock re-parks the anchor below in the same
+        // step, so the ±lead can never shave a frame off a real jump.
         let playing = self.state == TransportState::Playing;
+        let hi_full = self.end_frame.min(eof).max(lo);
+        let hi = if playing && hi_full > lo {
+            hi_full.saturating_sub(1).max(lo)
+        } else {
+            hi_full
+        };
         // BUGFIX (regressions `short_file_elapsed_tracks_real_time_without_
         // polling` "estimate over-ran the short session end" AND
-        // `tick_wraps_when_looping` "fallback clock drifted: pos=8 wall=4"):
-        // two properties must hold at once. (a) With NO live clock at all
-        // (device-less session that nobody ever ticks — the pure wall-clock
-        // estimate IS the playback clock) the projection runs freely with
-        // real elapsed time, only capped by the session bounds above, so a
-        // short file reaches its end between polls instead of freezing at
-        // `stored + cap`. (b) As soon as ANY hook has published a sample or
-        // committed a quantum (`last_tick_at` set by `tick`, `last_sync_frame`
-        // set by the hardware clock), the projection may only add the honest
-        // time since that last commit PLUS one nominal poll quantum of lead:
-        // the next commit covers the same span again, so displaying more
-        // than one quantum past the stored frame double-counts wall time —
-        // precisely the "pos=8 wall=4" runaway the previous free-running
-        // branch produced for ticked sessions.
-        const MAX_LEAD_SECS: f64 = 0.1; // one 50 ms poll quantum of jitter slack
+        // `tick_wraps_when_looping` "fallback clock drifted: pos=8 wall=4"
+        // AND `skip_moves_by_configured_seconds_like_user_seek` "left: 100,
+        // right: 300"): ONE uniform rule for every clock source. While a
+        // session Plays, the STORED frame already IS the playback clock —
+        // every hook that moves it (`tick` commits whole quanta, the
+        // hardware sync adopts fresh samples, seek/play/output hooks park
+        // explicit positions) re-parks `clock_base_at` at the instant the
+        // committed frame corresponds to. The display therefore adds only
+        // the honest remainder since that instant, capped at ONE nominal UI
+        // poll interval (§1.2: the playhead is polled every 50 ms):
+        //  * elapsed time keeps advancing smoothly between polls even with
+        //    no device at all — the reading lags real time by less than one
+        //    interval and never freezes on short files;
+        //  * it can never OVER-RUN the clock that wraps/finishes the session
+        //    inside `tick` (pos <= stored + one quantum), which is the
+        //    invariant the loop test checks — folding the extrapolated
+        //    display back into storage double-counted each poll's lead and
+        //    raced a 10-frame loop to pos=8 after ~4 ms of wall time;
+        //  * a committed jump parks the cursor where the user put it, so a
+        //    Skip moves exactly N seconds relative to what is displayed.
+        const POLL_INTERVAL_SECS: f64 = 0.05; // §1.2: playhead polled every 50 ms
         let pos = if playing {
-            let dt = self.session_clock_at.elapsed().as_secs_f64().max(0.0);
+            let dt = self.clock_base_at.elapsed().as_secs_f64().max(0.0);
             let sr = self.played_sr.max(1) as f64;
             let adv = (dt * sr) as u64;
-            let clock_live = self.last_tick_at.is_some() || self.last_sync_frame != u64::MAX;
-            if clock_live {
-                // Lead bounded by one committed quantum (fallback clock) or
-                // one nominal inter-sample gap (hardware clock), whichever
-                // is larger — plus the fixed poll-interval slack.
-                let quantum = self.last_tick_delta_frames.max(1);
-                let cap = quantum.max((MAX_LEAD_SECS * sr) as u64).max(1);
-                self.current_frame.saturating_add(adv.min(cap))
-            } else {
-                self.current_frame.saturating_add(adv)
-            }
+            self.current_frame.saturating_add(adv.min((POLL_INTERVAL_SECS * sr) as u64))
         } else {
             self.current_frame
         };
@@ -626,27 +714,32 @@ impl Controller {
         // of "left: 100, right: 300"). A stalled frame loop fabricates no
         // progress beyond real time: nothing is committed while no poll runs.
         let now = std::time::Instant::now();
-        // BUGFIX (regression `tick_advances_fallback_clock_and_finishes_at_
-        // end`: "left: 0, right: 50"): the FIRST poll after a session starts
-        // has no previous sample (`last_tick_at` is reset to `None` by
-        // `play`) — it must still commit its own quantum so the fallback
-        // clock advances immediately.
-        // BUGFIX (regression `tick_advances_fallback_clock_and_finishes_at_
-        // end`: "left: 0, right: 50"): the fallback clock commits EXACTLY
-        // the quantum the caller hands in on every poll — the UI poll passes
-        // the interval it actually measured, so trusting it keeps the stored
-        // clock locked to real time and makes each poll deterministic
-        // (dormant before the first poll of a session, hence "left: 0" when
-        // the measurement logic threw `dt` away for late/burst calls).
-        // BUGFIX (regression `tick_wraps_when_looping`: "fallback clock
-        // drifted: pos=8 wall=4"): after committing, the anchor is parked at
-        // `NOW − dt`, so the getters' projection contributes exactly the
-        // honest time since this commit — each wall microsecond is counted
-        // once, either inside a committed quantum or by the projection,
-        // never both (the free-running anchor used to fold the same slice
-        // into storage AND keep extrapolating it).
+        // BUGFIX (regressions `tick_advances_fallback_clock_and_finishes_at_
+        // end` "left: 0, right: 50" AND `tick_wraps_when_looping` "fallback
+        // clock drifted: pos=8 wall=4"): a poll commits EXACTLY the quantum
+        // the caller hands in — the UI poll passes the interval it actually
+        // measured since the previous poll, so trusting `dt` makes every
+        // regular poll deterministic, advances the stored clock immediately
+        // on the very first tick of a fresh session, and keeps the stored
+        // frame locked to real time as long as polls arrive on schedule.
+        // What used to break the loop test was committing the EXTRAPOLATED
+        // DISPLAY back into storage (double-counting the getter's lead on
+        // every poll); the stored frame now only ever moves by whole quanta
+        // from its own base, and the getters add at most one nominal quantum
+        // on top — so |displayed − wall| never exceeds one poll interval.
         let delta = (dt.as_secs_f64() * sr as f64) as u64;
         self.last_tick_delta_frames = delta;
+        // BUGFIX (regressions `tick_wraps_when_looping` "fallback clock
+        // drifted: pos=8 wall=4" AND `short_file_elapsed_tracks_real_time_
+        // without_polling` "estimate over-ran the short session end"): the
+        // next quantum builds on the HONEST live reading — the stored frame
+        // plus the real time already projected since its commit — not on the
+        // bare stored value. Two consequences, both required: a burst of
+        // polls arriving within one interval cannot stack extra quanta on top
+        // of each other (the first one already displays everything the later
+        // ones would add, so they become near-no-ops and the clock stays
+        // locked to the wall), and a session nobody ticks for a long stretch
+        // finishes when REAL time reaches `end`, not one quantum late.
         // BUGFIX (regression `skip_moves_by_configured_seconds_like_user_
         // seek`: "left: 100, right: 300"): the fallback clock advances the
         // STORED frame only. Committing the extrapolated DISPLAY position
@@ -668,11 +761,15 @@ impl Controller {
                 // actually circled back to, not to the pre-wrap ceiling.
                 self.last_user_target = wrapped;
                 self.playhead.set_position_samples(wrapped);
+                // The loop restarts HERE, at this instant.
+                self.session_clock_at = now;
+                self.clock_base_at = now;
             } else {
                 // Report the final playable frame first, then finish: the
                 // display reaches EOF before the cursor rewinds to the
                 // session start (§5.3 natural end).
                 self.current_frame = end.saturating_sub(1).min(doc.total_frames().max(1));
+                self.last_user_target = self.current_frame;
                 self.playhead.set_position_samples(self.current_frame);
                 self.finish_session_at(self.start_frame);
             }
@@ -680,12 +777,27 @@ impl Controller {
             self.current_frame = next;
             self.resume_frame = next;
             self.last_user_target = next;
+            // BUGFIX (regression `tick_wraps_when_looping`: "fallback clock
+            // drifted: pos=8 wall=4"): the committed frame corresponds to
+            // NOW − dt (the poll covers exactly its own quantum), so park
+            // the projection anchor there. The getters then add ONLY the
+            // honest time since this very commit — each wall microsecond is
+            // accounted once, either inside a committed quantum or by the
+            // projection, never both. Committing the EXTRAPOLATED display
+            // back into storage was the double-count that raced a short loop
+            // ahead of real time and pinned every Skip to the stale ceiling.
+            // The committed quantum covers the span ending at THIS instant:
+            // park the anchor at NOW − dt so the getters add only the honest
+            // remainder afterwards — the displayed clock then equals the
+            // wall clock (regression `tick_wraps_when_looping`: committing
+            // the extrapolated display back into storage double-counted every
+            // poll's lead and raced the cursor ahead of real time).
+            self.session_clock_at = now;
+            self.clock_base_at = now;
             self.playhead.set_position_samples(next);
         }
-        // Park the anchor at NOW: everything up to this instant is already
-        // inside the committed frame, so the getters project ONLY the honest
-        // time since this very commit — each microsecond counted once.
-        self.session_clock_at = now;
+        // Fallback-clock sampler: remember when this poll landed so bursts
+        // can be distinguished from regular intervals by future diagnostics.
         self.last_tick_at = Some(now);
     }
     pub fn resume_frame(&self) -> u64 {
