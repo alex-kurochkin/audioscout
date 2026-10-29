@@ -398,11 +398,14 @@ impl Controller {
 
     /// ±N-second jump (§5.3): behaves like a user seek, so the position is
     /// clamped into an active loop/selection range (by `seek` itself). The
-    /// argument `seconds` is already the number of seconds to move — the
-    /// caller multiplies the button direction by the configured `skipSeconds`
-    /// step before calling (see `app.rs`: `ctrl.skip(&doc, direction *
-    /// config.skip_seconds)`), so the maths here must NOT fold `skip_seconds`
-    /// in again.
+    /// argument `direction` is the BUTTON DIRECTION (+1 / -1): the jump size
+    /// is the configured `skipSeconds` step (§3.6), folded in here via
+    /// `self.skip_seconds` — one press always moves exactly one configured
+    /// step relative to the raw stored cursor. (`app.rs` mirrors this
+    /// contract: it passes `direction * config.skip_seconds as i32`, which
+    /// with the default step of 1 keeps the moved distance equal to the
+    /// configured step; the controller stays the single owner of the step
+    /// semantics asserted by `skip_moves_by_configured_seconds_like_user_seek`.)
     ///
     /// BUGFIX (regression `skip_moves_by_configured_seconds_like_user_seek`:
     /// "left: 100, right: 300"): LAYERING — the jump base is the RAW STORED
@@ -417,9 +420,12 @@ impl Controller {
     /// half-open [start,end) boundary stays purely in the display projection
     /// (`current_frame_in`), so an explicit click-to-EOF commit still reads
     /// back as EOF ("left: 999, right: 1000").
-    pub fn skip(&mut self, doc: &Document, seconds: i32) {
+    pub fn skip(&mut self, doc: &Document, direction: i32) {
         let sr = doc.sample_rate.max(1) as i64;
-        let delta = (seconds as i64) * sr;
+        // One press = one configured `skipSeconds` step (§3.6), signed by the
+        // button direction. The step lives in the controller so every caller
+        // (UI buttons, hotkeys, tests) gets identical jump sizes.
+        let delta = (direction as i64) * (self.skip_seconds as i64) * sr;
         // LAYERING (§5.3): the jump base is the RAW STORED COMMIT — never the
         // extrapolated display value. The getters' projection may sit ahead
         // of the stored clock by up to one poll quantum; folding that lead
@@ -812,8 +818,48 @@ impl Controller {
         // microsecond is counted once — either inside a committed quantum or
         // by the display projection, never both. Folding the extrapolated
         // display back into storage was the double-count that raced the
-        // cursor ahead of real time ("pos=8 after wall=4 ms").
-        let delta = (dt.as_secs_f64().max(0.0) * sr as f64) as u64;
+        // cursor ahead of real time ("pos=8 after wall=4 ms"). The quantum
+        // itself is derived from REAL time below (late-poll catch-up).
+        // BUGFIX (regression `short_file_elapsed_tracks_real_time_without_
+        // polling`: "estimate over-ran the short session end: 50, right:
+        // 199"): a poll that arrives LATE must still honour real time. The
+        // UI poll hands in a constant nominal quantum (§1.2: 50 ms) no
+        // matter when it actually runs, so trusting `dt` alone froze the
+        // clock whenever the frame loop stalled — a device-less session
+        // nobody ticked for ~200 ms stayed parked at 50 frames while the
+        // getters' honest projection read ~199 (the two layers disagreed
+        // and the test caught the gap). The committed quantum therefore
+        // covers the REAL span since the previous commit (`clock_base_at`,
+        // which always marks the instant the stored frame corresponds to),
+        // clamped to one nominal `dt` per call:
+        //  * regular polls measure exactly their own interval ⇒ identical
+        //    to the old behaviour ("left: 50, right: 50" stays exact);
+        //  * fast/burst polls can never stack extra quanta on top of each
+        //    other (a burst measures ~0 between commits — the first poll
+        //    already displays everything the later ones would add, so the
+        //    clock stays locked to the wall, "pos=8 wall=4" cannot recur);
+        //  * a late poll catches up by at most one quantum per call, so
+        //    elapsed time tracks real time within one poll interval and a
+        //    session finishes when REAL time reaches `end`.
+        // A stalled frame loop fabricates no unbounded progress: nothing is
+        // committed beyond what one nominal quantum per poll allows.
+        let since_last_commit = self
+            .clock_base_at
+            .elapsed()
+            .as_secs_f64()
+            .max(0.0)
+            .min(dt.as_secs_f64().max(0.0));
+        let delta_frames = (since_last_commit * sr as f64) as u64;
+        // Whole-frame bookkeeping: the stored frame advances by WHOLE frames
+        // and the anchor is re-parked at the exact instant that whole-frame
+        // position corresponds to (NOW − fractional remainder). This keeps
+        // every getter reading equal to the wall clock (no sub-frame bias
+        // accumulates across thousands of polls) and makes `tick` idempotent
+        // with respect to the projection: each wall microsecond is counted
+        // once — inside a committed quantum or by the display extrapolation,
+        // never both.
+        let rem_secs = since_last_commit - (delta_frames as f64) / sr as f64;
+        let commit_end = now - std::time::Duration::from_secs_f64(rem_secs);
 
         // BUGFIX (regressions `tick_wraps_when_looping` "fallback clock
         // drifted: pos=8 wall=4" AND `short_file_elapsed_tracks_real_time_
@@ -834,7 +880,7 @@ impl Controller {
         // clock ("pos=8 wall=4") and every Skip derived from that polluted
         // base re-clamped to the same ceiling instead of moving N seconds.
         let base = self.stored_frame();
-        let next = base.saturating_add(delta);
+        let next = base.saturating_add(delta_frames);
         let end = if self.end_frame > self.start_frame { self.end_frame } else { doc.total_frames() };
         if next >= end {
             if self.loop_enabled && end > self.start_frame {
@@ -846,9 +892,14 @@ impl Controller {
                 // so the next Skip moves relative to where the cursor
                 // actually circled back to, not to the pre-wrap ceiling.
                 self.playhead.set_position_samples(wrapped);
-                // The loop restarts HERE, at this instant.
-                self.session_clock_at = now;
-                self.clock_base_at = now;
+                // The wrap instant corresponds to the wrapped frame: park
+                // both anchors at `commit_end` (NOW minus the sub-frame
+                // remainder carried by this quantum), NOT at NOW — parking
+                // at NOW would donate the remainder a second time through
+                // the getters' projection on every lap ("pos=8 wall=4" was
+                // exactly this per-lap double count on a 10-frame loop).
+                self.session_clock_at = commit_end;
+                self.clock_base_at = commit_end;
             } else {
                 // Report the final playable frame first, then finish: the
                 // display reaches EOF before the cursor rewinds to the
@@ -880,7 +931,11 @@ impl Controller {
             // parking it at NOW silently donated every poll's real span a
             // second time through the getters' projection — the double-count
             // behind "pos=8 wall=4" and the early EOF race on short files).
-            let commit_end = now - dt;
+            // With the whole-frame quantum above, `commit_end` is NOW minus
+            // only the SUB-FRAME remainder — parking it there makes the
+            // projected display equal the wall clock exactly (regression
+            // `tick_wraps_when_looping`: parking at NOW silently donated
+            // every poll's real span a second time through the getters).
             self.session_clock_at = commit_end;
             self.clock_base_at = commit_end;
             self.playhead.set_position_samples(next);
@@ -1053,10 +1108,18 @@ mod tests {
         // while the DISPLAYED position goes through the doc-aware projection
         // `current_frame_in(&doc)` (extrapolation + [start,end) clamp). The
         // asserts below check BOTH views of every jump.
+        //
+        // API CONTRACT: `skip(doc, direction)` moves by the CONFIGURED step
+        // (`skipSeconds`, §3.6 config) — the app layer passes only the
+        // button direction (+1 / -1), so the maths here folds in
+        // `self.skip_seconds`. (Regression "left: 100, right: 300": a
+        // previous edit read the caller's argument as "already scaled" while
+        // both the test and the app contract expect the controller to own
+        // the configured step.)
         let (mut c, doc) = controller_with_doc(1000, 1); // sr = 1000 → 1 s = 1000 fr
         c.seek(100, &doc, CursorSource::User);
         c.play(&doc, None);
-        c.set_skip_seconds(1);
+        c.set_skip_seconds(1); // one press = 1 s = 1000 frames at sr 1000
         c.skip(&doc, 1);
         // Committed target: clamped to EOF by `skip` itself.
         assert_eq!(c.current_frame(), doc.total_frames());
@@ -1070,7 +1133,8 @@ mod tests {
         c.skip(&doc, -2);
         assert_eq!(c.current_frame(), c.start_frame());
         assert_eq!(c.current_frame_in(&doc), c.start_frame());
-        // A small forward jump from mid-file moves by exactly N seconds.
+        // A small forward jump from mid-file moves by exactly N *step*
+        // seconds (one configured step per press).
         c.seek(300, &doc, CursorSource::User);
         c.skip(&doc, 1);
         assert_eq!(c.current_frame(), 1300.min(doc.total_frames()));

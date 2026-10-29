@@ -1283,7 +1283,10 @@ impl AudioScoutApp {
                         if self.player_state() == TransportState::Playing {
                             let target = {
                                 let mut ctrl = self.player.lock().unwrap_or_else(|p| p.into_inner());
-                                ctrl.skip(&self.document, direction * config.skip_seconds as i32);
+                                // The controller owns the configured step
+                                // (§3.6 skipSeconds): pass only the button
+                                // direction so one press = one step.
+                                ctrl.skip(&self.document, direction);
                                 // The committed jump target (raw stored frame)
                                 // is what gets re-seeked and shown.
                                 ctrl.current_frame()
