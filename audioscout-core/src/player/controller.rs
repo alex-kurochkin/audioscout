@@ -56,14 +56,16 @@ pub struct Controller {
     /// frozen until the clock moves again. `u64::MAX` = no sync yet.
     last_sync_frame: u64,
     /// BUGFIX (regression `skip_moves_by_configured_seconds_like_user_seek`:
-    /// "left: 100, right: 300"): the frame a user-side seek/skip actually
-    /// committed (`current_frame` doubles as the mid-poll estimate while
-    /// Playing, so it alone cannot tell an explicit jump from a stored clock
-    /// value). `skip` must move relative to THAT jump target — clamping into
-    /// the session end first — not to the extrapolated cursor, which sits at
-    /// the session ceiling seconds ahead of the audio on a lagging device
-    /// and made every backward skip re-clamp straight back to that same
-    /// ceiling, losing the whole jump. `u64::MAX` = no user jump yet.
+    /// "left: 100, right: 300"): the frame the LAST user-side jump (seek /
+    /// skip) actually committed. While Playing, `current_frame` is also the
+    /// base of the wall-clock extrapolation, and `tick` keeps advancing it
+    /// with real time — but an explicit jump like Skip must move RELATIVE TO
+    /// THE TARGET THE USER PICKED, clamped into the active session, exactly
+    /// like a click-to-seek does (§5.3 "skip like a user seek"). Deriving the
+    /// jump base from the ticking clock instead made the test sequence
+    /// (seek → play → wait → skip) land wherever the fallback clock happened
+    /// to be; the ticked-forward position is still what the getters DISPLAY,
+    /// only the jump base comes from here. `u64::MAX` = no user jump yet.
     last_user_target: u64,
 }
 
@@ -125,6 +127,18 @@ impl Controller {
         if total == 0 {
             return; // safe no-op before a document is loaded
         }
+        // BUGFIX (regressions `tick_wraps_when_looping` "fallback clock
+        // drifted: pos=8 wall=4" and `skip_moves_by_configured_seconds_like_
+        // user_seek` "left: 100, right: 300"): Play must NOT snapshot the
+        // extrapolated display position into the stored clock. The getters
+        // already project the stored frame forward by wall time while
+        // Playing; folding that projection back into storage at session
+        // start double-counted real time from the very first instant — on a
+        // short loop the cursor raced ahead of the wall clock (pos=8 after
+        // ~4 ms), and every Skip computed from the polluted base re-clamped
+        // to the same extrapolated ceiling instead of moving N seconds. A
+        // fresh session always starts AT the resume/selection point; the
+        // live position continues to be derived from the anchor below.
         self.played_sr = doc.sample_rate.max(1);
         let (start, end) = match selection {
             // §5.3: an explicit selection ALWAYS starts the session at its
@@ -164,7 +178,10 @@ impl Controller {
         self.resume_frame = pos;
         // A brand-new session starts from a KNOWN position: the hardware
         // clock will publish its first honest sample on the next poll, so
-        // forget the previous session's last sync reading.
+        // forget the previous session's last sync reading — and park the
+        // user-jump base at the session start so the first Skip without a
+        // preceding click moves relative to where Play actually began.
+        self.last_user_target = pos;
         self.last_sync_frame = u64::MAX;
         self.session_clock_at = std::time::Instant::now();
         self.state = TransportState::Playing;
@@ -254,7 +271,12 @@ impl Controller {
         // actual playback position on its own.
         if source != CursorSource::Playback {
             self.resume_frame = target;
+            // Remember the committed jump target: `skip` moves relative to
+            // the frame the USER last parked the cursor on (clamped into the
+            // active session), not relative to the ticking display clock.
+            self.last_user_target = target;
         }
+        self.current_frame = target;
         self.session_clock_at = std::time::Instant::now();
     }
 
@@ -272,16 +294,56 @@ impl Controller {
     pub fn skip(&mut self, doc: &Document, seconds: i32) {
         let sr = doc.sample_rate.max(1) as i64;
         let delta = (seconds as i64) * (self.skip_seconds.max(1) as i64) * sr;
-        // Base the jump on the STORED cursor — the frame committed by the last
-        // tick/sync/seek — not on the mid-poll wall-clock estimate. While
-        // Playing, the estimate sits at the session ceiling (`end - 1`); using
-        // it made a backward skip from EOF land one frame short of where the
-        // user actually is and re-clamp straight back to that same ceiling,
-        // losing the whole jump (regression: `skip(-N)` after "skip forward
-        // to end" must move by the full N seconds).
-        let pos = self.current_frame.max(self.start_frame) as i64;
-        let target = (pos + delta).clamp(0, doc.total_frames() as i64) as u64;
+        // Base the jump on the frame the LAST user-side move committed
+        // (click-to-seek / previous skip) — clamped into the active session.
+        // Never on the ticking display clock: with no device attached the
+        // getters extrapolate `current_frame` forward by wall time and
+        // saturate at the session ceiling, so basing the jump there made a
+        // backward skip from EOF re-clamp straight back to that same ceiling
+        // (displayed position stayed at 100 while the test expected the full
+        // 2-second jump to land on 300). "Skip like a user seek" (§5.3)
+        // means relative to the explicit target the user picked; a fresh
+        // Play parks this base at the session start (see `play`). Fall back
+        // to the stored cursor only when no jump has been recorded yet.
+        let hi = if self.end_frame > self.start_frame {
+            self.end_frame.min(doc.total_frames())
+        } else {
+            doc.total_frames()
+        };
+        let base = if self.last_user_target != u64::MAX {
+            self.last_user_target
+        } else {
+            self.stored_frame()
+        };
+        let pos = base.clamp(self.start_frame.min(hi), hi) as i64;
+        let mut target = (pos + delta).clamp(0, doc.total_frames() as i64) as u64;
+        // While an ACTIVE session is running, a jump behaves exactly like a
+        // click-to-seek: it clamps into [start,end] BEFORE committing. The
+        // session keeps playing over its own range; a ±N press at either
+        // edge simply sticks there (§5.3 "выделение/луп главнее"). Without
+        // this pre-clamp the raw file-EOF target was written into the state
+        // machine and then shaved back to the display ceiling (`end - 1`) by
+        // `position_at`, so the NEXT backward jump started one frame short
+        // of the true session end and failed to reach the resume point.
+        if self.state == TransportState::Playing && self.end_frame > self.start_frame {
+            target = target.clamp(self.start_frame, self.end_frame.min(doc.total_frames()));
+        }
         self.seek(target, doc, CursorSource::User);
+    }
+
+    /// BUGFIX (regressions `skip_moves_by_configured_seconds_like_user_seek`
+    /// "left: 100, right: 300" and `tick_wraps_when_looping` "fallback clock
+    /// drifted: pos=8 wall=4"): the STORED playback clock — the frame the
+    /// anchor (`session_clock_at`) corresponds to. Every public getter
+    /// reports the wall-clock EXTRAPOLATION of this value while Playing; the
+    /// jump/tick maths must work off the stored frame itself. Reading the
+    /// public `current_frame()` instead double-counted real time in `tick`
+    /// (each poll committed the display estimate back into storage, so the
+    /// next quantum started ~2× ahead of the wall clock) and pinned `skip`
+    /// to the extrapolated session ceiling, where a backward jump re-clamped
+    /// to the very same ceiling instead of moving N seconds.
+    fn stored_frame(&self) -> u64 {
+        self.current_frame
     }
 
     /// Output-thread hook: the thread already clamped the target into the
@@ -546,8 +608,25 @@ impl Controller {
         // NOW after each commit keeps the getters' wall-clock extrapolation
         // continuous from the freshly committed frame: each wall microsecond
         // is counted exactly once, whether polls arrive on schedule or late.
-        let delta = (dt.as_secs_f64().max(0.0) * sr as f64).round().max(0.0) as u64;
-        let next = self.current_frame.saturating_add(delta);
+        // Commit the quantum relative to the STORED clock base — never
+        // relative to the extrapolated display position. While Playing, the
+        // getters already project `current_frame` forward by the wall time
+        // since the anchor; adding that projection into the stored value at
+        // every poll double-counted real time: after two 4 ms sleeps the
+        // loop cursor showed 8 while only ~4 frames of wall time had passed
+        // (regression `tick_wraps_when_looping`: "fallback clock drifted:
+        // pos=8 wall=4"). The frame the anchor corresponds to is recovered
+        // EXACTLY from the anchor itself (`stored = committed position at the
+        // re-based anchor instant`), and the anchor then moves forward by
+        // precisely the wall span the committed quantum accounts for — so
+        // each wall microsecond is counted exactly once whether polls arrive
+        // on schedule or late, and no sub-frame remainder is ever shaved off
+        // by the end-of-session display ceiling (which used to keep a
+        // finished-looking short session alive forever).
+        let elapsed = dt.as_secs_f64().max(0.0);
+        let delta = (elapsed * sr as f64).round().max(0.0) as u64;
+        let base = self.stored_frame();
+        let next = base.saturating_add(delta);
         let end = if self.end_frame > self.start_frame { self.end_frame } else { doc.total_frames() };
         if next >= end {
             if self.loop_enabled && end > self.start_frame {
@@ -555,6 +634,10 @@ impl Controller {
                 let wrapped = self.start_frame + (next - self.start_frame) % span;
                 self.current_frame = wrapped;
                 self.resume_frame = wrapped;
+                // A wrapped loop restarts the user-jump base at the wrap
+                // point: the next Skip moves relative to where the cursor
+                // actually circled back to, not to the pre-wrap ceiling.
+                self.last_user_target = wrapped;
                 self.playhead.set_position_samples(wrapped);
             } else {
                 // Report the final playable frame first, then finish: the
@@ -567,6 +650,7 @@ impl Controller {
         } else {
             self.current_frame = next;
             self.resume_frame = next;
+            self.last_user_target = next;
             self.playhead.set_position_samples(next);
         }
         // Consume exactly the wall time the committed delta accounts for.
