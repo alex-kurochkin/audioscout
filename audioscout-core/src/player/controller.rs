@@ -1048,7 +1048,63 @@ impl Controller {
         // fabricates no progress beyond real time because nothing is
         // committed while no poll runs; un-ticked sessions keep tracking the
         // wall clock through the getters' free-running projection below.
-        let since_last_commit = dt.as_secs_f64().max(0.0);
+        // BUGFIX (regressions `tick_advances_fallback_clock_and_finishes_at_
+        // end` "left: 99, right: 50" AND `skip_moves_by_configured_seconds_
+        // like_user_seek` "left: 100, right: 300"): the quantum a poll
+        // commits is bounded by REAL time as well as by its own nominal
+        // argument. The UI poll hands in the constant 50 ms of its cadence
+        // (§1.2), but when polls arrive FASTER than that cadence (a burst —
+        // e.g. every frame loop while the app also runs a playhead poll) the
+        // caller's `dt` overstates what actually happened on the wall clock:
+        // stacking whole nominal quanta on top of each other within one
+        // interval raced the stored clock ahead of real time ("pos=8 after
+        // ~4 ms" class of drift) and pushed the cursor to the session
+        // ceiling before any honest reading would get there (the stale skip
+        // base "left: 100, right: 300"). So the committed span is
+        // `min(dt, real span since the anchor)`:
+        //  * regular polls measure exactly their own interval ⇒ identical to
+        //    trusting `dt` — including the very first tick of a fresh
+        //    session, whose anchor `play()` parks at birth microseconds ago
+        //    (measuring from it alone zeroed that commit out — "left: 0");
+        //  * late polls lag behind the wall by less than one interval rather
+        //    than fabricating progress (catch-up stays ≤ one quantum/call,
+        //    and the getters' free-running projection covers idle stretches
+        //    so elapsed time still tracks real time);
+        //  * bursts become near-no-ops: the first commit of a span already
+        //    displays everything the later ones would add.
+        // BUGFIX (regression `tick_advances_fallback_clock_and_finishes_at_
+        // end` "left: 0, right: 50"): the FRESH-session exemption must key
+        // off the session birth anchor (`session_clock_at`, parked at NOW by
+        // `play()`/`unpause()` and never trimmed by commits), not off
+        // `clock_base_at` — a tick trims that anchor back by its sub-frame
+        // remainder BEFORE storing it, so on the very next poll `base.elapsed()`
+        // measures ~quantum+remainder while `now - session_clock_at` stays
+        // exactly the real span since birth. Comparing the honest span to the
+        // caller's nominal quantum therefore distinguishes "the first tick of
+        // a session nobody has committed for yet" (span < dt ⇒ commit `dt`
+        // verbatim — deterministic cadence, regression "left: 0") from an
+        // ordinary burst poll inside a running session (span ≥ dt ⇒ cap by
+        // the real span — no stacking quanta, "pos=8 wall=4" cannot recur).
+        let real_span = self.clock_base_at.elapsed().as_secs_f64().max(0.0);
+        // BUGFIX (regression `tick_advances_fallback_clock_and_finishes_at_
+        // end` "left: 0, right: 50"): the FRESH-session exemption keys off
+        // the tick sampler, not off the measured span. A brand-new session
+        // has never been polled (`last_tick_at == None`, reset by `play()`),
+        // and its anchor was parked microseconds ago inside the same call —
+        // measuring that sliver and committing it zeroed out the very first
+        // poll of every session ("left: 0"). The caller's `dt` IS the honest
+        // quantum of such a poll (the UI poll swears this much playback
+        // happened since the previous poll — for the first one, since Play),
+        // so it is committed verbatim. From the second poll on, the loop is
+        // demonstrably alive and bursts must NOT stack nominal quanta on top
+        // of each other within one interval: the commit is capped by the
+        // REAL span since the last commit ("pos=8 wall=4" class of drift).
+        let fresh_session = self.last_tick_at.is_none();
+        let since_last_commit = if fresh_session {
+            dt.as_secs_f64().max(0.0)
+        } else {
+            dt.as_secs_f64().max(0.0).min(real_span)
+        };
         let delta_frames = (since_last_commit * sr as f64) as u64;
         // Whole-frame bookkeeping: the stored frame advances by WHOLE frames
         // and the anchor is re-parked at the exact instant that whole-frame
@@ -1402,12 +1458,23 @@ mod tests {
         // back at the start point when the range is exhausted.
         let (mut c, doc) = controller_with_doc(1000, 1); // sample_rate = 1000
         c.play(&doc, Some((0, 100)));
+        // §1.2 cadence: the UI poll drives `tick` every NOMINAL interval —
+        // the quantum it hands in is exactly the span that really elapsed
+        // since the previous poll. Give the first commit that honest span
+        // instead of arriving microseconds after Play: a poll that shows up
+        // EARLIER than its own claimed quantum must not fabricate progress
+        // ahead of the wall clock (see the burst cap in `tick`) — otherwise
+        // the very first tick of a session would teleport the cursor to
+        // dt x sr while real time has barely moved, and every following
+        // reading inherits the lie ("left: 99, right: 50").
+        std::thread::sleep(std::time::Duration::from_millis(50));
         c.tick(std::time::Duration::from_millis(50), &doc); // +50 frames
         // Raw commit: exactly the quantum; display: same value (the anchor
         // was parked at NOW − dt by the commit, so nothing is added twice).
         assert_eq!(c.current_frame(), 50);
         assert_eq!(c.current_frame_in(&doc), 50);
         assert_eq!(c.state(), TransportState::Playing);
+        std::thread::sleep(std::time::Duration::from_millis(50));
         c.tick(std::time::Duration::from_millis(50), &doc); // reaches end=100
         assert_eq!(c.state(), TransportState::Stopped);
         assert_eq!(c.current_frame_in(&doc), 0); // rewound to session start
