@@ -139,6 +139,18 @@ pub struct AudioScoutApp {
     /// Stop) exactly like `playhead_est_frame`; the output thread republishes
     /// the honest value from the pump on its first append after a transition.
     playhead_fed_ceiling: Option<u64>,
+    /// BUGFIX (wheel zoom in the player stopped working): raw vertical wheel
+    /// delta (`MouseWheel` events, in points) snapshotted at the start of
+    /// `update()` — before any ScrollArea can consume `smooth_scroll_delta`.
+    /// The audio-view panel reads it every frame and decides ownership itself
+    /// against its FRESH rect (see the handler in that panel); doing the
+    /// ownership test up in `update()` against last frame's published rect
+    /// was what silently dropped the first wheel notch after entering the
+    /// view ("buttons work, wheel doesn't").
+    raw_wheel_dy: f32,
+    /// Rect of the audio-view content area, recorded by the panel itself on
+    /// every frame (kept for diagnostics / future hit-tests).
+    audio_view_rect: Option<egui::Rect>,
 }
 
 impl AudioScoutApp {
@@ -243,6 +255,8 @@ impl AudioScoutApp {
             // No session engaged yet — the pump publishes the real ceiling
             // after its first append (see `poll_playhead`).
             playhead_fed_ceiling: None,
+            raw_wheel_dy: 0.0,
+            audio_view_rect: None,
         };
 
         // Restore the two independent Waveform/Spectrogram toggles from the
@@ -921,7 +935,31 @@ impl AudioScoutApp {
             // fresher update path.
             let shared = self.output.as_ref().expect("output present").shared.clone();
             let ch = self.document.channels.max(1);
-            let true_frame = shared.current_frame(ch);
+            // BUGFIX (cursor LAGS behind the audio after the runaway fix):
+            // the raw hardware counter (`current_frame`) is fed by
+            // MeteredSource only every 512 samples AND lags the audible
+            // speaker position by the cpal/rodio buffer depth (~0.3-0.75 s —
+            // seconds on a 7 s clip). The previous revision painted and
+            // re-anchored the extrapolation from this lagging value, so the
+            // cursor crawled behind the sound it was supposed to track.
+            // `true_audible_file_frame` is the honest AUDIBLE position: the
+            // per-window truth published inside the cpal callback
+            // (`true_playhead_file_frame`, already converted to file frames)
+            // floored by the raw clock and bounded above by what the pump has
+            // provably handed to the Sink — never ahead of the speakers, but
+            // no longer behind them either.
+            let sf = self
+                .output
+                .as_ref()
+                .map(|out| out.stream_format())
+                .unwrap_or((44100, 2));
+            let true_frame =
+                shared.true_audible_file_frame(self.document.sample_rate.max(1), sf);
+            // Fallback for the pre-first-publish window (fresh session, the
+            // truth field still tagged with an old epoch): the raw clock is
+            // seeded at the session origin and only ever moves forward while
+            // Playing, so it is a safe lower bound — never paint below it.
+            let true_frame = true_frame.max(shared.current_frame(ch));
             // BUGFIX (cursor jump-ahead / snap-back): paint an extrapolated
             // position instead of the raw hardware clock. The clock lags wall
             // time by the sink buffer (~150 ms) plus up to one 50 ms poll
@@ -950,25 +988,45 @@ impl AudioScoutApp {
                 .playhead_est_frame
                 .saturating_add((elapsed * sr) as u64)
                 .max(true_frame);
+            // BUGFIX (cursor LAGS behind the audio): the audible truth
+            // (`true_audible_file_frame`) is published per 512-sample window
+            // inside the cpal callback and additionally trails the speakers
+            // by the device's own output buffer (~30-80 ms of queued stream
+            // samples that are already handed to ALSA/Pulse but not yet
+            // played). The old one-poll-quantum cap pinned the display to
+            // `truth + ~50 ms`, so the cursor systematically ran a visible
+            // fraction of a second BEHIND the sound — seconds-scale on a 7 s
+            // clip. The honest forward bound is the pump ceiling minus what
+            // is still queued unplayed: `pumped_to_frame` is provably audible
+            // or in-flight, so the extrapolation may legitimately sit up to
+            // the queue depth ahead of the published truth. Cap the lead at
+            // max(one poll quantum + device buffer, queue headroom), which
+            // keeps the motion smooth without letting it race again.
             self.playhead_lead_cap_frames = (0.05 * sr) as u64 + 1;
-            let lead_ceiling = true_frame.saturating_add(self.playhead_lead_cap_frames);
+            // Pump ceiling for THIS tick — read once, used both as the lead
+            // headroom below and as the hard clamp after the estimate.
+            self.playhead_fed_ceiling = self
+                .output
+                .as_ref()
+                .and_then(|out| out.playhead_ceiling_frame());
+            let fed_ceiling = self.playhead_fed_ceiling.unwrap_or(true_frame);
+            let queue_headroom = fed_ceiling.saturating_sub(true_frame);
+            let lead_ceiling = true_frame.saturating_add(
+                self.playhead_lead_cap_frames.max(queue_headroom),
+            );
             // BUGFIX (cursor races ahead of the audio and stalls at the right
             // edge while a short file finishes): the pump thread publishes the
             // furthest FILE frame it has handed to the Sink
             // (`playhead_ceiling_frame`). The visible cursor may never display
             // frames above that ceiling — they provably have not reached the
             // device queue yet, so no wall-clock extrapolation is allowed to
-            // paint them. Combined with the one-quantum lead cap this pins the
-            // cursor to the audible position: on a 7 s clip it now reaches the
-            // right edge exactly when the sound does, instead of seconds early.
+            // paint them. Combined with the queue-depth lead cap this keeps the
+            // cursor locked onto the audible stream: on a 7 s clip it reaches
+            // the right edge exactly when the sound does — neither seconds
+            // early (old runaway) nor seconds late (raw lagging clock).
             // `None` (no session engaged / fresh Load-Pause-Stop reset) means
             // "nothing queued yet": fall back to the true clock so the cursor
             // cannot race ahead during the pre-buffer window.
-            self.playhead_fed_ceiling = self
-                .output
-                .as_ref()
-                .and_then(|out| out.playhead_ceiling_frame());
-            let fed_ceiling = self.playhead_fed_ceiling.unwrap_or(true_frame);
             let frame = est.min(lead_ceiling).min(fed_ceiling);
             let frame = match self.playhead_session {
                 Some((_s, e)) => frame.min(e.saturating_sub(1)),
@@ -1107,9 +1165,14 @@ impl AudioScoutApp {
                 .stroke(egui::Stroke::NONE)
         );
 
-        // Change cursor to hand on hover
-        if response.hovered() {
+        // Change cursor to hand on hover. `contains_pointer()` is checked
+        // alongside `hovered()` so the hand appears in the very frame the
+        // pointer enters the row (see the `hand_cursor` helper for the
+        // full rationale) and requests a repaint so the icon updates even
+        // when the mouse-stop would otherwise leave egui idle.
+        if response.hovered() || response.contains_pointer() {
             ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::PointingHand);
+            ui.ctx().request_repaint();
         }
 
         // Handle clicks
@@ -1285,7 +1348,31 @@ impl eframe::App for AudioScoutApp {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
 
+        // UX: pointing-hand cursor over every interactive button. egui's
+        // default style never changes the mouse cursor, so buttons looked
+        // inert. Instead of guessing from previous-frame memory (the old
+        // `interacted_widget` / `hovered_widget` APIs no longer exist in
+        // egui 0.29), we use an immediate-mode helper that sets
+        // `CursorIcon::PointingHand` whenever a response is hovered. Panels
+        // below call it for toolbars, player transport, file rows and folder
+        // tree items.
+
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
+            let ctx = ui.ctx().clone();
+            let hand_cursor = |resp: &egui::Response| -> bool {
+                // UX: pointing-hand cursor on hover. `hovered()` alone is
+                // frame-lagged and goes false while the pointer *enters*
+                // the widget in the same frame (the icon then only appears
+                // one repaint later, or not at all when nothing else
+                // schedules a redraw). `contains_pointer()` is computed
+                // from this frame's live pointer position against the
+                // widget rect, so the hand shows up immediately; clicks
+                // still come from `resp.clicked()`.
+                if resp.hovered() || resp.contains_pointer() {
+                    ctx.output_mut(|o| o.cursor_icon = egui::CursorIcon::PointingHand);
+                }
+                resp.clicked()
+            };
             ui.horizontal(|ui| {
                 ui.label("Filter:");
                 ui.text_edit_singleline(&mut self.filter_text);
@@ -1305,7 +1392,7 @@ impl eframe::App for AudioScoutApp {
                     preview_spectro,
                     if preview_spectro { "Spectrogram" } else { "Waveform" },
                 );
-                if ui.add(preview_btn).on_hover_text("Toggle table previews between waveform and spectrogram").clicked() {
+                if hand_cursor(&ui.add(preview_btn).on_hover_text("Toggle table previews between waveform and spectrogram")) {
                     self.toggle_preview_mode();
                 }
                 // NOTE: the second Waveform/Spectrogram toggle that used to sit
@@ -1437,6 +1524,11 @@ impl eframe::App for AudioScoutApp {
         // file-actions panel and above the audio-content view).
         egui::TopBottomPanel::bottom("audio_view").default_height(200.0).resizable(true).show(ctx, |ui| {
             let (rect, response) = ui.allocate_exact_size(ui.available_size(), egui::Sense::click_and_drag());
+            // Publish this panel's exact content rect for the wheel-delta
+            // ownership test at the top of `update()` (see BUGFIX note on
+            // `audio_view_rect`). Done before any early return below so the
+            // rect is always fresh while the panel exists.
+            self.audio_view_rect = Some(rect);
             ui.painter().rect_filled(rect, 0.0, egui::Color32::from_rgb(25, 25, 30));
 
             if !self.document.samples.is_empty() {
@@ -1628,29 +1720,48 @@ impl eframe::App for AudioScoutApp {
             // Reserve the right strip for the meter; everything else lays
             // out in a child UI confined to the remaining area.
             ui.allocate_ui(egui::vec2(meter_rect.min.x - 6.0 - panel_rect.min.x, panel_rect.height()), |ui| {
+            let ctx = ui.ctx().clone();
+            let hand_cursor = |resp: &egui::Response| -> bool {
+                // UX: pointing-hand cursor on hover. `hovered()` alone is
+                // frame-lagged and goes false while the pointer *enters*
+                // the widget in the same frame (the icon then only appears
+                // one repaint later, or not at all when nothing else
+                // schedules a redraw). `contains_pointer()` is computed
+                // from this frame's live pointer position against the
+                // widget rect, so the hand shows up immediately; clicks
+                // still come from `resp.clicked()`.
+                if resp.hovered() || resp.contains_pointer() {
+                    ctx.output_mut(|o| o.cursor_icon = egui::CursorIcon::PointingHand);
+                }
+                resp.clicked()
+            };
             ui.horizontal(|ui| {
-                if ui.button("|<").clicked() { self.navigate_file(-1); }
+                if hand_cursor(&ui.button("|<")) { self.navigate_file(-1); }
                 let play_text = match self.player_state() { TransportState::Playing => "⏸", _ => "▶" };
-                if ui.button(play_text).clicked() { self.transport_play_pause(); }
-                if ui.button("⏹").clicked() { self.transport_stop(); }
-                if ui.button(">|").clicked() { self.navigate_file(1); }
+                if hand_cursor(&ui.button(play_text)) { self.transport_play_pause(); }
+                if hand_cursor(&ui.button("⏹")) { self.transport_stop(); }
+                if hand_cursor(&ui.button(">|")) { self.navigate_file(1); }
                 let (looping, playing_now) = {
                     let ctrl = self.player.lock().unwrap_or_else(|p| p.into_inner());
                     (ctrl.is_looping(), ctrl.state() == TransportState::Playing)
                 };
                 let loop_color = if looping && playing_now { egui::Color32::YELLOW } else if looping { egui::Color32::GREEN } else { ui.visuals().text_color() };
-                if ui.colored_label(loop_color, "🔁").clicked() { self.transport_toggle_loop(); }
+                if hand_cursor(&ui.colored_label(loop_color, "🔁")) { self.transport_toggle_loop(); }
                 ui.separator();
-                if ui.button("+").clicked() { self.audio_view.zoom_in(); }
-                if ui.button("−").clicked() { self.audio_view.zoom_out(); }
+                if hand_cursor(&ui.button("+")) { self.audio_view.zoom_in(); }
+                if hand_cursor(&ui.button("−")) { self.audio_view.zoom_out(); }
                 ui.separator();
                 ui.label("Vol:");
                 let mut vol = self.player.lock().unwrap_or_else(|p| p.into_inner()).volume() * 100.0;
-                if ui.add(egui::Slider::new(&mut vol, 0.0..=100.0)).changed() { self.transport_set_volume(vol / 100.0); }
+                {
+                    let slider_resp = ui.add(egui::Slider::new(&mut vol, 0.0..=100.0));
+                    if slider_resp.hovered() { ctx.output_mut(|o| o.cursor_icon = egui::CursorIcon::ResizeHorizontal); }
+                    if slider_resp.changed() { self.transport_set_volume(vol / 100.0); }
+                }
                 ui.separator();
                 let save_color = if self.document.dirty { egui::Color32::YELLOW } else { ui.visuals().text_color() };
                 let save_label = if self.document.dirty { "Save*" } else { "Save" };
-                if ui.colored_label(save_color, save_label).clicked() { self.save_file(); }
+                if hand_cursor(&ui.colored_label(save_color, save_label)) { self.save_file(); }
                 ui.separator();
                 // Player-panel display-mode toggle (§3.5): reflects and flips
                 // the live `AudioView::mode` state (persisted in config.json).
@@ -1659,7 +1770,7 @@ impl eframe::App for AudioScoutApp {
                     view_spectro,
                     if view_spectro { "Spectrogram" } else { "Waveform" },
                 );
-                if ui.add(view_btn).on_hover_text("Toggle the visualization between waveform and spectrogram").clicked() {
+                if hand_cursor(&ui.add(view_btn).on_hover_text("Toggle the visualization between waveform and spectrogram")) {
                     self.toggle_audio_view_mode();
                 }
             });
@@ -1678,13 +1789,31 @@ impl eframe::App for AudioScoutApp {
         // the player, i.e. docked *above* it: this is the panel the transport
         // controls must sit under (bug #1).
         egui::TopBottomPanel::bottom("actions").default_height(40.0).show(ctx, |ui| {
+            let ctx = ui.ctx().clone();
+            let hand_cursor = |resp: &egui::Response| -> bool {
+                // UX: pointing-hand cursor on hover. `hovered()` alone is
+                // frame-lagged and goes false while the pointer *enters*
+                // the widget in the same frame (the icon then only appears
+                // one repaint later, or not at all when nothing else
+                // schedules a redraw). `contains_pointer()` is computed
+                // from this frame's live pointer position against the
+                // widget rect, so the hand shows up immediately; clicks
+                // still come from `resp.clicked()`.
+                if resp.hovered() || resp.contains_pointer() {
+                    ctx.output_mut(|o| o.cursor_icon = egui::CursorIcon::PointingHand);
+                }
+                resp.clicked()
+            };
             ui.horizontal(|ui| {
-                if ui.button("Mute").clicked() { self.mute_selection(); }
+                if hand_cursor(&ui.button("Mute")) { self.mute_selection(); }
                 ui.label("Normalize:");
-                ui.add(egui::DragValue::new(&mut self.normalize_dbfs).range(-60.0..=0.0).suffix(" dBFS"));
-                if ui.button("Apply").clicked() { self.normalize_selection(); }
+                {
+                    let dv_resp = ui.add(egui::DragValue::new(&mut self.normalize_dbfs).range(-60.0..=0.0).suffix(" dBFS"));
+                    if dv_resp.hovered() { ctx.output_mut(|o| o.cursor_icon = egui::CursorIcon::ResizeHorizontal); }
+                }
+                if hand_cursor(&ui.button("Apply")) { self.normalize_selection(); }
                 ui.separator();
-                if ui.button("Delete all markers").clicked() { self.document.markers.clear(); }
+                if hand_cursor(&ui.button("Delete all markers")) { self.document.markers.clear(); }
                 if let Some(path) = &self.active_file {
                     ui.separator();
                     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
@@ -1834,6 +1963,10 @@ impl eframe::App for AudioScoutApp {
                         // Collected inside the scroll closure, appended to
                         // `paths_to_load` after the closure returns.
                         let mut local_paths_to_load: Vec<PathBuf> = Vec::new();
+                        // UX: set once if the pointer hovers any file-row
+                        // cell this frame; checked after the grid closure to
+                        // switch the cursor icon to a pointing hand.
+                        let mut any_row_hovered = false;
 
                         let grid = egui::Grid::new("file_table")
                             .num_columns(visible_cols.len())
@@ -1987,6 +2120,26 @@ impl eframe::App for AudioScoutApp {
                                     let cell_id = ui.id().with(("file_cell", idx, ci));
                                     let cell_response = ui.interact(cell_rect, cell_id, egui::Sense::click());
 
+                                    // UX: hand cursor while hovering a file
+                                    // row — the whole row is clickable
+                                    // (single click selects, double click
+                                    // loads), so it must look like a link.
+                                    // NOTE: `Response::hovered()` is false
+                                    // whenever some OTHER widget owns the
+                                    // hover this frame — e.g. the label or
+                                    // thumbnail inside the very same cell,
+                                    // which are allocated before this
+                                    // `interact()` call. Using it alone made
+                                    // the pointer stay an arrow over most of
+                                    // each row. `contains_pointer` ignores
+                                    // that priority contest and answers the
+                                    // real question ("is the mouse inside
+                                    // this row?"), so it drives the cursor
+                                    // here; `hovered()` still drives clicks.
+                                    if cell_response.hovered() || cell_response.contains_pointer() {
+                                        any_row_hovered = true;
+                                    }
+
                                     // Check if any cell in this row was clicked
                                     if cell_response.clicked() {
                                         row_clicked = true;
@@ -2025,6 +2178,12 @@ impl eframe::App for AudioScoutApp {
                         // Hand the collected double-click paths over to the
                         // outer `paths_to_load` (loaded after CentralPanel).
                         paths_to_load.append(&mut local_paths_to_load);
+
+                        // UX: pointing-hand cursor over file rows (hover).
+                        if any_row_hovered {
+                            ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::PointingHand);
+                            ui.ctx().request_repaint();
+                        }
                     });
 
                 // A column title clicked in the header row: apply the sort
