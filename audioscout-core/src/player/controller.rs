@@ -114,26 +114,6 @@ impl Controller {
         }
     }
 
-    /// Park the wall-clock projection anchor at the instant that corresponds
-    /// to `frame` on the current sample rate. Every place that MOVES the
-    /// stored clock (play/seek/tick/hardware sync/hooks) must call this in
-    /// the same step; places that merely read it must not.
-    #[inline]
-    fn rebase_clock(&mut self, frame: u64, sr: u32) {
-        let sr = sr.max(1) as u64;
-        let cur = self.current_frame.min(u64::MAX - sr);
-        // Anchor = NOW − (frame − cur)/sr, computed without floats so a
-        // forward commit never drifts the base backwards.
-        if frame >= cur {
-            let frames_ahead = frame - cur;
-            let micros = frames_ahead.saturating_mul(1_000_000) / sr;
-            self.clock_base_at = std::time::Instant::now()
-                - std::time::Duration::from_micros(micros.min(u64::MAX / 1_000_000 * 1_000_000));
-        } else {
-            self.clock_base_at = std::time::Instant::now();
-        }
-    }
-
     pub fn state(&self) -> TransportState {
         self.state
     }
