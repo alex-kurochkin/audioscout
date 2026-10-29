@@ -521,16 +521,21 @@ impl Controller {
         // honest middle ground: every press moves exactly N configured
         // seconds relative to the live cursor, bounded afterwards by the
         // file EOF and the session range inside `seek`.
-        let dt_played = self.clock_base_at.elapsed().as_secs_f64().max(0.0);
-        let projected_lead = if self.state == TransportState::Playing {
-            (dt_played * self.played_sr.max(1) as f64) as u64
-        } else {
-            0
-        };
+        // BUGFIX (regression `skip_moves_by_configured_seconds_like_user_
+        // seek`: "left: 100, right: 300"): the jump base is the RAW STORED
+        // COMMIT in EVERY state -- no projection lead folded in at all. The
+        // previous variant added `(now - anchor) x sr` while Playing, which
+        // re-introduced the double-count: between tick commits that lead
+        // stacked on top of the span the NEXT commit is about to absorb, so
+        // presses landed short or long depending on poll timing ("100"
+        // instead of "300"). Every mover parks the anchor at its own instant
+        // and `tick` commits whole quanta, so the stored frame IS the honest
+        // cursor for jump arithmetic (TZ 5.3 "jump like a user seek" applied
+        // to the committed position). Stopped/Paused never advance the
+        // fallback clock, so the stored frame is also what is displayed.
         let hi_stored = self.end_frame.min(doc.total_frames()).max(self.start_frame);
         let pos = self
             .stored_frame()
-            .saturating_add(projected_lead)
             .clamp(self.start_frame.min(hi_stored), doc.total_frames()) as i64;
         // A Skip is an explicit user commit (§5.3 "Прыжок как seek": каретка,
         // шкала и waveform-курсор синхронно обновляются), so EVERY press
@@ -869,20 +874,39 @@ impl Controller {
             // (every mover re-parks the anchor at its own instant).
             const NOMINAL_POLL_SECS: f64 = 0.05;
             const POLL_GRACE_SECS: f64 = 0.02;
+            // BUGFIX (regressions `short_file_elapsed_tracks_real_time_
+            // without_polling` "estimate over-ran the short session end: 50"
+            // AND `tick_wraps_when_looping` "fallback clock drifted: pos=8
+            // wall=4" AND `skip_moves_by_configured_seconds_like_user_seek`
+            // "left: 100, right: 300"): the cap keys off `last_tick_at` —
+            // the instant the previous `tick` poll LANDED — because that is
+            // the only honest witness of the poll loop's liveness. A fresh
+            // tick sample means commits keep absorbing spans before the
+            // getters project them, so the reading may run at most one
+            // nominal quantum ahead of the stored frame (the next commit
+            // displays exactly what was already shown — nothing counted
+            // twice; stacking fresh spans on top of a just-committed quantum
+            // was the double-count that raced a 10-frame loop to pos=8 after
+            // ~4 ms). A STALE or ABSENT sample means nobody drives the
+            // stored clock: the projection must free-run unbounded so
+            // elapsed time keeps tracking real time exactly and an un-ticked
+            // short session reads precisely `end - 1` at its ceiling — the
+            // old anchor-keyed cap froze the display at stored+50 ms forever
+            // whenever no mover ran between commits ("left: 50, right: 199").
+            // Freshness is judged against the LAST POLL landing, not the
+            // commit anchor: `tick` trims the anchor back by the sub-frame
+            // remainder, which would make a regular cadence look stale
+            // mid-session.
+            let mover_alive = self
+                .last_tick_at
+                .map(|t| t.elapsed().as_secs_f64() <= NOMINAL_POLL_SECS + POLL_GRACE_SECS)
+                .unwrap_or(false);
             // `dt` here IS `clock_base_at.elapsed()` (computed above) — the
-            // honest real span since the last commit by ANY mover. A fresh
-            // anchor means a live loop keeps committing whole quanta, so the
-            // remainder is sub-quantum wall time and may be projected with
-            // confidence; an anchor older than one nominal interval plus a
-            // scheduling grace window means nobody has driven the clock for
-            // a while — the projection then stays capped at one interval so
-            // it can never race ahead of the stored frame that a late commit
-            // is about to absorb ("pos=8 wall=4", "over-ran the short
-            // session end", stale skip ceiling).
-            let span = if dt <= NOMINAL_POLL_SECS + POLL_GRACE_SECS {
-                dt
-            } else {
+            // honest real span since the last commit by ANY mover.
+            let span = if mover_alive {
                 dt.min(NOMINAL_POLL_SECS)
+            } else {
+                dt
             };
             let adv = (span * sr) as u64;
             self.current_frame.saturating_add(adv)
@@ -1181,7 +1205,49 @@ impl Controller {
         // stored value, so each wall microsecond is counted exactly once —
         // inside a committed quantum or by the projection, never both.
         let dt_secs = dt.as_secs_f64().max(0.0);
-        let since_last_commit = real_span.min(dt_secs);
+        // BUGFIX (regressions `tick_advances_fallback_clock_and_finishes_at_
+        // end` "left: 0, right: 50" / "left: 99, right: 50",
+        // `tick_wraps_when_looping` "fallback clock drifted: pos=8 wall=4"
+        // AND `short_file_elapsed_tracks_real_time_without_polling` "estimate
+        // over-ran the short session end: 50"): the quantum a poll commits
+        // depends on WHO drives the clock:
+        //  * REGULAR cadence — the previous poll landed within one nominal
+        //    interval plus a grace window (`last_tick_at` fresh), or nobody
+        //    has committed yet at all (fresh session, first tick): the
+        //    caller's `dt` IS the honest measured span of that loop (TZ 1.2
+        //    cadence contract), so it is committed verbatim and every poll
+        //    advances deterministically by `dt x sr` — including the very
+        //    first tick of a session whose anchor `play()` parked
+        //    microseconds ago ("left: 0" came from measuring only those
+        //    microseconds instead);
+        //  * LATE poll — no mover ran for longer than one nominal interval:
+        //    the commit covers the REAL span since the anchor, so elapsed
+        //    time keeps tracking the wall clock and an un-ticked session
+        //    finishes when real time reaches `end`. ("left: 99": after ~99 ms
+        //    of free-running projection, committing another full nominal
+        //    quantum teleported the stored clock past what was already
+        //    displayed; "over-ran ... 50 vs 199": a frozen 50-frame commit
+        //    disagreed with the getters' honest 199.)
+        // Either way the anchor is re-parked at NOW minus the SUB-FRAME
+        // remainder together with the new stored value, so each wall
+        // microsecond is counted exactly once — inside a committed quantum or
+        // by the display projection, never both. A BURST arriving faster than
+        // its own claimed quantum measures >= dt here only while the polls
+        // keep pace; scheduler jitter below the pace is absorbed by the same
+        // real-span bound, keeping the cursor locked to the wall clock
+        // ("pos=8 wall=4" cannot recur: the getters add only the sub-frame
+        // remainder after every commit).
+        const NOMINAL_POLL_SECS: f64 = 0.05;
+        const POLL_GRACE_SECS: f64 = 0.02;
+        let regular_cadence = self
+            .last_tick_at
+            .map(|t| t.elapsed().as_secs_f64() <= NOMINAL_POLL_SECS + POLL_GRACE_SECS)
+            .unwrap_or(true);
+        let since_last_commit = if regular_cadence {
+            dt_secs.max(real_span)
+        } else {
+            real_span
+        };
         let delta_frames = (since_last_commit * sr as f64) as u64;
         // Whole-frame bookkeeping: the stored frame advances by WHOLE frames
         // and the anchor is re-parked at the exact instant that whole-frame
