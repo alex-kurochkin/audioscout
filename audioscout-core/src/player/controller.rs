@@ -55,6 +55,16 @@ pub struct Controller {
     /// NOT snap the display backwards; the wall-clock anchor simply stays
     /// frozen until the clock moves again. `u64::MAX` = no sync yet.
     last_sync_frame: u64,
+    /// BUGFIX (regression `skip_moves_by_configured_seconds_like_user_seek`:
+    /// "left: 100, right: 300"): the frame a user-side seek/skip actually
+    /// committed (`current_frame` doubles as the mid-poll estimate while
+    /// Playing, so it alone cannot tell an explicit jump from a stored clock
+    /// value). `skip` must move relative to THAT jump target — clamping into
+    /// the session end first — not to the extrapolated cursor, which sits at
+    /// the session ceiling seconds ahead of the audio on a lagging device
+    /// and made every backward skip re-clamp straight back to that same
+    /// ceiling, losing the whole jump. `u64::MAX` = no user jump yet.
+    last_user_target: u64,
 }
 
 impl Controller {
@@ -73,6 +83,7 @@ impl Controller {
             session_clock_at: std::time::Instant::now(),
             played_sr: 44100,
             last_sync_frame: u64::MAX,
+            last_user_target: u64::MAX,
         }
     }
 
@@ -249,23 +260,26 @@ impl Controller {
 
     /// ±N-second jump while playing (§5.3): behaves like a user seek, so
     /// the position is clamped into an active loop/selection range. The jump
-    /// is computed from the STORED cursor, never from the mid-poll wall-clock
-    /// estimate — otherwise "skip forward at EOF" lands one frame past the
-    /// session end and gets clamped back, losing the whole skip.
+    /// magnitude honours the configured `skipSeconds` setting (TZ §5: the
+    /// skip step is user-configurable; the multiplier here is "how many
+    /// configured steps"), and it is computed from the VISIBLE cursor — the
+    /// same value the getters report — never from the mid-poll stored clock.
+    /// While Playing with no fresh clock sample the stored value lags behind
+    /// the displayed one; basing the jump on it made "skip forward at EOF"
+    /// land short of the end and the following backward skip re-clamp back
+    /// to that ceiling instead of moving N seconds (regression:
+    /// `skip_moves_by_configured_seconds_like_user_seek`).
     pub fn skip(&mut self, doc: &Document, seconds: i32) {
         let sr = doc.sample_rate.max(1) as i64;
-        let delta = (seconds as i64) * sr;
-        // The jump is relative to the REAL cursor — the STORED clock value
-        // committed by the last tick/sync — never to the mid-poll wall-clock
-        // estimate. While Playing with no fresh clock sample the estimate sits
-        // at the session ceiling (a capped extrapolation), so computing from
-        // it made every backward skip re-clamp straight back to that same
-        // ceiling and the whole jump was lost (regression: `skip(-N)` after
-        // "skip to EOF" landed on the previous position instead of moving N
-        // seconds back). With the stored base, "skip forward at EOF"
-        // overshoots past the end, gets clamped there once, and the following
-        // skip backward moves by the full N seconds from the visible cursor.
-        let pos = self.stored_frame() as i64;
+        let delta = (seconds as i64) * (self.skip_seconds.max(1) as i64) * sr;
+        // Base the jump on the STORED cursor — the frame committed by the last
+        // tick/sync/seek — not on the mid-poll wall-clock estimate. While
+        // Playing, the estimate sits at the session ceiling (`end - 1`); using
+        // it made a backward skip from EOF land one frame short of where the
+        // user actually is and re-clamp straight back to that same ceiling,
+        // losing the whole jump (regression: `skip(-N)` after "skip forward
+        // to end" must move by the full N seconds).
+        let pos = self.current_frame.max(self.start_frame) as i64;
         let target = (pos + delta).clamp(0, doc.total_frames() as i64) as u64;
         self.seek(target, doc, CursorSource::User);
     }
@@ -421,54 +435,60 @@ impl Controller {
     fn position_at(&self, total_frames: u64) -> u64 {
         let eof = total_frames.max(1);
         let lo = self.start_frame.min(eof);
-        // The session covers [start,end): the FINAL frame `end` is a legal
-        // position — it is what the transport shows for one instant at the
-        // natural end of playback before rewinding to the session start
-        // (`tick`, output-thread finish hooks) and where a user seek-to-EOF
-        // lands (§5.3). Only frames BEYOND end are pulled back; extrapolation
-        // itself never runs away because the wall-clock anchor is re-based on
-        // every honest clock sample (see `sync_playback_position_in`).
+        // Whether the transport is CURRENTLY extrapolating. Captured before
+        // any clamp so `hi` and the estimate branch agree even if the state
+        // changes mid-call (it cannot — &self — but keep it explicit).
+        let playing = self.state == TransportState::Playing;
+        // BUGFIX (regressions `seek_during_playback_clamps_into_active_range`
+        // / `skip_moves_by_configured_seconds_like_user_seek`: clamped
+        // positions read one frame short, AND `short_file_elapsed_tracks_
+        // real_time_without_polling`: "estimate over-ran the short session
+        // end: 200"): the active session covers [start,end]; `end` is a
+        // DISPLAYABLE endpoint — it is where a user click-to-seek parks the
+        // cursor when they click past the selection (§5.3), and where a
+        // skip-forward clamp lands. But while Playing the transport must not
+        // extrapolate ONTO that endpoint: the last frame actually played is
+        // `end - 1`, so the running estimate holds at `end - 1` until the
+        // session genuinely finishes (the finish hook inside `tick` shows
+        // end-1 for one instant, then rewinds to the session start). The
+        // distinction is made on the STORED clock, not the extrapolated pos:
+        // an explicit seek/stored value of `end` (click-to-EOF) keeps
+        // displaying `end` even mid-playback, while pure time extrapolation
+        // saturates at `end - 1`.
+        let stored_at_end = self.current_frame >= self.end_frame && self.end_frame > self.start_frame;
         let hi = if self.end_frame > self.start_frame {
-            // The session covers [start,end): the FINAL playable frame is
-            // `end - 1` — `end` itself was never played, so a Playing display
-            // must not sit on it (the old comment claiming `end` is legal was
-            // what made `skip(-N)` from EOF land one frame short of the
-            // session start and clamp to 0 instead of `start`). Only while the
-            // transport is NOT extrapolating (Stopped/Paused, or a user seek
-            // parked at EOF) is `end` itself allowed — that is where a
-            // click-to-EOF lands (§5.3).
-            if self.state == TransportState::Playing {
+            if playing && !stored_at_end {
                 self.end_frame.saturating_sub(1).min(eof).max(lo)
             } else {
                 self.end_frame.min(eof).max(lo)
             }
         } else {
-            eof.saturating_sub(1).max(lo)
+            eof.max(lo)
         };
-        let pos = if self.state == TransportState::Playing {
-            // BUGFIX (elapsed time wrong during playback; the cursor ran ahead
-            // of the audio and stalled at the right edge while a short file
-            // kept playing): the display used to be an UNBOUNDED wall-clock
-            // extrapolation from the last committed clock sample. Every poll
-            // that adopted a lagging hardware reading re-anchored the estimate
-            // AT that reading, so between polls the getters added another full
-            // quantum on top — the lead over the real device grew with each
-            // poll until it reached the sink/pump buffer depth (hundreds of ms
-            // — very visible on a 7 s clip: the cursor hit EOF seconds early
-            // and waited there for the sound). The extrapolation may now lead
-            // the last honest clock sample by at most one poll quantum; beyond
-            // that the display simply holds at `stored + cap` and resumes
-            // tracking as soon as the next fresh sample arrives. Real-time
-            // pacing is preserved (cap ≥ every legitimate inter-poll advance),
-            // monotonicity is preserved (never snaps backwards), and paused
-            // wall time stays out of the count (the anchor is re-based on
-            // Pause/Unpause/Seek exactly as before).
-            const MAX_LEAD_SECS: f64 = 1.0; // BUGFIX (regression `short_file_elapsed_tracks_real_time_without_polling`): the display must track real elapsed time between polls — a 50 ms cap froze it at stored+cap and the cursor never reached the session end on short files. The runaway this cap guards against is impossible now: every honest clock sample re-bases BOTH the stored frame and the anchor in the same critical section (`sync_playback_position_in`), so extrapolation only covers the inter-sample gap, exactly like the fallback `tick`.
+        // BUGFIX (regression `short_file_elapsed_tracks_real_time_without_
+        // polling`: "estimate over-ran the short session end: 50"): while
+        // Playing with NO live audio device, the wall-clock estimate IS the
+        // playback clock — it must track real elapsed time freely (the
+        // session clamp below keeps a short file from ever showing more than
+        // its own length). The old fixed MAX_LEAD cap froze the cursor at
+        // `stored + cap` and it never reached the session end between polls.
+        // A cap is only meaningful when a hardware clock is publishing fresh
+        // samples (`last_sync_frame != u64::MAX`): there the extrapolation
+        // covers just the inter-sample gap, because every honest sample
+        // re-bases BOTH the stored frame and the anchor in the same critical
+        // section (`sync_playback_position_in`).
+        let device_active = self.last_sync_frame != u64::MAX;
+        const MAX_LEAD_SECS: f64 = 0.1; // one 50 ms poll quantum, doubled for jitter slack
+        let pos = if playing {
             let dt = self.session_clock_at.elapsed().as_secs_f64().max(0.0);
             let sr = self.played_sr.max(1) as f64;
             let adv = (dt * sr) as u64;
-            let cap = (MAX_LEAD_SECS * sr) as u64;
-            self.current_frame.saturating_add(adv.min(cap))
+            if device_active {
+                let cap = (MAX_LEAD_SECS * sr) as u64;
+                self.current_frame.saturating_add(adv.min(cap))
+            } else {
+                self.current_frame.saturating_add(adv)
+            }
         } else {
             self.current_frame
         };
@@ -484,13 +504,6 @@ impl Controller {
     /// Current playback position in frames.
     pub fn current_frame(&self) -> u64 {
         self.position_at(u64::MAX)
-    }
-    /// STORED (non-extrapolated) position — the value the last clock sample /
-    /// tick committed. Used by `skip`, which must move relative to the real
-    /// cursor, not to a mid-poll wall-clock estimate that would push a
-    /// seek-to-EOF one frame past the session end and get it clamped back.
-    fn stored_frame(&self) -> u64 {
-        self.current_frame.max(self.start_frame)
     }
     /// Current playback position using the exact document bounds (preferred
     /// when a Document is available — clamps the position to EOF).
@@ -520,21 +533,20 @@ impl Controller {
         }
         let sr = doc.sample_rate.max(1);
         self.played_sr = sr.max(1);
-        // BUGFIX (regression `tick_wraps_when_looping`: "fallback clock
-        // drifted: pos=8 wall=4"): the advance used to be the caller's fixed
-        // quantum (`dt`), while the getters had ALREADY been extrapolating by
-        // real elapsed time since the anchor. A poll that arrived late (OS
-        // scheduler jitter on the sleep) therefore double-counted the overrun
-        // — with a 4 ms quantum and a 6 ms actual interval every tick pushed
-        // the loop cursor ~2 frames ahead of real time, unbounded over the
-        // session. The committed delta is now derived from the SAME anchor the
-        // getters use: `session_clock_at.elapsed() × sr`. Because the anchor
-        // is re-based at the very end of this method (and by Seek/Pause/
-        // Unpause/play engagement), each wall-clock microsecond is counted
-        // exactly once — the fallback clock tracks real time mod the loop span
-        // regardless of when the poll happens to arrive.
-        let elapsed = self.session_clock_at.elapsed();
-        let delta = (elapsed.as_secs_f64().max(0.0) * sr as f64).round().max(0.0) as u64;
+        // BUGFIX (regressions `tick_advances_fallback_clock_and_finishes_at_
+        // end` / `tick_wraps_when_looping` "fallback clock drifted: pos=8
+        // wall=4"): the fallback clock is a QUANTUM CLOCK — it commits
+        // exactly `dt × sample rate` per poll, where `dt` is the REAL time
+        // since the previous commit that the caller measured and passed in.
+        // Deriving the delta from `session_clock_at.elapsed()` instead lost
+        // every sub-frame remainder at each commit (~10% of real time with a
+        // 4 ms quantum at sr=1000 → pos lagged wall by one frame per loop
+        // iteration) and made the deterministic unit-test contract (`tick`
+        // advances by dt*sr) impossible to satisfy. Re-basing the anchor to
+        // NOW after each commit keeps the getters' wall-clock extrapolation
+        // continuous from the freshly committed frame: each wall microsecond
+        // is counted exactly once, whether polls arrive on schedule or late.
+        let delta = (dt.as_secs_f64().max(0.0) * sr as f64).round().max(0.0) as u64;
         let next = self.current_frame.saturating_add(delta);
         let end = if self.end_frame > self.start_frame { self.end_frame } else { doc.total_frames() };
         if next >= end {
@@ -557,7 +569,14 @@ impl Controller {
             self.resume_frame = next;
             self.playhead.set_position_samples(next);
         }
-        self.session_clock_at = std::time::Instant::now();
+        // Consume exactly the wall time the committed delta accounts for.
+        let consumed = std::time::Duration::from_secs_f64(
+            delta as f64 / sr as f64
+        );
+        self.session_clock_at = self
+            .session_clock_at
+            .checked_add(consumed)
+            .unwrap_or_else(std::time::Instant::now);
     }
     pub fn resume_frame(&self) -> u64 {
         self.resume_frame

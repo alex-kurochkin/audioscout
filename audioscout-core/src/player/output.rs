@@ -2011,6 +2011,14 @@ mod idle_loop_tests {
     #[test]
     fn timeout_is_not_shutdown_in_source() {
         let src = include_str!("output.rs");
+        // Build the forbidden literals from fragments so this test's own
+        // source lines (the scan reads the whole file, including this module)
+        // don't self-match and report a phantom regression.
+        let banned_arm = format!("{} | {} => {}", "Some(Cmd::Shutdown)", "None", "break");
+        let banned_poll = format!(
+            "recv_timeout(std::time::Duration::from_millis(50)){})",
+            ".ok("
+        );
         // no code line may collapse timeouts into the shutdown arm anymore
         for line in src.lines() {
             let t = line.trim_start();
@@ -2018,11 +2026,11 @@ mod idle_loop_tests {
                 continue;
             }
             assert!(
-                !t.contains("Some(Cmd::Shutdown) | None => break"),
+                !t.contains(banned_arm.as_str()),
                 "regression: timeout-as-shutdown arm reintroduced: {t}"
             );
             assert!(
-                !t.contains("recv_timeout(std::time::Duration::from_millis(50)).ok()"),
+                !t.contains(banned_poll.as_str()),
                 "regression: `.ok()` swallowing RecvTimeoutError reintroduced: {t}"
             );
         }
