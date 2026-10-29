@@ -148,6 +148,10 @@ pub struct AudioScoutApp {
     /// was what silently dropped the first wheel notch after entering the
     /// view ("buttons work, wheel doesn't").
     raw_wheel_dy: f32,
+    /// Whether the snapshotted wheel event above carried the Ctrl modifier
+    /// (zoom gesture) — captured together with `raw_wheel_dy` at the top of
+    /// `update()` so the panel never has to re-read stale live modifiers.
+    raw_wheel_ctrl: bool,
     /// Rect of the audio-view content area, recorded by the panel itself on
     /// every frame (kept for diagnostics / future hit-tests).
     audio_view_rect: Option<egui::Rect>,
@@ -256,6 +260,7 @@ impl AudioScoutApp {
             // after its first append (see `poll_playhead`).
             playhead_fed_ceiling: None,
             raw_wheel_dy: 0.0,
+            raw_wheel_ctrl: false,
             audio_view_rect: None,
         };
 
@@ -1312,47 +1317,52 @@ impl eframe::App for AudioScoutApp {
         // this one, then let the per-widget hover checks below re-apply it.
         ctx.output_mut(|o| o.cursor_icon = egui::CursorIcon::Default);
 
-        // BUGFIX (wheel zoom in the player stopped working; buttons still
-        // work): egui accumulates wheel motion into TWO independent fields —
-        // `smooth_scroll_delta` (continuous trackpad-style scrolling) and
-        // `raw_scroll_delta` (classic discrete mouse-wheel notches). In
-        // `InputState::end_pass` the raw delta is folded into the smooth one
-        // ONLY when the pointer hovers a widget that actually wants static
-        // dragging (`wants_drag_and_drop`, e.g. ScrollArea / Slider). The
-        // audio-view area below allocates its rect with plain
-        // `Sense::click_and_drag()` and is not a drag-and-drop target, so
-        // after the recent layout refactor the mouse wheel's notch deltas are
-        // simply DISCARDED at the end of every input pass and
-        // `smooth_scroll_delta.y` reads 0 — the Ctrl+wheel zoom never fires
-        // while the +/− buttons keep working because they don't depend on
-        // scroll events at all. The handler inside the audio-view panel now
-        // consumes BOTH deltas directly; additionally, request an immediate
-        // follow-up repaint whenever this frame saw any scroll motion, so
-        // even if the very first post-event frame happens to read a zeroed
-        // smooth delta, the next pass re-evaluates the pointer position used
-        // by `zoom_at_x` and the gesture is never silently swallowed.
-        //
-        // BUGFIX (the snapshot above was never consumed → wheel zoom STILL
-        // dead): reading `i.raw_scroll_delta` inside the panel closure does
-        // NOT help either — egui zeroes both scroll fields in
-        // `Context::run` BEFORE the first pass' `input()` snapshot is taken
-        // (`take()`, not peek), so every UI-visible accessor sees 0 for a
-        // discrete wheel notch. The values are only alive at the top of
-        // `update()`, where egui has just fed this frame's events but no
-        // pass has consumed them yet: snapshot the RAW vertical wheel delta
-        // (and the Ctrl modifier) into `raw_wheel_dy` here, clear it the
-        // moment the audio-view panel claims it, and have the panel fall
-        // back to this snapshot whenever its own live read comes up empty.
-        let had_scroll = ctx.input(|i| {
-            let s = i.raw_event_iter().any(|e| matches!(e, egui::Event::MouseWheel { .. }));
-            s || i.raw_scroll_delta != egui::Vec2::ZERO || i.smooth_scroll_delta != egui::Vec2::ZERO
+        // BUGFIX (wheel zoom / wheel scrub in the player stopped working;
+        // the +/− buttons still worked): egui 0.29 folds each `MouseWheel`
+        // event into two fields — `raw_scroll_delta` (the total notch delta
+        // for this frame) and `smooth_scroll_delta` (a smoothed slice of it).
+        // Both stay readable for the WHOLE frame (nothing in egui zeroes
+        // them mid-pass), so the original failure was elsewhere: the old
+        // handler preferred `smooth_scroll_delta` whenever it was non-zero.
+        // A discrete wheel notch arrives as one big jump (typically ≥ 8
+        // points per detent), which egui classifies as "not smooth" and
+        // routes through `unprocessed_scroll_delta`, releasing only ~10 %
+        // of it into the smooth field per frame while the rest decays
+        // exponentially. Worse, during playback the 50 ms poll repaints the
+        // UI *without* new input, and those frames keep replaying the same
+        // stale `raw_scroll_delta` from `new_events.take()` — so the huge,
+        // slowly-decaying smooth value dominated the "prefer smooth" pick
+        // and the effective gesture became invisible (sub-pixel pans, zoom
+        // indistinguishable from the buttons doing nothing noticeable).
+        // Fix: snapshot the RAW notch delta (exactly one application per
+        // real wheel event) plus the Ctrl modifier right here, at the top
+        // of `update()`, hand it to the audio-view panel below (which
+        // consumes-then-clears it), and request an immediate repaint so a
+        // notch arriving between on-demand frames is processed at once.
+        let mut wheel_evt = None;
+        ctx.input(|i| {
+            if let Some(ev) = i.events.iter().rev().find_map(|e| match e {
+                egui::Event::MouseWheel { unit, delta, modifiers, .. } => Some((*unit, *delta, *modifiers)),
+                _ => None,
+            }) {
+                let px_per_notch = match ev.0 {
+                    egui::MouseWheelUnit::Point => 1.0,
+                    // egui's default `InputOptions::line_scroll_speed` (the
+                    // field itself is private in 0.29; the value is stable).
+                    egui::MouseWheelUnit::Line => 20.0,
+                    egui::MouseWheelUnit::Page => i.screen_rect().height(),
+                };
+                wheel_evt = Some((ev.1.y * px_per_notch, ev.2.ctrl));
+            } else if i.raw_scroll_delta.y != 0.0 {
+                wheel_evt = Some((i.raw_scroll_delta.y, i.modifiers.ctrl));
+            }
         });
-        // Raw wheel snapshot for the audio view (see the BUGFIX note above
-        // and the consumer in the `audio_view` bottom panel).
-        self.raw_wheel_dy = ctx.input(|i| i.raw_scroll_delta.y);
-        if had_scroll {
-            // Immediate extra pass so a wheel notch is never lost between
-            // on-demand frames (see the BUGFIX note above).
+        if let Some((dy, ctrl)) = wheel_evt {
+            self.raw_wheel_dy = dy;
+            self.raw_wheel_ctrl = ctrl;
+            // Immediate repaint so the panel (declared later this frame or
+            // on the next one) applies the gesture without waiting for the
+            // next input event.
             ctx.request_repaint();
         }
 
@@ -1700,20 +1710,33 @@ impl eframe::App for AudioScoutApp {
             }
 
             // Wheel zoom / horizontal scroll — see the BUGFIX note at the top
-            // of `update`: a plain mouse wheel only fills `raw_scroll_delta`
-            // (which egui discards for non-drag targets), while trackpads
-            // fill `smooth_scroll_delta`. Handle BOTH so Ctrl+wheel zoom and
-            // plain-wheel horizontal scrubbing work regardless of pointer
-            // hover state; prefer the smooth delta when both are present.
-            let (scroll, ctrl_mods) = ui.input(|i| {
-                let s = if i.smooth_scroll_delta != egui::Vec2::ZERO {
-                    i.smooth_scroll_delta
-                } else {
-                    i.raw_scroll_delta
-                };
-                (s, i.modifiers.ctrl)
-            });
-            if scroll.y != 0.0 {
+            // of `update()`: the RAW notch delta (one application per real
+            // wheel event, immune to egui's exponential smoothing and to the
+            // stale-event replay on input-less repaints) is snapshotted there
+            // into `raw_wheel_dy`/`raw_wheel_ctrl` and consumed-then-cleared
+            // right here, but ONLY while the pointer actually hovers this
+            // panel — otherwise the gesture would silently apply when the
+            // cursor sits over the file list or a toolbar. Trackpad-style
+            // continuous motion additionally flows through the live smooth
+            // delta every frame; reading it directly here is safe because
+            // nothing else in this app scrolls vertically inside the panel.
+            let hovering = response.contains_pointer()
+                || ui.input(|i| i.pointer.hover_pos().map_or(false, |p| rect.contains(p)));
+            let live_smooth_y = if hovering {
+                ui.input(|i| if i.smooth_scroll_delta != egui::Vec2::ZERO {
+                    i.smooth_scroll_delta.y
+                } else { 0.0 })
+            } else { 0.0 };
+            let (scroll_y, ctrl_mods) = if hovering && self.raw_wheel_dy != 0.0 {
+                let v = (self.raw_wheel_dy, self.raw_wheel_ctrl);
+                self.raw_wheel_dy = 0.0; // consume exactly once
+                self.raw_wheel_ctrl = false;
+                v
+            } else {
+                if hovering { self.raw_wheel_dy = 0.0; self.raw_wheel_ctrl = false; }
+                (live_smooth_y, ui.input(|i| i.modifiers.ctrl))
+            };
+            if hovering && scroll_y != 0.0 {
                 if ctrl_mods {
                     // Zoom around the pointer: fall back to the centre of the
                     // view when the pointer is outside the rect (e.g. it left
@@ -1723,11 +1746,19 @@ impl eframe::App for AudioScoutApp {
                         .filter(|p| rect.contains(*p))
                         .unwrap_or(rect.center());
                     let x_ratio = ((pos.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
-                    let factor = if scroll.y > 0.0 { 1.25 } else { 1.0 / 1.25 };
+                    // One classic wheel notch is ~35–40 points after unit
+                    // conversion; normalise so a single Ctrl+notch always
+                    // gives the same comfortable ×1.25 zoom step regardless
+                    // of device units or smoothing leftovers.
+                    let steps = (scroll_y / 35.0).clamp(-1.0, 1.0);
+                    let factor = 1.25_f64.powf(steps as f64);
                     self.audio_view.zoom_at_x(factor, x_ratio as f64);
                 } else {
-                    self.audio_view.scroll_horizontal(-scroll.y as f64 * 0.01);
+                    // Plain wheel: horizontal scrub, one notch ≈ 25 % of the
+                    // visible window (see `scroll_horizontal`).
+                    self.audio_view.scroll_horizontal(-scroll_y as f64 * 0.01);
                 }
+                ctx.request_repaint();
             }
         });
 
