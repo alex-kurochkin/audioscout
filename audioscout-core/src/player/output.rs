@@ -125,6 +125,35 @@ impl SharedOutput {
         (consumed / dst_ch).saturating_mul(src_rate) / dst_rate
     }
 
+    /// BUGFIX (elapsed playback time computed wrong; the cursor races ahead
+    /// of the audio and stands at the right edge of the player window while a
+    /// short file finishes): honest AUDIBLE floor for the UI clock — the
+    /// position published by the cpal callback (`MeteredSource::publish`,
+    /// chunk-relative so it never chases the pump feed point), tagged with
+    /// `true_playhead_epoch` so stale values from a previous session are
+    /// ignored. Unlike `true_audible_file_frame` this is NOT bounded above by
+    /// the feed point and NOT floored by the raw absolute clock (which counts
+    /// samples already handed to ALSA but still unplayed), so it can be used
+    /// as the lower bound of a wall-clock interpolation that must never jump
+    /// backwards when the pump refills the queue.
+    pub fn audible_floor_file_frame(&self) -> Option<u64> {
+        if self.source_active.load(Ordering::Acquire)
+            && self.true_playhead_epoch.load(Ordering::Acquire)
+                == self.session_epoch.load(Ordering::Acquire)
+        {
+            Some(self.true_playhead_file_frame.load(Ordering::Acquire))
+        } else {
+            None
+        }
+    }
+
+    /// Session origin in FILE frames (seeded by the controller on every
+    /// Play/Seek) — the honest position to display during the pre-buffer
+    /// window before any chunk has been audibly played.
+    pub fn session_origin_file_frame(&self) -> u64 {
+        self.session_start_frame.load(Ordering::Acquire)
+    }
+
     /// Ground-truth AUDIBLE position in absolute FILE frames — the single
     /// value the UI cursor must never exceed while extrapolating.
     ///
@@ -554,46 +583,33 @@ impl RodioOutput {
         })
     }
 
-    /// BUGFIX (playhead races ahead of the audio; cursor stalls at the right
-    /// edge while a short file keeps playing): the maximum file frame the UI
-    /// cursor may display for the CURRENT audible state — the true hardware
-    /// position plus whatever the pump has already queued in the Sink but the
-    /// device has not played yet. The wall-clock extrapolation in the app is
-    /// clamped to this ceiling, so the cursor can never show samples that
-    /// have not reached (or are not about to reach) the speakers. `None`
-    /// when no document is loaded into the output yet.
+    /// BUGFIX (elapsed playback time computed wrong; the cursor races ahead
+    /// of the audio and stands at the right edge of the player window while a
+    /// short file finishes): honest AUDIBLE CEILING for the UI clock — the
+    /// furthest FILE frame that can possibly have reached the speakers plus
+    /// only what is provably in flight toward them.
+    ///
+    /// The previous implementation derived the ceiling from
+    /// `true_audible_file_frame`, which floors itself with the raw absolute
+    /// hardware clock (`consumed_samples`). That counter advances by whole
+    /// 512-sample windows *when cpal pulls them* — i.e. when samples are
+    /// handed to ALSA/Pulse, not when they leave the speakers — so it sits up
+    /// to one device-buffer (~0.3-0.75 s) AHEAD of the audible truth. On a
+    /// 7 s clip the clamped cursor still reached EOF and parked at the right
+    /// edge while the tail kept playing. This ceiling uses ONLY the chunk-
+    /// relative truth published inside the callback (`audible_floor_file_frame`
+    /// — never ahead of the device), plus at most one poll quantum of
+    /// smoothing headroom; the pump feed point no longer inflates it.
+    /// `None` means "no live session truth yet" — the caller must then fall
+    /// back to the session origin instead of extrapolating freely.
     pub fn playhead_ceiling_frame(&self) -> Option<u64> {
-        // `pumped_to_frame` is the ABSOLUTE FILE frame the pump handed to
-        // the Sink; everything above it provably has not reached the device
-        // queue yet, so no wall-clock extrapolation may ever display it.
-        let fed_file = self.shared.pumped_to_frame.load(Ordering::Acquire);
-        if fed_file == 0 {
-            // No session engaged yet (fresh Load/Stop resets the counter):
-            // no honest ceiling exists — let the caller fall back to its own
-            // conservative clamp instead of pinning the cursor at 0.
-            return None;
-        }
-        // BUGFIX (cursor STILL races ahead and parks at the right edge on a
-        // ~7 s file): `pumped_to_frame` alone is NOT an audible bound — the
-        // pump deliberately keeps up to `LEAD_SECONDS` (~0.75 s) of samples
-        // queued inside the Sink ahead of the device. Clamping the display
-        // to the feed point still lets the cursor lead the SOUND by the full
-        // queue depth: during the initial pre-buffer the whole first chunk
-        // is fed before a single sample reaches the speakers, so on short
-        // clips the cursor jumped ~0.75 s forward, hit the window's right
-        // edge, and waited there while the audio caught up. The honest
-        // ceiling is the AUDIBLE truth (`true_audible_file_frame`: cpal-
-        // callback clock bounded by the feed point), plus only what is
-        // actually in flight toward the speakers — never more than the
-        // current queue headroom and one poll quantum of smoothing.
-        let sf = self.stream_format;
-        // AtomicU32 — load with Acquire so the value published by
-        // `load_document` (Release store) is visible to this UI-thread poll.
+        let floor = self.shared.audible_floor_file_frame()?;
         let sr = self.document_sample_rate.load(Ordering::Acquire).max(1);
-        let true_frame = self.shared.true_audible_file_frame(sr, sf);
-        let queue_headroom = fed_file.saturating_sub(true_frame);
+        // Smoothing headroom: one UI poll quantum (the display interpolates
+        // between polls at the nominal rate; anything beyond this lead has
+        // not been measured as audible yet).
         let cap_frames = ((0.05 * sr as f64) as u64).max(1);
-        Some(true_frame + queue_headroom.min(cap_frames))
+        Some(floor + cap_frames)
     }
 
     /// Device stream format `(sample_rate, channels)` the output was opened
@@ -824,6 +840,19 @@ struct MeteredSource {
     /// a previous session (stale EOF clamps pinned the fresh cursor at the
     /// right window edge until the new session's first chunk played).
     session_epoch_at_append: u64,
+    /// BUGFIX (elapsed playback time computed wrong; the cursor races ahead
+    /// of the audio and parks at the right edge of the player window while a
+    /// short file keeps playing): absolute FILE frame where THIS chunk starts
+    /// (`pump.cursor_frame` snapshot at append time). The truth published by
+    /// `publish()` must be `chunk_start + played-within-this-chunk`, NOT
+    /// `session_origin + clock_since_session_seed`: the shared clock is
+    /// seeded at the session start but advances only while sources are being
+    /// pulled, so between two pump appends it lags behind the fed cursor by
+    /// up to one whole chunk (~0.5 s) — adding that lag on top of the origin
+    /// made the reported position jump ahead toward the feed point whenever
+    /// the queue was refilled. With this field the published position tracks
+    /// the device sample-for-sample instead of chasing the pump ceiling.
+    chunk_start_file_frame: u64,
     // Local mirror of the global `consumed_samples` clock. Incremented in
     // `next()` and flushed into the atomic only every 512 samples — see the
     // BUGFIX note below (atomic-per-sample starved the cpal callback).
@@ -913,22 +942,28 @@ impl MeteredSource {
         // window's end (the frame the hardware has just finished playing).
         let consumed = self.shared.consumed_samples.load(Ordering::Relaxed)
             + self.rms_count as u64;
-        // Absolute STREAM frames played so far (device rate / device
-        // channels), then mapped back into FILE frames with the exact
-        // resampling ratio used by `slice_to_buffer` for this chunk:
-        // out_frames = file_frames * dst_rate / src_rate. `self.stream_rate`
+        // dst/src rates used to map this chunk's played stream samples back
+        // into FILE frames (the same ratio `slice_to_buffer` resampled with:
+        // out_frames = file_frames * dst_rate / src_rate). `self.stream_rate`
         // is the device rate the chunk was built with (passed in by the pump)
         // — `SamplesBuffer::sample_rate` is an inherent field getter behind
         // the `rodio::Source` trait, so we carry the value explicitly instead
         // of importing the trait into this hot path.
-        let stream_frames = consumed / self.channels.max(1) as u64;
         let dst_rate = self.stream_rate.max(1) as u64;
         let src_rate = self.file_sample_rate.max(1) as u64;
-        // Absolute FILE frame from the session origin (chunk-relative count).
-        let file_frame_rel = stream_frames.saturating_mul(src_rate) / dst_rate;
+        // BUGFIX (elapsed time computed wrong; cursor races ahead and waits
+        // at the right edge on short files): convert only THIS chunk's own
+        // played samples (`local_idx`, reset per source) into file frames and
+        // add them to the absolute file frame where the chunk starts. The old
+        // formula added the whole session-wide clock delta to the session
+        // origin — but that clock lags the fed cursor by up to a full pump
+        // chunk (~0.5 s) between refills, so every queue top-up made the
+        // truth leap forward toward the feed point and the UI cursor raced
+        // ahead of the sound, hitting EOF long before the audio did.
+        let played_stream_frames = self.local_idx / self.channels.max(1) as u64;
         let file_frame_true = self
-            .session_start_file_frame
-            .saturating_add(file_frame_rel)
+            .chunk_start_file_frame
+            .saturating_add(played_stream_frames.saturating_mul(src_rate) / dst_rate)
             .min(self.fed_ceiling_file_frame);
         // Publish the ground-truth audible position before advancing the
         // raw clock, both with ordering strong enough for the UI poll:
@@ -1675,6 +1710,11 @@ fn pump_thread(pump: Arc<PumpState>, stream_format: (u32, u16)) {
             // started from. The pump knows it as `s_start` — the same value
             // the controller seeded `consumed_samples` with.
             session_start_file_frame: s_start,
+            // BUGFIX (elapsed time computed wrong): absolute FILE frame where
+            // THIS chunk begins — the truth is published as
+            // `chunk_start + played-within-chunk`, which tracks the device
+            // exactly instead of chasing the pump feed point.
+            chunk_start_file_frame: cursor,
             fed_ceiling_file_frame: next_end,
             session_epoch_at_append: pump
                 .shared
