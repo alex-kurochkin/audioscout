@@ -86,8 +86,18 @@ impl AudioView {
     /// = 1 frame — "scrolling does nothing"). A notch now moves ~25% of the
     /// screen, matching a normal scrollbar page-step feel.
     pub fn scroll_horizontal(&mut self, fraction: f64) {
-        let delta = (self.view_range.len() as f64 * fraction * 25.0) as i64;
-        self.pan(delta);
+        // BUGFIX (wheel pan direction was inverted): a forward wheel notch
+        // carries a POSITIVE delta in egui (`Event::MouseWheel.delta.y > 0`
+        // when scrolled "up"), which conventionally scrolls the CONTENT down
+        // — i.e. toward the beginning of the file. The caller therefore must
+        // NOT negate the raw delta before handing it over here: positive
+        // fraction → view moves left (toward frame 0), negative → right.
+        // The old `* 25.0` multiplier is likewise dropped: `fraction` is now
+        // documented as "fractions of the visible window", so one notch
+        // (~0.035 after the caller's normalisation) pans ~3.5 % and a full
+        // page-height gesture pans exactly one page.
+        let delta = (self.view_range.len() as f64 * fraction) as i64;
+        self.pan(-delta);
     }
     pub fn set_cursor(&mut self, frame: u64) { self.cursor_frame = frame.min(self.total_frames); }
     pub fn auto_scroll_to_cursor(&mut self) {

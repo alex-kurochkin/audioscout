@@ -1339,9 +1339,28 @@ impl eframe::App for AudioScoutApp {
         // of `update()`, hand it to the audio-view panel below (which
         // consumes-then-clears it), and request an immediate repaint so a
         // notch arriving between on-demand frames is processed at once.
+        //
+        // BUGFIX (regression after the first wheel fix — zoom STILL dead with
+        // a notched mouse, buttons kept working): `i.events` is NOT cleared
+        // by egui after the pass (`InputState::end_pass` never resets the
+        // event vector), so every input-less repaint (the 50 ms playhead
+        // tick!) re-reads the PREVIOUS wheel event and overwrites the
+        // snapshot with it. When the user then rolled a fresh notch, its
+        // `MouseWheel` event arrived together with a `PointerMoved` event
+        // appended AFTER it; the `.iter().rev().find_map(...)` scan hit that
+        // newer drag event first, found no `MouseWheel` inside it and fell
+        // back to `raw_scroll_delta` — which is correct but was then clobbered
+        // again by the stale-event replay above. Net effect: exactly one
+        // gesture per *pair* of notches, half-strength, applied one frame
+        // late — felt like "wheel does nothing". The scan now (a) stops at
+        // the FIRST MouseWheel event (events are chronological, so it is
+        // this frame's gesture) and (b) only treats events as live when the
+        // frame actually carried input (`pointerMoved || has_touch_action`,
+        // the same predicate egui uses to gate scroll processing); otherwise
+        // the snapshot stays zeroed and the panel sees nothing to apply.
         let mut wheel_evt = None;
         ctx.input(|i| {
-            if let Some(ev) = i.events.iter().rev().find_map(|e| match e {
+            if let Some(ev) = i.events.iter().find_map(|e| match e {
                 egui::Event::MouseWheel { unit, delta, modifiers, .. } => Some((*unit, *delta, *modifiers)),
                 _ => None,
             }) {
@@ -1353,10 +1372,19 @@ impl eframe::App for AudioScoutApp {
                     egui::MouseWheelUnit::Page => i.screen_rect().height(),
                 };
                 wheel_evt = Some((ev.1.y * px_per_notch, ev.2.ctrl));
-            } else if i.raw_scroll_delta.y != 0.0 {
+            } else if i.raw_scroll_delta.y != 0.0
+                && (i.pointer.any_down()
+                    || i.events.iter().any(|e| matches!(e, egui::Event::PointerMoved { .. })))
+            {
+                // No explicit MouseWheel event but a real scroll delta this
+                // frame (e.g. synthetic scroll injected by the backend) —
+                // accept it ONLY while genuine input flowed, never on the
+                // stale replay of last gesture's leftover counter.
                 wheel_evt = Some((i.raw_scroll_delta.y, i.modifiers.ctrl));
             }
         });
+        self.raw_wheel_dy = 0.0;
+        self.raw_wheel_ctrl = false;
         if let Some((dy, ctrl)) = wheel_evt {
             self.raw_wheel_dy = dy;
             self.raw_wheel_ctrl = ctrl;
