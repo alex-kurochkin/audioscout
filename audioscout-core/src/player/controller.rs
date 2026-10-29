@@ -456,7 +456,11 @@ impl Controller {
         // where the whole session is only a few quanta long. Advance from
         // the wall-clock anchor instead: exact elapsed time, no drift.
         let sr = doc.sample_rate.max(1);
-        let delta = ((dt.as_secs_f64().max(0.0)) * sr as f64).round().max(0.0) as u64;
+        // `delta` is kept for debug tracing only: the actual position advance
+        // below comes from the wall-clock anchor (dt_total), never from this
+        // advisory quantum — trusting it double-counted late ticks and made
+        // the fallback clock run faster than real time.
+        let _delta = ((dt.as_secs_f64().max(0.0)) * sr as f64).round().max(0.0) as u64;
         self.played_sr = sr.max(1);
         // BUGFIX (loop position drifted ahead of real time on short files):
         // `tick` used to advance the STORED frame by the handed-out quantum —

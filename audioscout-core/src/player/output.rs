@@ -301,6 +301,11 @@ pub struct RodioOutput {
     /// of what is audibly reachable — the root cause of the runaway cursor
     /// on short (~7 s) files.
     pub last_ceiling_frame: std::sync::atomic::AtomicU64,
+    /// Sample rate of the document currently loaded into the output (file
+    /// frames are what the UI shows; the pump converts to `stream_format`
+    /// internally). Needed by `playhead_ceiling_frame` to translate the
+    /// hardware clock back into file frames. 0 until a document is loaded.
+    pub document_sample_rate: std::sync::atomic::AtomicU32,
 }
 
 impl RodioOutput {
@@ -544,6 +549,8 @@ impl RodioOutput {
             last_session_epoch: 0,
             pump,
             stream_format,
+            last_ceiling_frame: std::sync::atomic::AtomicU64::new(0),
+            document_sample_rate: std::sync::atomic::AtomicU32::new(0),
         })
     }
 
@@ -580,7 +587,9 @@ impl RodioOutput {
         // actually in flight toward the speakers — never more than the
         // current queue headroom and one poll quantum of smoothing.
         let sf = self.stream_format;
-        let sr = self.document_sample_rate.max(1);
+        // AtomicU32 — load with Acquire so the value published by
+        // `load_document` (Release store) is visible to this UI-thread poll.
+        let sr = self.document_sample_rate.load(Ordering::Acquire).max(1);
         let true_frame = self.shared.true_audible_file_frame(sr, sf);
         let queue_headroom = fed_file.saturating_sub(true_frame);
         let cap_frames = ((0.05 * sr as f64) as u64).max(1);
@@ -668,6 +677,10 @@ impl RodioOutput {
 
     pub fn load_document(&self, doc: Arc<Document>) {
         tracing::debug!("[output] send Cmd::Load frames={} sr={} ch={}", doc.total_frames(), doc.sample_rate, doc.channels);
+        // Remember the document's sample rate so `playhead_ceiling_frame` can
+        // translate the hardware clock (stream samples) back into file frames
+        // for the UI cursor without needing the Document itself.
+        self.document_sample_rate.store(doc.sample_rate.max(1), Ordering::Release);
         if let Err(e) = self.tx.send(Cmd::Load { doc }) {
             tracing::error!("[output] Cmd::Load send FAILED: {e} — controller thread is gone");
         }

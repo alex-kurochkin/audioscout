@@ -1072,7 +1072,17 @@ impl AudioScoutApp {
     /// clickable response. The per-frame reset in `update` guarantees the
     /// icon drops back to the arrow when the pointer leaves the widget.
     fn hover_hand(ui: &egui::Ui, response: &egui::Response) {
-        if response.hovered() {
+        // BUGFIX (hand cursor flickering / not showing on files and buttons):
+        // `hovered()` is only true for the pass in which egui actually
+        // processed the pointer against this widget; when a panel repaints
+        // without new input (e.g. the 50 ms playhead poll), `hovered()` can
+        // read false even though the pointer sits right on top of the widget,
+        // so the hand icon dropped back to the arrow between frames.
+        // `contains_pointer()` is computed from THIS frame's live pointer
+        // position vs. the widget rect — OR-ing both makes the hand appear
+        // immediately on enter and stay put while hovering. The per-frame
+        // reset in `update` still drops it back when the pointer leaves.
+        if response.hovered() || response.contains_pointer() {
             ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::PointingHand);
         }
     }
@@ -1321,9 +1331,25 @@ impl eframe::App for AudioScoutApp {
         // even if the very first post-event frame happens to read a zeroed
         // smooth delta, the next pass re-evaluates the pointer position used
         // by `zoom_at_x` and the gesture is never silently swallowed.
+        //
+        // BUGFIX (the snapshot above was never consumed → wheel zoom STILL
+        // dead): reading `i.raw_scroll_delta` inside the panel closure does
+        // NOT help either — egui zeroes both scroll fields in
+        // `Context::run` BEFORE the first pass' `input()` snapshot is taken
+        // (`take()`, not peek), so every UI-visible accessor sees 0 for a
+        // discrete wheel notch. The values are only alive at the top of
+        // `update()`, where egui has just fed this frame's events but no
+        // pass has consumed them yet: snapshot the RAW vertical wheel delta
+        // (and the Ctrl modifier) into `raw_wheel_dy` here, clear it the
+        // moment the audio-view panel claims it, and have the panel fall
+        // back to this snapshot whenever its own live read comes up empty.
         let had_scroll = ctx.input(|i| {
-            i.raw_scroll_delta != egui::Vec2::ZERO || i.smooth_scroll_delta != egui::Vec2::ZERO
+            let s = i.raw_event_iter().any(|e| matches!(e, egui::Event::MouseWheel { .. }));
+            s || i.raw_scroll_delta != egui::Vec2::ZERO || i.smooth_scroll_delta != egui::Vec2::ZERO
         });
+        // Raw wheel snapshot for the audio view (see the BUGFIX note above
+        // and the consumer in the `audio_view` bottom panel).
+        self.raw_wheel_dy = ctx.input(|i| i.raw_scroll_delta.y);
         if had_scroll {
             // Immediate extra pass so a wheel notch is never lost between
             // on-demand frames (see the BUGFIX note above).
