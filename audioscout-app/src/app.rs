@@ -1005,6 +1005,20 @@ impl AudioScoutApp {
 
     /// Two vertical scales per channel — instantaneous peak (+hold marker)
     /// and RMS — drawn at the right side of the player window (§3.5.1).
+    /// BUGFIX (cursor "hand" on files and buttons): egui only switches to
+    /// `CursorIcon::PointingHand` automatically for widgets it internally
+    /// classifies as buttons; our custom table cells (`Sense::click()` over
+    /// row rects), colored-label actions ("Save", "🔁") and folder-tree
+    /// buttons kept the default arrow. This helper sets the hand icon while
+    /// the response's widget is hovered — call it right after producing each
+    /// clickable response. The per-frame reset in `update` guarantees the
+    /// icon drops back to the arrow when the pointer leaves the widget.
+    fn hover_hand(ui: &egui::Ui, response: &egui::Response) {
+        if response.hovered() {
+            ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::PointingHand);
+        }
+    }
+
     fn draw_volume_meter(&self, ui: &egui::Ui, rect: egui::Rect) {
         let painter = ui.painter();
         let ch = self.document.channels.max(1);
@@ -1216,22 +1230,42 @@ impl eframe::App for AudioScoutApp {
                 self.meter_hold.peak_l *= k; self.meter_hold.peak_r *= k;
             }
         }
-        // BUGFIX (wheel zoom in the player stopped working): the scroll delta
-        // is consumed inside the audio-view panel below, but egui's InputState
-        // only reports a NON-ZERO `smooth_scroll_delta` while the pointer is
-        // actually hovering some widget. After playback starts the mouse sits
-        // still over the waveform and egui stops emitting hover updates for
-        // widgets whose area did not change (`hovered_widget` keeps its stale
-        // rect from the previous frame), so `smooth_scroll_delta.y` reads 0
-        // and neither the Ctrl+wheel zoom nor plain wheel horizontal scroll
-        // fires until the user moves the mouse again. Force a repaint on every
-        // real scroll event so the input state — and with it the pointer
-        // position used by the zoom handler — is re-evaluated each frame.
-        ctx.on_request_repaint(move |_, data| {
-            if data.input(|i| i.smooth_scroll_delta != egui::Vec2::ZERO) {
-                data.request_repaint();
-            }
+        // BUGFIX (hand cursor on files/buttons): egui only sets
+        // `CursorIcon::PointingHand` automatically for widgets it internally
+        // marks as buttons; our custom table cells (`Sense::click()` over the
+        // row rects) and colored-label "buttons" kept the default arrow.
+        // Reset the icon to the default at the START of every frame so a hand
+        // requested by a hovered widget in the previous pass never leaks into
+        // this one, then let the per-widget hover checks below re-apply it.
+        ctx.output_mut(|o| o.cursor_icon = egui::CursorIcon::Default);
+
+        // BUGFIX (wheel zoom in the player stopped working; buttons still
+        // work): egui accumulates wheel motion into TWO independent fields —
+        // `smooth_scroll_delta` (continuous trackpad-style scrolling) and
+        // `raw_scroll_delta` (classic discrete mouse-wheel notches). In
+        // `InputState::end_pass` the raw delta is folded into the smooth one
+        // ONLY when the pointer hovers a widget that actually wants static
+        // dragging (`wants_drag_and_drop`, e.g. ScrollArea / Slider). The
+        // audio-view area below allocates its rect with plain
+        // `Sense::click_and_drag()` and is not a drag-and-drop target, so
+        // after the recent layout refactor the mouse wheel's notch deltas are
+        // simply DISCARDED at the end of every input pass and
+        // `smooth_scroll_delta.y` reads 0 — the Ctrl+wheel zoom never fires
+        // while the +/− buttons keep working because they don't depend on
+        // scroll events at all. The handler inside the audio-view panel now
+        // consumes BOTH deltas directly; additionally, request an immediate
+        // follow-up repaint whenever this frame saw any scroll motion, so
+        // even if the very first post-event frame happens to read a zeroed
+        // smooth delta, the next pass re-evaluates the pointer position used
+        // by `zoom_at_x` and the gesture is never silently swallowed.
+        let had_scroll = ctx.input(|i| {
+            i.raw_scroll_delta != egui::Vec2::ZERO || i.smooth_scroll_delta != egui::Vec2::ZERO
         });
+        if had_scroll {
+            // Immediate extra pass so a wheel notch is never lost between
+            // on-demand frames (see the BUGFIX note above).
+            ctx.request_repaint();
+        }
 
         self.process_events(ctx);
         self.handle_keyboard(ctx);
@@ -1255,9 +1289,13 @@ impl eframe::App for AudioScoutApp {
             ui.horizontal(|ui| {
                 ui.label("Filter:");
                 ui.text_edit_singleline(&mut self.filter_text);
-                if ui.button("✕").clicked() { self.filter_text.clear(); }
+                let r_x = ui.button("✕");
+                Self::hover_hand(ui, &r_x);
+                if r_x.clicked() { self.filter_text.clear(); }
                 ui.separator();
-                if ui.button("Columns").clicked() { self.show_columns_dialog = true; }
+                let r_Columns = ui.button("Columns");
+                Self::hover_hand(ui, &r_Columns);
+                if r_Columns.clicked() { self.show_columns_dialog = true; }
                 ui.separator();
                 // Table thumbnail style toggle (§3.1): the code to switch
                 // modes existed but had no control — this button exposes the
@@ -1275,7 +1313,9 @@ impl eframe::App for AudioScoutApp {
                 // audio-view display mode has exactly ONE control now, the one
                 // on the player panel below.
                 ui.separator();
-                if ui.button("Settings").clicked() { self.show_settings = true; }
+                let r_Settings = ui.button("Settings");
+                Self::hover_hand(ui, &r_Settings);
+                if r_Settings.clicked() { self.show_settings = true; }
             });
         });
 
@@ -1527,6 +1567,10 @@ impl eframe::App for AudioScoutApp {
                 }
             }
 
+            // Hand cursor over the waveform: clicking seeks, so the whole
+            // visualization area is an interactive target (§3.5).
+            Self::hover_hand(ui, &response);
+
             if response.clicked() {
                 if let Some(pos) = response.interact_pointer_pos() {
                     let x_ratio = (pos.x - rect.left()) / rect.width();
@@ -1536,13 +1580,36 @@ impl eframe::App for AudioScoutApp {
                 }
             }
 
-            ui.input(|i| {
-                let scroll = i.smooth_scroll_delta;
-                if i.modifiers.ctrl {
-                    if scroll.y > 0.0 { if let Some(pos) = i.pointer.hover_pos() { let x_ratio = ((pos.x - rect.left()) / rect.width()).clamp(0.0, 1.0); self.audio_view.zoom_at_x(1.25, x_ratio as f64); } }
-                    else if scroll.y < 0.0 { if let Some(pos) = i.pointer.hover_pos() { let x_ratio = ((pos.x - rect.left()) / rect.width()).clamp(0.0, 1.0); self.audio_view.zoom_at_x(1.0 / 1.25, x_ratio as f64); } }
-                } else if scroll.y != 0.0 { self.audio_view.scroll_horizontal(-scroll.y as f64 * 0.01); }
+            // Wheel zoom / horizontal scroll — see the BUGFIX note at the top
+            // of `update`: a plain mouse wheel only fills `raw_scroll_delta`
+            // (which egui discards for non-drag targets), while trackpads
+            // fill `smooth_scroll_delta`. Handle BOTH so Ctrl+wheel zoom and
+            // plain-wheel horizontal scrubbing work regardless of pointer
+            // hover state; prefer the smooth delta when both are present.
+            let (scroll, ctrl_mods) = ui.input(|i| {
+                let s = if i.smooth_scroll_delta != egui::Vec2::ZERO {
+                    i.smooth_scroll_delta
+                } else {
+                    i.raw_scroll_delta
+                };
+                (s, i.modifiers.ctrl)
             });
+            if scroll.y != 0.0 {
+                if ctrl_mods {
+                    // Zoom around the pointer: fall back to the centre of the
+                    // view when the pointer is outside the rect (e.g. it left
+                    // the window between the event and this repaint).
+                    let pos = ui
+                        .input(|i| i.pointer.hover_pos())
+                        .filter(|p| rect.contains(*p))
+                        .unwrap_or(rect.center());
+                    let x_ratio = ((pos.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
+                    let factor = if scroll.y > 0.0 { 1.25 } else { 1.0 / 1.25 };
+                    self.audio_view.zoom_at_x(factor, x_ratio as f64);
+                } else {
+                    self.audio_view.scroll_horizontal(-scroll.y as f64 * 0.01);
+                }
+            }
         });
 
         // Player panel (transport controls) — declared after the audio view,
@@ -1927,6 +1994,18 @@ impl eframe::App for AudioScoutApp {
                                     if cell_response.double_clicked() {
                                         row_double_clicked = true;
                                     }
+                                }
+
+                                // Hand cursor while the pointer is over a
+                                // file row (single click selects, double
+                                // click opens — §3.1): `ui.interact` with
+                                // `Sense::click()` above makes every cell a
+                                // real hover target, so `hovered()` is the
+                                // authoritative signal. The check runs per
+                                // cell but only mutates the global cursor
+                                // icon, so it is idempotent.
+                                if cell_response.hovered() {
+                                    ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::PointingHand);
                                 }
 
                                 // Handle row selection
