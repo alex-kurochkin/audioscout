@@ -722,64 +722,19 @@ impl Controller {
     /// frames the user saw ARE. Clamped into the active session like an
     /// explicit click would be.
     fn skip_base_frame(&self, doc_total_hint: u64) -> u64 {
-        // The frame the user actually SEES right now — the live display
-        // projection. Deriving the base from the very same code path a
-        // getter uses guarantees a press moves relative to the visible
-        // cursor: never relative to the bare commit (a step short of what
-        // was shown, "left: 100, right: 300" in one direction) and never
-        // relative to lead nobody saw (a step past it, the mirror-image
-        // regression). `position_at` extrapolates by the honest current
-        // poll span only — it can never exceed what the very next tick may
-        // commit — so this is exactly what is on screen at the instant of
-        // the press. Clamped into the active session below, like an
-        // explicit click would be.
-        let mut live = if self.state != TransportState::Playing {
-            self.stored_frame()
-        } else {
-            const NOMINAL_POLL_SECS: f64 = 0.05;
-            let mover_alive = self
-                .last_tick_at
-                .map(|t| {
-                    std::time::Instant::now()
-                        .duration_since(t)
-                        .as_secs_f64()
-                        <= NOMINAL_POLL_SECS + 0.02
-                })
-                .unwrap_or(false);
-            if !mover_alive {
-                // The poll loop is dead (device-less degradation / stopped
-                // polling): the display free-runs off the last commit, so
-                // what a getter shows right now IS the visible cursor and
-                // the honest jump base — but extrapolated from the LAST
-                // COMMIT instant only, never across an explicit teleport
-                // ("left: 100, right: 300": pre-jump wall time must not be
-                // handed to the next press).
-                let since_commit = std::time::Instant::now()
-                    .duration_since(self.last_commit_at)
-                    .as_secs_f64()
-                    .max(0.0);
-                self.position_at_since(u64::MAX, Some(since_commit))
-            } else {
-                // A LIVE poll loop: the visible cursor is the committed
-                // quantum plus whatever the display has ACTUALLY SHOWN on
-                // screen since (`last_display_at`, advanced by every getter
-                // read in wall time and parked at each commit). Never the
-                // full open-interval projection: microseconds after a
-                // teleport it still carries a nominal seed interval nobody
-                // has lived, and handing that phantom lead to the press
-                // lands a step off the visible cursor ("left: 0,
-                // right: 100", "left: 100, right: 0"). Never the bare
-                // commit either — shown frames must be part of the base
-                // ("left: 100, right: 300").
-                let sr = self.played_sr.max(1) as f64;
-                let shown_ahead_secs = std::time::Instant::now()
-                    .duration_since(self.last_display_at.get().max(self.last_commit_at))
-                    .as_secs_f64()
-                    .max(0.0);
-                let shown_lead = (shown_ahead_secs * sr) as u64;
-                self.stored_frame().saturating_add(shown_lead)
-            }
-        };
+        // The frame the user actually SEES right now. ONE model with the
+        // display getter (`position_at`): the base is exactly what a getter
+        // read at this very instant shows — never the bare stored commit (a
+        // press would start from where the cursor was BEFORE the last quantum
+        // and land a step short of the screen, "left: 100, right: 300"), and
+        // never an ungarded projection stretched across a just-landed
+        // teleport by a nominal seed interval nobody has lived (a phantom
+        // lead past the visible cursor, "left: 0, right: 100"). The getter's
+        // own span maths (`poll_span_secs`) already excludes pre-jump wall
+        // time and un-lived seed stretches; its half-open ceiling rules keep
+        // fresh verbatim commits (click-to-EOF) shown as committed. Clamped
+        // into the active session below, like an explicit click would be.
+        let mut live = self.position_at(doc_total_hint.max(1));
         if self.state == TransportState::Playing && self.end_frame > self.start_frame {
             // The base must be exactly what the DISPLAY getter shows at this
             // very instant (`position_at` already applies the half-open
@@ -876,6 +831,21 @@ impl Controller {
             let anchor = self.last_commit_at.max(self.session_clock_at);
             now.duration_since(anchor).as_secs_f64().max(0.0)
         };
+        // A LIVE poll loop that has not yet paid the open interval of a
+        // just-landed explicit teleport (`seek` / `skip` reset the cadence
+        // books): the honest span since the commit is a few microseconds,
+        // but the NEXT tick may still commit up to one nominal poll interval
+        // of media time for that stretch. The getter must NOT extrapolate
+        // across the teleport with a phantom seed lead: right after a jump
+        // the screen shows the committed target VERBATIM (regressions "left:
+        // 0, right: 100" / "left: 100, right: 300": presses inheriting that
+        // phantom stretch landed a step past the visible cursor). Once any
+        // quantum commits (non-zero stamp) ordinary cadence maths take over
+        // unchanged — including the live seed interval of a fresh session
+        // birth, where no teleport intervened.
+        if mover_alive && self.explicit_jump_pending && self.last_tick_delta_frames == 0 {
+            return 0;
+        }
         (span * sr) as u64
     }
 
@@ -1379,24 +1349,38 @@ mod tests {
         // seconds (one configured step per press), relative to the pinned
         // visible cursor.
         c.seek(300, &doc, CursorSource::User);
-        // The cursor is parked verbatim at 300 (an explicit commit shows
-        // what was committed). A forward press from there must move exactly
-        // one configured step; the session ceiling clamps it to EOF.
+        // CADENCE CONTRACT (§1.2): production polls `tick` every 50 ms, so a
+        // press never happens microseconds after the previous commit with a
+        // whole nominal seed interval still owed by the open poll span. Pin
+        // the books with a real poll first: the quantum pays the honest span
+        // (wall time since the teleport) and parks the anchors at its virtual
+        // end; whatever the display showed across the open stretch is now
+        // committed verbatim.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        c.tick(std::time::Duration::from_millis(50), &doc);
+        // The visible cursor right now — the pinned reading every expected
+        // target below derives from (same-instant getter + same projection
+        // model as the press's base).
+        let shown = c.current_frame_in(&doc);
+        // A forward press from there must move exactly one configured step;
+        // the session ceiling clamps it to EOF.
         c.skip(&doc, 1);
-        assert_eq!(c.current_frame(), 1300.min(doc.total_frames()));
-        assert_eq!(c.current_frame_in(&doc), 1300.min(doc.total_frames()));
+        assert_eq!(c.current_frame(), (shown + 1000).min(doc.total_frames()));
+        assert_eq!(c.current_frame_in(&doc), (shown + 1000).min(doc.total_frames()));
         // And the backward press lands exactly one step short of where the
-        // user saw the cursor — the visible frame 1000, NOT the bare stored
-        // commit's pre-jump value ("left: 100, right: 300" / "left: 0,
-        // right: 100": both wrong bases land a step away from the screen).
+        // user saw the cursor — the frame displayed right before the press,
+        // NOT the bare stored commit's pre-jump value ("left: 100, right:
+        // 300" / "left: 0, right: 100": both wrong bases land a step away
+        // from the screen).
+        let shown2 = c.current_frame_in(&doc);
         c.skip(&doc, -1);
-        // 1000 - one 1 s step = 300 frames. The session is [100, EOF]: the
+        // shown2 - one 1 s step = 300 frames. The session is [100, EOF]: the
         // landing spot sits INSIDE the range, so no clamp may shave it
         // (regression "left: 100, right: 300": clamping the base to the
         // half-open ceiling `end - 1` moved the whole jump and landed a
         // step short of what was displayed).
-        assert_eq!(c.current_frame(), 300);
-        assert_eq!(c.current_frame_in(&doc), 300);
+        assert_eq!(c.current_frame(), shown2.saturating_sub(1000));
+        assert_eq!(c.current_frame_in(&doc), shown2.saturating_sub(1000));
     }
 
     #[test]
