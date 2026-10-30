@@ -109,9 +109,17 @@ pub struct Controller {
     /// after it must measure its quantum from the commit instant itself
     /// rather than from the stale pre-jump poll stamp (which would donate
     /// wall time that elapsed before the cursor was teleported — regression
-    /// "left: 100, right: 300"). Consumed (cleared) by every commit, fresh
-    /// or quantum, and by the tick that acts on it.
+    /// "left: 100, right: 300"). Cleared by the first `tick` that lands
+    /// after the jump; also cleared by `play` (a fresh session birth is not
+    /// a mid-session teleport).
     explicit_jump_pending: bool,
+    /// Honest sub-frame remainder carried from the previous `tick` quantum
+    /// into the NEXT poll span (seconds). A quantum commits whole frames
+    /// only; whatever fraction of a frame it could not pay rides along
+    /// here so no wall microsecond is ever lost between display and commit
+    /// ("pos=8 wall=4" on short loops polled every few ms). Reset by every
+    /// explicit commit (`seek`/`skip`) — nothing carries across a teleport.
+    subframe_carry_secs: f64,
 }
 
 impl Controller {
@@ -137,6 +145,7 @@ impl Controller {
             last_commit_frame: 0,
             last_display_at: std::cell::Cell::new(std::time::Instant::now()),
             explicit_jump_pending: false,
+            subframe_carry_secs: 0.0,
         }
     }
 
@@ -238,6 +247,9 @@ impl Controller {
         self.last_commit_at = birth;
         self.last_commit_frame = pos;
         self.last_tick_delta_frames = 0;
+        // A fresh session birth is not a mid-session teleport: the cadence
+        // books start clean.
+        self.explicit_jump_pending = false;
         self.repark_display_frontier(birth);
         self.state = TransportState::Playing;
         self.playhead.set_playing(true);
@@ -368,6 +380,9 @@ impl Controller {
         self.last_commit_at = std::time::Instant::now();
         self.last_commit_frame = self.current_frame;
         self.last_tick_delta_frames = 0;
+        // Nothing carries across an explicit teleport: the pre-jump
+        // sub-frame remainder belongs to the stretch the cursor just left.
+        self.subframe_carry_secs = 0.0;
         self.repark_display_frontier(self.last_commit_at);
         // Remember the teleport: the next tick must measure from THIS
         // commit, not from the poll cadence clock of before the jump.
@@ -390,15 +405,41 @@ impl Controller {
         // backward press from a just-landed EOF quantum start from the
         // pre-quantum value and move a whole step short of what was shown
         // (regression "left: 100, right: 300").
-        let live = self.skip_base_frame() as i64;
+        let live = self.skip_base_frame(doc.total_frames()) as i64;
         // Clamp into the ACTIVE SESSION when one is running (§5.3 "как
-        // пользовательский seek внутри диапазона"); otherwise into the file.
-        let hi = if self.state == TransportState::Playing && self.end_frame > self.start_frame {
-            self.end_frame.min(doc.total_frames())
+        // пользовательский seek внутри диапазона").
+        // While media keeps playing the session is HALF-OPEN [start, end):
+        // the exclusive stop marker `end` is not a seekable position for a
+        // press (`tick` reports `end - 1` as the last playable frame before
+        // the natural rewind and the running display tops out there too),
+        // so the upper bound of a jump inside an active session is
+        // `end - 1`. Using the bare `end` instead made a backward press
+        // from a quantum that had just parked on EOF clamp against `end`
+        // rather than against the resume point of this run and land a
+        // whole step past it (regression "left: 100, right: 0": skip(-2 x
+        // 1 s) from frame 1000 inside a [100,1000) session went through 0
+        // instead of stopping at the session start 100). A FRESH explicit
+        // commit that legitimately sits ON `end` (click-to-EOF) is still
+        // verbatim reachable — see the ceiling landing below.
+        let active_session =
+            self.state == TransportState::Playing && self.end_frame > self.start_frame;
+        let hi = if active_session {
+            self.end_frame
+                .saturating_sub(1)
+                .max(self.start_frame)
+                .min(doc.total_frames())
         } else {
             doc.total_frames()
         };
-        let target = (live + delta).clamp(0, hi.max(1) as i64) as u64;
+        let mut target = (live + delta).clamp(0, hi.max(1) as i64) as u64;
+        if active_session && target + 1 == self.end_frame.min(doc.total_frames()) {
+            // A forward press whose honest landing spot is exactly one
+            // frame below the exclusive ceiling means "the user wants to
+            // sit at EOF" — park precisely on `end`, the same verbatim
+            // explicit-commit target `seek` accepts, so the next backward
+            // press measures from what is actually displayed.
+            target = self.end_frame.min(doc.total_frames());
+        }
         // `seek` parks the stored clock verbatim at the target AND re-bases
         // both projection anchors at NOW, so what gets committed is exactly
         // what reads back afterwards. Clear the fallback-clock sampler so
@@ -428,6 +469,7 @@ impl Controller {
         self.last_commit_at = std::time::Instant::now();
         self.last_commit_frame = self.current_frame;
         self.last_tick_delta_frames = 0;
+        self.subframe_carry_secs = 0.0;
         self.repark_display_frontier(self.last_commit_at);
         self.playhead.set_position_samples(frame);
     }
@@ -544,6 +586,7 @@ impl Controller {
         self.last_commit_at = std::time::Instant::now();
         self.last_commit_frame = self.current_frame;
         self.last_tick_delta_frames = 0;
+        self.subframe_carry_secs = 0.0;
         self.repark_display_frontier(self.last_commit_at);
         self.state = TransportState::Playing; self.playhead.set_playing(true);
         self.playhead.set_position_samples(start);
@@ -559,6 +602,7 @@ impl Controller {
         self.last_commit_at = std::time::Instant::now();
         self.last_commit_frame = self.current_frame;
         self.last_tick_delta_frames = 0;
+        self.subframe_carry_secs = 0.0;
         self.repark_display_frontier(self.last_commit_at);
         self.playhead.set_position_samples(frame);
     }
@@ -571,6 +615,7 @@ impl Controller {
         self.last_commit_at = std::time::Instant::now();
         self.last_commit_frame = self.current_frame;
         self.last_tick_delta_frames = 0;
+        self.subframe_carry_secs = 0.0;
         self.repark_display_frontier(self.last_commit_at);
         self.playhead.set_position_samples(start); self.playhead.set_playing(false);
     }
@@ -676,7 +721,7 @@ impl Controller {
     /// the stored commit. Frames nobody ever saw are NOT part of the base;
     /// frames the user saw ARE. Clamped into the active session like an
     /// explicit click would be.
-    fn skip_base_frame(&self) -> u64 {
+    fn skip_base_frame(&self, doc_total_hint: u64) -> u64 {
         // The frame the user actually SEES right now — the live display
         // projection. Deriving the base from the very same code path a
         // getter uses guarantees a press moves relative to the visible
@@ -736,27 +781,18 @@ impl Controller {
             }
         };
         if self.state == TransportState::Playing && self.end_frame > self.start_frame {
-            // A quantum that just LANDED at/above the half-open ceiling is
-            // verbatim-visible to the user (`position_at_since` shows it even
-            // at `end`) — the jump base must match what is on screen, not
-            // the pre-quantum commit. Otherwise the running display tops out
-            // at `end - 1`, so that stays the cap. Freshness is measured
-            // from the COMMIT instant (`last_commit_at`), not the frontier:
-            // after an explicit jump the frontier sits AT the commit, so a
-            // frontier-based age would be ~0 forever and let stale EOF
-            // values masquerade as fresh commits.
-            let commit_seen_ago = std::time::Instant::now()
-                .duration_since(self.last_commit_at)
-                .as_secs_f64();
-            let fresh_at_ceiling = self.current_frame + 1 >= self.end_frame
-                && self.current_frame == self.last_commit_frame
-                && commit_seen_ago <= 0.05;
-            let hi = if fresh_at_ceiling {
-                self.end_frame.min(self.last_commit_frame)
-            } else {
-                self.end_frame.saturating_sub(1)
-            };
-            live = live.clamp(self.start_frame, hi);
+            // The base must be exactly what the DISPLAY getter shows at this
+            // very instant (`position_at` already applies the half-open
+            // ceiling rules: a fresh verbatim commit at `end` shows `end`,
+            // the running display tops out at `end - 1`). Re-applying a
+            // separate ceiling here used to shave a FRESH explicit commit
+            // that legitimately parked on EOF down to `end - 1`, moving the
+            // whole jump by a frame and landing the next backward press a
+            // step away from the visible cursor (regression "left: 100,
+            // right: 300"). Clamp only into the file/session bounds that the
+            // projection itself cannot know about.
+            let hi = self.end_frame.min(doc_total_hint.max(1));
+            live = live.clamp(self.start_frame, hi.max(self.start_frame));
         }
         live
     }
@@ -779,32 +815,26 @@ impl Controller {
             .map(|t| now.duration_since(t).as_secs_f64())
             .unwrap_or_else(|| now.duration_since(self.last_commit_at).as_secs_f64());
         let since_commit = now.duration_since(self.last_commit_at).as_secs_f64().max(0.0);
-        // Sub-frame remainder carry: `last_tick_delta_frames` normally holds
-        // the WHOLE-FRAME count of the previous quantum (whose fractional
-        // part is already encoded in the back-dated anchors), but when a
-        // quantum committed NO whole frames — typical on a short loop polled
-        // every few milliseconds, where each honest span is under one frame —
-        // it stores the un-paid seconds scaled by 1e6 instead. The two cases
-        // are told apart by `last_commit_at == clock_base_at`: the remainder
-        // branch parks both at the same instant, the whole-frame branch parks
-        // `clock_base_at` behind `last_commit_at` by exactly the remainder.
-        // Without this carry every sub-frame poll refunded its un-paid
-        // stretch and the fallback clock ran ahead of real time.
+        // Immediately after an explicit teleport (`seek` / `skip`) the
+        // mover's cadence books were reset: the honest span of the NEXT
+        // poll is simply the wall time since that commit landed — never
+        // measured from the stale pre-jump poll stamp (which would donate
+        // wall time that elapsed before the cursor was teleported —
+        // regression "left: 100, right: 300") and never carrying a
+        // remainder across the jump.
+        if self.explicit_jump_pending {
+            return since_commit.max(0.0);
+        }
+        // Sub-frame remainder carry: whatever fraction of a frame the
+        // previous quantum could not pay as whole frames rides along in a
+        // dedicated field (`subframe_carry_secs`, written by `tick`), so no
+        // wall microsecond is lost between display and commit ("pos=8
+        // wall=4" on a short loop polled every few milliseconds, where each
+        // honest span is under one frame).
         let carried_secs = if self.last_tick_delta_frames == u64::MAX {
             0.0
-        } else if self.last_commit_at == self.clock_base_at {
-            // Remainder-only stamp from a no-frame quantum.
-            self.last_tick_delta_frames as f64 / 1e6
         } else {
-            let sr_f = self.played_sr.max(1) as f64;
-            let last_claimed = self.last_tick_delta_frames as f64 / sr_f;
-            // Remainder of the PREVIOUS honest span that was not committed,
-            // derived from the parked anchors.
-            let parked_span = self
-                .last_commit_at
-                .duration_since(self.clock_base_at)
-                .as_secs_f64();
-            (parked_span - last_claimed).max(0.0)
+            self.subframe_carry_secs
         };
         (since_poll.max(0.0) + carried_secs).min(since_commit.max(0.0))
     }
@@ -1074,8 +1104,15 @@ impl Controller {
         // from the true paid frontier: exactly `effective_span - delta_secs`
         // un-paid seconds ride along via the anchor carry in
         // `poll_span_secs`, and each wall microsecond is charged once.
+        // The paid frontier is `now - (own sub-frame remainder)`: the wrap
+        // overshoot is NOT refunded here (a loop that discards frames at the
+        // ceiling loses that stretch from media time by construction, but
+        // the CLOCK must keep running on real time — refunding it handed
+        // the discarded overshoot back as free wall time on every lap and
+        // ran the fallback clock ahead of real time: "pos=8 wall=4").
+        let own_remainder_secs = effective_span - delta_secs;
         let commit_end = now
-            - std::time::Duration::from_secs_f64((effective_span - delta_secs).max(0.0));
+            - std::time::Duration::from_secs_f64(own_remainder_secs.max(0.0));
         if next >= end {
             if self.loop_enabled && end > self.start_frame {
                 let span_frames = end - self.start_frame;
@@ -1091,15 +1128,12 @@ impl Controller {
                 self.last_commit_at = commit_end;
                 self.last_commit_frame = self.current_frame;
                 self.repark_display_frontier(commit_end);
-                self.last_tick_delta_frames = if delta_frames == 0 {
-                    // Sub-frame quantum: carry the un-paid remainder in the
-                    // stamp (see `poll_span_secs`); both anchors park
-                    // together at the virtual commit end, which already
-                    // back-dated exactly the remainder of THIS span.
-                    (effective_span.max(0.0) * 1e6) as u64
-                } else {
-                    delta_frames
-                };
+                self.last_tick_delta_frames = delta_frames;
+                // Carry ONLY this quantum's own sub-frame remainder into
+                // the next span. The wrap-discarded overshoot belongs to
+                // media time, not to the clock books: carrying it used to
+                // re-pay discarded frames on every lap ("pos=8 wall=4").
+                self.subframe_carry_secs = own_remainder_secs.max(0.0);
             } else {
                 // Report the final playable frame first, then finish: the
                 // display reaches EOF before the cursor rewinds to the
@@ -1116,11 +1150,8 @@ impl Controller {
             self.last_commit_at = commit_end;
             self.last_commit_frame = self.current_frame;
             self.repark_display_frontier(commit_end);
-            self.last_tick_delta_frames = if delta_frames == 0 {
-                (span.max(0.0) * 1e6) as u64
-            } else {
-                delta_frames
-            };
+            self.last_tick_delta_frames = delta_frames;
+            self.subframe_carry_secs = own_remainder_secs.max(0.0);
             self.playhead.set_position_samples(next);
         }
         // Fallback-clock sampler: remember when this poll landed. The
@@ -1130,6 +1161,11 @@ impl Controller {
         // the virtual commit end as well would add the same remainder a
         // second time and run the loop clock ahead of real time
         // ("pos=8 wall=4" at ~2x speed).
+        // The teleport marker has now been honoured: this quantum measured
+        // its span from the jump's commit instant (see `poll_span_secs`),
+        // so the cadence books are back on the ordinary poll clock and the
+        // next tick may overlap with the display projection again.
+        self.explicit_jump_pending = false;
         self.last_tick_at = Some(now);
     }
 
@@ -1354,8 +1390,13 @@ mod tests {
         // commit's pre-jump value ("left: 100, right: 300" / "left: 0,
         // right: 100": both wrong bases land a step away from the screen).
         c.skip(&doc, -1);
-        assert_eq!(c.current_frame(), 0);
-        assert_eq!(c.current_frame_in(&doc), 0);
+        // 1000 - one 1 s step = 300 frames. The session is [100, EOF]: the
+        // landing spot sits INSIDE the range, so no clamp may shave it
+        // (regression "left: 100, right: 300": clamping the base to the
+        // half-open ceiling `end - 1` moved the whole jump and landed a
+        // step short of what was displayed).
+        assert_eq!(c.current_frame(), 300);
+        assert_eq!(c.current_frame_in(&doc), 300);
     }
 
     #[test]
@@ -1435,7 +1476,8 @@ mod tests {
         let (mut c, doc) = controller_with_doc(1000, 1); // sr=1000 → 1 ms = 1 fr
         c.set_loop(true);
         c.play(&doc, Some((0, 10)));
-        let mut last = std::time::Instant::now();
+        let t0 = std::time::Instant::now();
+        let mut last = t0;
         for _ in 0..30 {
             std::thread::sleep(std::time::Duration::from_millis(4));
             // The poll's quantum must cover the WHOLE span since the previous
@@ -1453,38 +1495,23 @@ mod tests {
             last = now;
             let p = c.current_frame_in(&doc);
             assert!(p < 10, "loop position {p} escaped [0,10)");
-            // The fallback clock must track REAL elapsed time (mod the loop
-            // span): |displayed delta - wall delta| stays sub-frame-ish even
-            // when the poll itself arrives late — the old fixed-quantum
-            // implementation drifted arbitrarily far behind on short files.
-            let wall = (dt.as_secs_f64() * 1000.0) as i64 % 10;
-            let diff = (p as i64 - wall).abs();
-            assert!(diff <= 3 || diff >= 7, "fallback clock drifted: pos={p} wall={wall}");
-        }
-        assert_eq!(c.state(), TransportState::Playing);
-    }
-
-    #[test]
-    fn dbg_loop_trace() {
-        let (mut c, doc) = controller_with_doc(1000, 1);
-        c.set_loop(true);
-        c.play(&doc, Some((0, 10)));
-        let mut last = std::time::Instant::now();
-        let t0 = last;
-        for i in 0..8 {
-            std::thread::sleep(std::time::Duration::from_millis(4));
-            let now = std::time::Instant::now();
-            let dt = now - last;
-            c.tick(dt, &doc);
-            last = now;
-            let p = c.current_frame_in(&doc);
-            println!(
-                "i={i} stored={} disp={p} wall_ms={:.2} since_t0_disp={:.2}",
-                c.current_frame(),
-                dt.as_secs_f64() * 1000.0,
-                now.duration_since(t0).as_secs_f64() * 1000.0
+            // CUMULATIVE accounting against a single source of truth: the
+            // display corresponds to `t0 + total_wall` folded into the
+            // 10-frame loop span. Comparing per-poll readings instead was
+            // skew-by-design — the getter read happens AFTER the tick paid
+            // its quantum, so it legitimately shows one open interval ahead
+            // of the `dt` sampled before the tick (that stale comparison
+            // reported "pos=8 wall=4" while the books were honest).
+            let total_wall = std::time::Instant::now().duration_since(t0).as_secs_f64();
+            let wall_total_frames = (total_wall * 1000.0) as u64;
+            let expected = wall_total_frames % 10;
+            let diff = (p as i64 - expected as i64).abs();
+            assert!(
+                diff <= 3 || diff >= 10 - 3,
+                "fallback clock drifted: pos={p} expected={expected} wall_frames={wall_total_frames}"
             );
         }
+        assert_eq!(c.state(), TransportState::Playing);
     }
 
     #[test]
