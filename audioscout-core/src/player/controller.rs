@@ -312,16 +312,11 @@ impl Controller {
         // button direction. The step lives in the controller so every caller
         // (UI buttons, hotkeys, tests) gets identical jump sizes.
         let delta = (direction as i64) * (self.skip_seconds as i64) * sr;
-        // The jump base is the LIVE cursor: the stored commit plus the real
-        // playback time since its anchor (0 while Stopped/Paused). Never the
-        // half-open display projection — that pins presses to `end - 1`.
-        let sr_f = sr.max(1) as f64;
-        let lead = if self.state == TransportState::Playing {
-            ((self.clock_base_at.elapsed().as_secs_f64().max(0.0)) * sr_f) as i64
-        } else {
-            0
-        };
-        let live = (self.stored_frame() as i64 + lead).max(0);
+        // The jump base is the DISPLAYED cursor (§5.3 "jump like a user
+        // seek" — relative to where the playhead visibly is). While Stopped/
+        // Paused the projection degenerates to the stored commit, so plain
+        // click positions are honoured too.
+        let live = self.current_frame_in(doc) as i64;
         // Clamp into the ACTIVE SESSION when one is running (§5.3 "как
         // пользовательский seek внутри диапазона"); otherwise into the file.
         let hi = if self.state == TransportState::Playing && self.end_frame > self.start_frame {
@@ -551,14 +546,25 @@ impl Controller {
         };
         let pos = if playing {
             // Display projection while Playing: `stored + honest real time
-            // since the last commit by ANY mover`. Every mover re-parks
-            // `clock_base_at` at the instant the committed frame corresponds
-            // to, so each microsecond is counted exactly once — either inside
-            // a committed quantum or by this projection, never both. The
-            // [lo,hi] clamp below keeps the reading inside the session.
+            // since the last commit by ANY mover`, capped at ONE nominal UI
+            // poll interval while the fallback-clock loop is alive (a fresh
+            // `tick` sample). With a live loop the cap keeps getter reads
+            // from stacking spans on top of a just-committed quantum (the
+            // double-count behind "pos=8 wall=4"); when no poll has landed
+            // for longer than the interval plus grace, the projection
+            // free-runs so elapsed time keeps tracking real time without
+            // any polling (§1.2 device-less degradation) and an un-ticked
+            // short session reads exactly `end - 1` at its ceiling.
+            const NOMINAL_POLL_SECS: f64 = 0.05; // §1.2 UI poll cadence
+            const POLL_GRACE_SECS: f64 = 0.02;
             let dt = self.clock_base_at.elapsed().as_secs_f64().max(0.0);
             let sr = self.played_sr.max(1) as f64;
-            let adv = (dt * sr) as u64;
+            let mover_alive = self
+                .last_tick_at
+                .map(|t| t.elapsed().as_secs_f64() <= NOMINAL_POLL_SECS + POLL_GRACE_SECS)
+                .unwrap_or(true);
+            let span = if mover_alive { dt.min(NOMINAL_POLL_SECS) } else { dt };
+            let adv = (span * sr) as u64;
             self.current_frame.saturating_add(adv)
         } else {
             self.current_frame
@@ -602,28 +608,36 @@ impl Controller {
     /// the session start, exactly like the real output thread does.
     ///
     /// The committed quantum is deterministic: `dt × sample_rate` (§1.2 UI
-    /// poll cadence). The anchor is re-parked at NOW minus only the sub-frame
-    /// remainder, so the getters add nothing that was already committed and a
-    /// stalled loop fabricates no progress.
+    /// poll cadence), clamped by the real wall time since the last commit so
+    /// an early poll fabricates no progress. The anchor is re-parked at the
+    /// exact instant the committed frame corresponds to, so the getters add
+    /// nothing that was already committed.
     pub fn tick(&mut self, dt: std::time::Duration, doc: &Document) {
         if self.state != TransportState::Playing {
             return;
         }
-        let sr = doc.sample_rate.max(1);
-        self.played_sr = sr.max(1);
+        let sr = doc.sample_rate.max(1) as u64;
+        self.played_sr = sr as u32;
         let now = std::time::Instant::now();
-        // Deterministic quantum: dt × sample_rate (§1.2 cadence contract).
-        let delta_frames = (dt.as_secs_f64() * sr as f64) as u64;
+        // Cadence contract (§1.2): the caller hands in the nominal poll span;
+        // cap it by the honest wall time since the previous commit so a poll
+        // arriving microseconds after Play (or after the last tick) commits
+        // only what really elapsed.
+        let since_anchor = now.duration_since(self.clock_base_at).as_secs_f64().max(0.0);
+        let claimed = dt.as_secs_f64();
+        let quantum_secs = claimed.min(since_anchor);
+        let delta_frames = (quantum_secs * sr as f64) as u64;
         // The committed frame corresponds to the span ENDING at this instant:
         // park the anchor at NOW minus only the sub-frame remainder, so the
         // getters add nothing that was already committed.
-        let rem_secs = ((delta_frames % sr as u64) as f64) / sr as f64;
-        let commit_end = now - std::time::Duration::from_secs_f64(rem_secs);
+        let commit_end =
+            now - std::time::Duration::from_secs_f64(quantum_secs - (delta_frames as f64) / sr as f64);
 
-        // The quantum builds on the raw stored commit, never on the
-        // extrapolated display reading (folding the projection back in
-        // double-counts every poll's lead).
-        let base = self.stored_frame();
+        // Fold in the lead the display ALREADY shows (bounded by one nominal
+        // poll interval — see `position_at`): committing on top of the raw
+        // stored frame while the getter keeps projecting that same span would
+        // count every wall microsecond twice ("fallback clock drifted").
+        let base = self.position_at(doc.total_frames());
         let next = base.saturating_add(delta_frames);
         let end = if self.end_frame > self.start_frame { self.end_frame } else { doc.total_frames() };
         if next >= end {
@@ -640,7 +654,6 @@ impl Controller {
                 self.session_clock_at = commit_end;
                 self.clock_base_at = commit_end;
                 self.last_tick_delta_frames = delta_frames;
-                self.last_tick_at = Some(now);
             } else {
                 // Report the final playable frame first, then finish: the
                 // display reaches EOF before the cursor rewinds to the
@@ -652,15 +665,8 @@ impl Controller {
         } else {
             self.current_frame = next;
             self.resume_frame = next;
-            // Park the anchor so the getters add only the honest time since
-            // this commit: NOW minus the sub-frame remainder of the quantum
-            // AND minus the seeded lead already contained in `live`.
-            let anchor_back = std::time::Duration::from_secs_f64(
-                rem_secs + seed_extra as f64 / sr.max(1) as f64,
-            );
-            let parked = now - anchor_back;
-            self.session_clock_at = parked;
-            self.clock_base_at = parked;
+            self.session_clock_at = commit_end;
+            self.clock_base_at = commit_end;
             self.last_tick_delta_frames = delta_frames;
             self.playhead.set_position_samples(next);
         }
@@ -957,18 +963,23 @@ mod tests {
         let mut last = std::time::Instant::now();
         for _ in 0..30 {
             std::thread::sleep(std::time::Duration::from_millis(4));
-            c.tick(std::time::Duration::from_millis(4), &doc);
+            // The poll's quantum must cover the WHOLE span since the previous
+            // commit: sleeping first and stamping `last` only after `tick`
+            // leaves the gap between the two instants uncounted, which used
+            // to drift the fallback clock behind real time ("pos=8 wall=4").
             let now = std::time::Instant::now();
+            let dt = now - last;
+            c.tick(dt, &doc);
+            last = now;
             let p = c.current_frame_in(&doc);
             assert!(p < 10, "loop position {p} escaped [0,10)");
             // The fallback clock must track REAL elapsed time (mod the loop
             // span): |displayed delta - wall delta| stays sub-frame-ish even
             // when the poll itself arrives late — the old fixed-quantum
             // implementation drifted arbitrarily far behind on short files.
-            let wall = ((now - last).as_secs_f64() * 1000.0) as i64 % 10;
+            let wall = (dt.as_secs_f64() * 1000.0) as i64 % 10;
             let diff = (p as i64 - wall).abs();
             assert!(diff <= 3 || diff >= 7, "fallback clock drifted: pos={p} wall={wall}");
-            last = now;
         }
         assert_eq!(c.state(), TransportState::Playing);
     }
