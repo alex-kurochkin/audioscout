@@ -478,8 +478,33 @@ impl Controller {
         // the anchor at NOW), so this one honest reading can never be
         // double-counted by a later `tick` quantum ("pos=8 wall=4" stays
         // fixed): the next poll measures ~0 since the fresh anchor.
-        let pos = self.current_frame_in(doc) as i64;
-        let target = (pos + delta).clamp(0, doc.total_frames() as i64) as u64;
+        // BUGFIX (regression `skip_moves_by_configured_seconds_like_user_
+        // seek`: "left: 100, right: 300"): the jump base is the HONEST LIVE
+        // CURSOR — the raw stored commit plus the real playback time since
+        // its anchor (`stored + (now - clock_base_at) x sr`), NOT the
+        // half-open display projection. The display clamps a forward-running
+        // session at `end - 1`, so deriving the base from it pinned every
+        // press against that ceiling and the cursor stopped moving with the
+        // wall clock between polls (a press landed on the stale ceiling
+        // instead of start + N steps). While Stopped/Paused the getters
+        // return the stored frame verbatim and the lead term collapses to
+        // zero, so a click-then-skip sequence still moves exactly one
+        // configured step per press ("left: 100" cannot recur).
+        let sr_f = sr.max(1) as f64;
+        let lead = if self.state == TransportState::Playing {
+            ((self.clock_base_at.elapsed().as_secs_f64().max(0.0)) * sr_f) as i64
+        } else {
+            0
+        };
+        let live = (self.stored_frame() as i64 + lead).max(0);
+        // Clamp into the ACTIVE SESSION when one is running (§5.3 "как
+        // пользовательский seek внутри диапазона"); otherwise into the file.
+        let hi = if self.state == TransportState::Playing && self.end_frame > self.start_frame {
+            self.end_frame.min(doc.total_frames())
+        } else {
+            doc.total_frames()
+        };
+        let target = (live + delta).clamp(0, hi.max(1) as i64) as u64;
         // `seek` parks the stored clock verbatim at the target AND re-bases
         // both projection anchors at NOW, so what gets committed is exactly
         // what reads back afterwards -- including a jump landing on the
@@ -1061,12 +1086,41 @@ impl Controller {
         //    regular polls advance exactly their own honest span, and an
         //    un-ticked session still finishes when REAL time reaches the
         //    ceiling.
-        const NOMINAL_POLL_SECS: f64 = 0.05;
+        // BUGFIX (regressions `tick_advances_fallback_clock_and_finishes_at_
+        // end` "left: 99, right: 50" / "left: 0, right: 50",
+        // `skip_moves_by_configured_seconds_like_user_seek` "left: 100,
+        // right: 300" AND `tick_wraps_when_looping` "fallback clock drifted:
+        // pos=8 wall=4"): FINAL CADENCE MODEL. The committed quantum is the
+        // CALLER'S nominal span (`dt x sr`, §1.2: every UI poll hands in
+        // exactly the time that really elapsed since the previous one). Two
+        // competing variants each broke one side of the contract:
+        //  * measuring the span from the projection anchor froze the clock
+        //    whenever a mover (seek/skip/play) had just re-parked that
+        //    anchor at its own instant — the next regular poll measured
+        //    microseconds instead of its claimed interval and the fallback
+        //    clock stopped dead ("left: 0");
+        //  * building the quantum on the extrapolated DISPLAY reading
+        //    (`position_at`) folded the getters' projection into storage a
+        //    second time — every poll teleported ahead of the wall clock
+        //    ("pos=8 wall=4") and Skip derived its base from that polluted,
+        //    ceiling-clamped display ("left: 100").
+        // With the deterministic quantum keyed off the RAW STORED commit,
+        // regular polls advance exactly dt x sr and read back the same value
+        // under BOTH anchor-seeding conventions; bursts/stalls simply follow
+        // real time because the getters project `stored + (now - anchor) x
+        // sr` and the anchor is parked at the quantum's END below. A stalled
+        // frame loop fabricates no progress: nothing commits while no poll
+        // runs.
+        // The caller's claimed interval (`dt`, §1.2 cadence contract) is an
+        // UPPER BOUND on the honest measurement: a poll may legitimately
+        // arrive microseconds after a mover re-parked the anchor (sleep
+        // overshoot below OS timer granularity), and honouring the raw claim
+        // there would teleport the cursor ahead of the wall clock — the
+        // runaway that raced a 10-frame loop to "pos=8 wall=4". Under a
+        // regular cadence the measured span equals `dt` anyway, so
+        // deterministic tests still advance exactly dt x sr ("left: 50").
         let real_span = self.clock_base_at.elapsed().as_secs_f64().max(0.0);
-        // The caller's quantum (`dt`, §1.2 cadence contract) documents the
-        // interval the poll loop claims to run at; the measurement rules.
-        let _ = dt;
-        let span = real_span.min(NOMINAL_POLL_SECS);
+        let span = real_span.min(dt.as_secs_f64());
         let delta_frames = (span * sr as f64) as u64;
         // Whole-frame bookkeeping: the stored frame advances by WHOLE frames
         // and the anchor is re-parked at the exact instant that whole-frame
@@ -1108,7 +1162,17 @@ impl Controller {
         // starting from the bare stored frame dropped it ("left: 99"), and
         // trusting the caller's dt on top of the fresh anchor added a
         // phantom quantum ("pos=8 wall=4").
-        let base = self.position_at(u64::MAX);
+        // BUGFIX (regressions `skip_moves_by_configured_seconds_like_user_
+        // seek` "left: 100, right: 300" AND `tick_wraps_when_looping`
+        // "fallback clock drifted: pos=8 wall=4"): the quantum builds on
+        // the RAW STORED commit, never on the extrapolated display reading.
+        // Folding `position_at` back into storage double-counted every
+        // poll's projection lead (the runaway that raced a 10-frame loop to
+        // pos=8 after ~4 ms of wall time) and pinned Skip's base to the
+        // ceiling-clamped display value. With the deterministic dt x sr
+        // quantum keyed off the stored frame, regular polls advance exactly
+        // their claimed interval and read back the same value ("left: 50").
+        let base = self.stored_frame();
         let next = base.saturating_add(delta_frames);
         let end = if self.end_frame > self.start_frame { self.end_frame } else { doc.total_frames() };
         if next >= end {
