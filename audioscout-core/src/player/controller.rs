@@ -114,26 +114,6 @@ impl Controller {
         }
     }
 
-    /// Park the wall-clock projection anchor at the instant that corresponds
-    /// to `frame` on the current sample rate. Every place that MOVES the
-    /// stored clock (play/seek/tick/hardware sync/hooks) must call this in
-    /// the same step; places that merely read it must not.
-    #[inline]
-    fn rebase_clock(&mut self, frame: u64, sr: u32) {
-        let sr = sr.max(1) as u64;
-        let cur = self.current_frame.min(u64::MAX - sr);
-        // Anchor = NOW − (frame − cur)/sr, computed without floats so a
-        // forward commit never drifts the base backwards.
-        if frame >= cur {
-            let frames_ahead = frame - cur;
-            let micros = frames_ahead.saturating_mul(1_000_000) / sr;
-            self.clock_base_at = std::time::Instant::now()
-                - std::time::Duration::from_micros(micros.min(u64::MAX / 1_000_000 * 1_000_000));
-        } else {
-            self.clock_base_at = std::time::Instant::now();
-        }
-    }
-
     pub fn state(&self) -> TransportState {
         self.state
     }
@@ -547,9 +527,40 @@ impl Controller {
         // is what reads back, immediately and every following poll alike —
         // including a jump that lands exactly on the session start, which is
         // otherwise indistinguishable from "the cursor never moved".
-        self.session_clock_at = std::time::Instant::now();
-        self.clock_base_at = std::time::Instant::now();
+        // BUGFIX (regression `skip_moves_by_configured_seconds_like_user_
+        // seek`: "left: 100, right: 300"): the base above is the DISPLAYED
+        // position whenever no poll loop is alive. Parking the anchor at
+        // NOW would then throw away the honest wall lead already baked into
+        // that reading: after `seek(300)` the display verbatim shows 300,
+        // but the next press jumped from the stale stored commit instead of
+        // from the visible cursor ("left: 100"). Re-park the anchor at the
+        // exact instant the base corresponds to — NOW minus the projected
+        // span for a free-running Playing session, plain NOW otherwise (in
+        // Stopped/Paused the getters add nothing, display == stored). With a
+        // live poll loop the stored frame IS the last commit's endpoint, so
+        // parking at NOW keeps the sub-frame remainder out of the books and
+        // every wall microsecond stays counted exactly once.
+        let anchor = if self.state == TransportState::Playing && !poll_loop_alive {
+            let lead_frames = (raw_base - self.stored_frame().min(raw_base as u64)) as f64;
+            let sr = doc.sample_rate.max(1) as f64;
+            now - std::time::Duration::from_secs_f64(lead_frames / sr)
+        } else {
+            now
+        };
+        self.session_clock_at = anchor;
+        self.clock_base_at = anchor;
         self.last_tick_delta_frames = 0;
+        // BUGFIX (regression `skip_moves_by_configured_seconds_like_user_
+        // seek`: "left: 100, right: 300"): a Skip commits an EXPLICIT
+        // position (`seek` parks the stored clock verbatim at the target),
+        // so the fallback-clock sampler must be invalidated afterwards:
+        // `tick` treats a fresh sample as "the caller's poll loop is still
+        // running at its cadence" and honours the caller's quantum on top
+        // of the just-committed jump — pressing ±N right after a late poll
+        // teleported the cursor a whole nominal interval past what the user
+        // sees. With the sampler cleared, the first post-Skip poll measures
+        // the real span since this very commit instead.
+        self.last_tick_at = None;
         let target = (pos + delta).clamp(0, doc.total_frames() as i64) as u64;
         self.seek(target, doc, CursorSource::User);
     }
