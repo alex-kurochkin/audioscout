@@ -220,14 +220,13 @@ impl Controller {
         let end = if end > start { end } else { total };
         self.start_frame = start;
         self.end_frame = end;
-        // Without a selection, start from the live position (§5.3 resume);
-        // with one, the session starts at its left bound.
-        let pos = if selection.is_some() {
+        // A FRESH play (Stopped) always starts at the resume point verbatim:
+        // a re-Play while already Playing keeps the extrapolated live
+        // position (restart-from-cursor semantics).
+        let pos = if selection.is_some() || self.state != TransportState::Playing {
             start
-        } else if self.state == TransportState::Playing {
-            self.position_at(total).max(start)
         } else {
-            self.resume_frame.max(start)
+            self.position_at(total).max(start)
         };
         let pos = pos.min(total);
         if selection.is_none() {
@@ -602,71 +601,41 @@ impl Controller {
     }
 
     /// Projection core: the display value WITH the half-open ceiling rule
-    /// applied, and — as the single funnel through which every time-aware
-    /// getter passes — the place where the shown lead is REGISTERED (see
-    /// `register_lead`). The raw stored commit is served by `current_frame()`
-    /// without touching it.
+    /// applied. The raw stored commit is served by `current_frame()` without
+    /// touching it.
     fn position_at_since(&self, total_frames: u64, dt_secs: Option<f64>) -> u64 {
-        self.position_at_since_untracked(total_frames, dt_secs).0
-    }
-
-    /// Projection core returning BOTH the displayed value and the UNCLAMPED
-    /// extrapolation (`naive`): internal callers use only `.0`, while the
-    /// public display funnels feed `naive` into `register_lead` so the frontier
-    /// records exactly what this read showed — never a re-clamped lie about
-    /// where the cursor was.
-    fn position_at_since_untracked(
-        &self,
-        total_frames: u64,
-        dt_secs: Option<f64>,
-    ) -> (u64, u64) {
-        // PURE projection — no lead registration here: internal callers
-        // (`play` start snapshot, sync hooks re-basing) reason about the raw
-        // value; only the public display funnels (`current_frame_in`,
-        // `current_secs`) register what the user actually saw.
+        // PURE projection — no side effects: internal callers (`play` start
+        // snapshot, sync hooks re-basing) reason about the displayed value;
+        // the public getters read the same honest state (`last_display_at`)
+        // the projection itself maintains.
         let playing = self.state == TransportState::Playing;
         let eof = total_frames.max(1);
         let lo = self.start_frame.min(eof);
         let hi_full = self.end_frame.min(eof).max(lo);
-        const ANCHOR_FRESH_SECS: f64 = 0.05; // one nominal poll interval
-        let anchor_fresh = self
-            .last_commit_at
-            .elapsed()
-            .as_secs_f64()
-            <= ANCHOR_FRESH_SECS;
-        // A FRESH verbatim commit (explicit seek/skip landing at/above the
-        // session ceiling) displays exactly what was committed — shaving it
-        // to `end - 1` made the next backward jump land a step short of
-        // where the user saw the cursor ("left: 999, right: 1000").
-        let stored_at_ceiling = playing
-            && self.current_frame >= hi_full
-            && self.current_frame == self.last_commit_frame
-            && anchor_fresh;
-        if !playing || hi_full <= lo || stored_at_ceiling {
-            let pos = self.raw_projection(total_frames, dt_secs);
-            return (pos, pos);
+        if !playing || hi_full <= lo {
+            return self.raw_projection(total_frames, dt_secs);
         }
         // Half-open session [start,end): while Playing the RUNNING cursor
         // may show at most the last playable frame `end - 1` — the exclusive
         // stop marker appears only when the finish step parks it (session
-        // Stopped) or an explicit commit lands there. The check lives on the
-        // UNCLAMPED extrapolated value, not on the clamped result: with the
-        // lead capped at one nominal poll, a quantum that merely LANDED the
-        // stored clock on the ceiling still projects past it from below, so
-        // the running display keeps showing `end - 1` even while the stored
-        // commit sits at `end` (regression "left: 100, right: 300" — the
-        // following skip inherited a ceiling lie). A free-running
-        // projection never pushes the STORED frame to the ceiling (`tick`
-        // wraps/finishes before that), so sitting on `hi_full` means some
-        // mover put it there deliberately — and after one nominal poll the
-        // extrapolation collapses onto it, letting the ceiling dwell surface
-        // the exclusive marker for precise backward jumps.
-        let naive = self.current_frame.saturating_add(self.extrapolation_lead_secs(dt_secs));
-        if naive >= hi_full {
-            return (hi_full.saturating_sub(1).max(lo), naive);
+        // Stopped) or an explicit commit lands there. A FRESH verbatim
+        // commit at/above the ceiling (explicit seek/skip landing exactly on
+        // `end`, seen within one poll interval) displays what was committed —
+        // shaving it to `end - 1` made the next backward jump land a step
+        // short of where the user saw the cursor ("left: 999, right: 1000",
+        // "left: 100, right: 300"). Once the commit ages beyond one poll
+        // interval the running display falls back to the `end - 1` ceiling.
+        let commit_seen_ago = std::time::Instant::now()
+            .duration_since(self.last_display_at.get())
+            .as_secs_f64();
+        let fresh_at_ceiling = self.current_frame >= hi_full
+            && self.current_frame == self.last_commit_frame
+            && commit_seen_ago <= 0.05;
+        if fresh_at_ceiling {
+            return self.current_frame.min(eof);
         }
         let pos = self.raw_projection(total_frames, dt_secs);
-        (pos, naive)
+        pos.min(hi_full.saturating_sub(1).max(lo))
     }
 
     /// The jump base for `skip`: the frame the user actually SEES right now.
@@ -676,12 +645,13 @@ impl Controller {
     ///   just landed at/above the half-open ceiling start from the
     ///   PRE-quantum value and move a whole step short of what was shown
     ///   (regression "left: 100, right: 300");
-    /// * the raw display projection carries the deliberate between-poll lead
-    ///   (sub-frame truncation + extrapolation), so a press inherited it and
-    ///   each repeated jump drifted by up to a frame per press.
+    /// * the raw display projection at the CURRENT instant carries lead time
+    ///   nobody ever saw (a getter read microseconds after a commit still
+    ///   extrapolates the whole open poll span), so a press inherited that
+    ///   phantom stretch and jumped past the visible cursor.
     /// The honest middle ground is the DISPLAY FRONTIER: the wall instant up
     /// to which the UI has genuinely been shown progress (`last_display_at`,
-    /// registered by real projection reads) translated into frames on top of
+    /// advanced by every projection read) translated into frames on top of
     /// the stored commit. Frames nobody ever saw are NOT part of the base;
     /// frames the user saw ARE. Clamped into the active session like an
     /// explicit click would be.
@@ -698,13 +668,14 @@ impl Controller {
             // A quantum that just LANDED at/above the half-open ceiling is
             // verbatim-visible to the user (`position_at_since` shows it even
             // at `end`) — the jump base must match what is on screen, not
-            // the pre-quantum commit ("left: 100, right: 300": a backward
-            // press from a fresh EOF landing started from 150 instead of the
-            // visible 1000 and landed a whole step short). Otherwise the
-            // running display tops out at `end - 1`, so that stays the cap.
+            // the pre-quantum commit. Otherwise the running display tops out
+            // at `end - 1`, so that stays the cap.
+            let commit_seen_ago = std::time::Instant::now()
+                .duration_since(self.last_display_at.get())
+                .as_secs_f64();
             let fresh_at_ceiling = self.current_frame >= self.end_frame
                 && self.current_frame == self.last_commit_frame
-                && frontier.duration_since(self.last_commit_at).as_secs_f64() <= 0.05;
+                && commit_seen_ago <= 0.05;
             let hi = if fresh_at_ceiling {
                 self.end_frame.min(self.last_commit_frame)
             } else {
@@ -715,124 +686,87 @@ impl Controller {
         live
     }
 
-    /// Remember how far ahead of the stored commit a display read went, so
-    /// the next committed quantum folds only genuinely SHOWN wall time into
-    /// its frontier. Takes `&self` through interior mutability: the getters
-    /// stay `&self` for every existing caller (UI frame loop, output thread,
-    /// tests). `shown` is the UNCLAMPED extrapolation this read paid for with
-    /// wall time (the half-open ceiling may have displayed less than that —
-    /// the projection still consumed the full span up to `shown`).
-    fn register_lead(&self, shown: u64) {
-        // The projection is `stored + floor(dt x sr)` from the last commit,
-        // so `shown` corresponds to the wall instant
-        // `last_commit_at + lead/sr`. Advance the frontier to the FARTHEST
-        // such instant; `tick` measures its quantum from there and never
-        // pays for shown time twice.
-        let lead = shown.saturating_sub(self.current_frame);
-        let sr = self.played_sr.max(1) as f64;
-        let shown_upto = self
-            .last_commit_at
-            .checked_add(std::time::Duration::from_secs_f64(lead as f64 / sr))
-            .unwrap_or_else(|| self.last_commit_at);
-        if shown_upto > self.last_display_at.get() {
-            self.last_display_at.set(shown_upto);
-        }
-        // Freeze the raw extrapolation at exactly what this read showed until
-        // the next commit: a second getter read must not re-grow the lead off
-        // the same commit instant (that stacking ran the loop clock at ~2x,
-        // "pos=8 wall=4"). A read AT the commit value has nothing ahead to
-        // freeze, so it leaves the honest free-run window open (§1.2).
-        self.display_lead_frozen.set(lead > 0);
+    /// Honest span of the CURRENT poll interval, in seconds: wall time
+    /// since the previous poll landed (`last_tick_at`, seeded one nominal
+    /// interval behind the session birth by `play` / `unpause`), PLUS the
+    /// sub-frame remainder the previous quantum could not pay as whole
+    /// frames. Clamped by the real time since the last commit so an early
+    /// first tick cannot fabricate progress ahead of the wall clock.
+    /// Shared verbatim between `tick` (its committed quantum) and the
+    /// projection lead (`extrapolation_lead_secs`) — this is THE definition
+    /// of "the honest current poll interval" for both layers, so a getter
+    /// read can never show more than the very next poll may commit, and no
+    /// wall microsecond is ever counted twice (or lost) between display and
+    /// commit ("pos=8 wall=4", "estimate over-ran the short session end").
+    fn poll_span_secs(&self, now: std::time::Instant) -> f64 {
+        let since_poll = self
+            .last_tick_at
+            .map(|t| now.duration_since(t).as_secs_f64())
+            .unwrap_or_else(|| now.duration_since(self.last_commit_at).as_secs_f64());
+        let since_commit = now.duration_since(self.last_commit_at).as_secs_f64().max(0.0);
+        // Sub-frame remainder carry: `last_tick_delta_frames` normally holds
+        // the WHOLE-FRAME count of the previous quantum (whose fractional
+        // part is already encoded in the back-dated anchors), but when a
+        // quantum committed NO whole frames — typical on a short loop polled
+        // every few milliseconds, where each honest span is under one frame —
+        // it stores the un-paid seconds scaled by 1e6 instead. The two cases
+        // are told apart by `last_commit_at == clock_base_at`: the remainder
+        // branch parks both at the same instant, the whole-frame branch parks
+        // `clock_base_at` behind `last_commit_at` by exactly the remainder.
+        // Without this carry every sub-frame poll refunded its un-paid
+        // stretch and the fallback clock ran ahead of real time.
+        let carried_secs = if self.last_tick_delta_frames == u64::MAX {
+            0.0
+        } else if self.last_commit_at == self.clock_base_at {
+            // Remainder-only stamp from a no-frame quantum.
+            self.last_tick_delta_frames as f64 / 1e6
+        } else {
+            let sr_f = self.played_sr.max(1) as f64;
+            let last_claimed = self.last_tick_delta_frames as f64 / sr_f;
+            // Remainder of the PREVIOUS honest span that was not committed,
+            // derived from the parked anchors.
+            let parked_span = self
+                .last_commit_at
+                .duration_since(self.clock_base_at)
+                .as_secs_f64();
+            (parked_span - last_claimed).max(0.0)
+        };
+        (since_poll.max(0.0) + carried_secs).min(since_commit.max(0.0))
     }
 
-    /// The pure extrapolation WITHOUT the half-open ceiling rule: stored
-    /// commit + the honest wall time since the last commit (capped at one
-    /// nominal poll while the fallback loop is alive, free-running beyond
-    /// that so §1.2 device-less degradation keeps tracking real time even
-    /// without any polling). Clamped into [start, end] here; the exclusive
-    /// `end` handling lives in `position_at_since`.
-    /// The honest extrapolation LEAD (in seconds) the display adds on top of
-    /// the stored commit: wall time since the last commit, capped at one
-    /// nominal poll interval while the fallback-clock loop is alive (getter
-    /// reads can never stack spans on top of a just-committed quantum), and
-    /// suppressed entirely for a session driven OUT OF CADENCE (a test or app
-    /// that claims quanta ahead of real time must not extrapolate at all —
-    /// its display equals the raw commit, and the finish step reports
-    /// `end - 1` before rewinding rather than teleporting to the exclusive
-    /// stop marker early, "left: 99, right: 50"). Beyond the alive window the
-    /// projection FREE-RUNS so elapsed time keeps tracking real time without
-    /// any polling (§1.2 device-less degradation).
-    fn extrapolation_lead_secs(&self, dt_secs: Option<f64>) -> u64 {
+    /// The honest extrapolation LEAD (in frames) the display adds on top of
+    /// the stored commit. ONE model with `tick`: the shown value is exactly
+    /// `stored + floor(poll_span x sr)` — the honest span of the current
+    /// poll interval — so the next `tick` commits precisely what this read
+    /// showed and every microsecond is accounted exactly once, either by a
+    /// committed quantum or by the projection, never both and never lost.
+    /// While the fallback loop is ALIVE (a poll landed within a nominal
+    /// interval plus grace) the display is capped at that one interval —
+    /// reads can never stack spans on top of a just-committed quantum. Once
+    /// the mover dies (device-less §1.2 degradation, or a paused poll loop)
+    /// the projection FREE-RUNS off the last commit so elapsed time keeps
+    /// tracking real time with no polling at all.
+    fn extrapolation_lead_frames(&self) -> u64 {
         const NOMINAL_POLL_SECS: f64 = 0.05; // §1.2 UI poll cadence
         const POLL_GRACE_SECS: f64 = 0.02;
-        // The caller may supply an explicit span (used by `tick` when it
-        // reasons about the lead of the span it is about to commit); getters
-        // pass the honest time since the last commit. Either way the lead
-        // runs from the COMMIT instant — never from the back-dated projection
-        // anchor, whose sub-frame remainder belongs to the previous span.
         let sr = self.played_sr.max(1) as f64;
-        // FROZEN lead: a display read already showed a value ahead of this
-        // commit; until the next commit re-opens the window, every further
-        // read must show exactly what was registered (`last_display_at`),
-        // not a freshly re-grown free-run span off the same commit instant.
-        // Without this, repeated getter reads pushed the frontier past real
-        // time and `tick` — measuring from the frontier — ran the loop clock
-        // at ~2x ("pos=8 wall=4").
-        if self.display_lead_frozen.get() && dt_secs.is_none() {
-            let shown = self
-                .last_display_at
-                .get()
-                .duration_since(self.last_commit_at)
-                .as_secs_f64()
-                .max(0.0);
-            return (shown * sr) as u64;
-        }
-        let dt = match dt_secs {
-            Some(span) => span.max(0.0),
-            None => self.last_commit_at.elapsed().as_secs_f64().max(0.0),
-        };
-        // Out-of-cadence driver (claims quanta faster than real time): no
-        // extrapolation at all — the display equals the raw commit.
-        let in_cadence = self
+        let now = std::time::Instant::now();
+        let mover_alive = self
             .last_tick_at
-            .map(|t| t.elapsed().as_secs_f64() >= NOMINAL_POLL_SECS - 0.005)
+            .map(|t| now.duration_since(t).as_secs_f64() <= NOMINAL_POLL_SECS + POLL_GRACE_SECS)
             .unwrap_or(false);
-        if !in_cadence {
-            return 0;
-        }
-        // Honest lead from the LAST COMMIT instant. The nominal cap applies
-        // only to getter reads that arrive right after a commit (a read must
-        // not stack a whole free-run span on top of a just-committed
-        // quantum); once the poll loop is overdue, the projection FREE-RUNS
-        // so elapsed time keeps tracking real time without any polling
-        // (§1.2 device-less degradation, regression `short_file_elapsed_
-        // tracks_real_time_without_polling`).
-        let mover_overdue = self
-            .last_tick_at
-            .map(|t| t.elapsed().as_secs_f64() > NOMINAL_POLL_SECS + POLL_GRACE_SECS)
-            .unwrap_or(true);
-        let span = if mover_overdue { dt } else { dt.min(NOMINAL_POLL_SECS) };
+        let span = if mover_alive {
+            self.poll_span_secs(now)
+        } else {
+            now.duration_since(self.last_commit_at).as_secs_f64().max(0.0)
+        };
         (span * sr) as u64
-    }
-
-    /// The UNCLAMPED extrapolation of the stored commit — the naive
-    /// `stored + lead` before session/ceiling folding. This is the value the
-    /// projection layer actually paid for with wall time, so it is what a
-    /// display read registers into the frontier (see `register_lead`): even
-    /// when the half-open rule shows `end - 1`, the frontier honestly sits
-    /// at the naive landing, letting `tick` measure its next quantum from
-    /// there instead of re-paying the same stretch.
-    fn untracked_projection_frame(&self) -> u64 {
-        if self.state != TransportState::Playing {
-            return self.current_frame;
-        }
-        self.current_frame.saturating_add(self.extrapolation_lead_secs(None))
     }
 
     /// The pure extrapolation WITHOUT the half-open ceiling rule: stored
     /// commit + the honest display lead, clamped into [start, end]. The
     /// exclusive `end` handling lives in `position_at_since`.
-    fn raw_projection(&self, total_frames: u64, dt_secs: Option<f64>) -> u64 {
+    fn raw_projection(&self, total_frames: u64, _dt_secs: Option<f64>) -> u64 {
         // Layering (§5.3): this is the ONE display projection — extrapolation
         // and range restriction live here and nowhere else. The raw stored
         // commit is served by `current_frame()` without touching it.
@@ -840,10 +774,30 @@ impl Controller {
         let lo = self.start_frame.min(eof);
         let hi = self.end_frame.min(eof).max(lo);
         let pos = if self.state == TransportState::Playing {
-            self.current_frame.saturating_add(self.extrapolation_lead_secs(dt_secs))
+            self.current_frame.saturating_add(self.extrapolation_lead_frames())
         } else {
             self.current_frame
         };
+        // Advance the display frontier to the instant this read paid for:
+        // the projection is `stored + floor(span x sr)` from the last
+        // commit, so what it shows corresponds to `last_commit_at +
+        // lead/sr` — never further than NOW. `skip` and `tick` measure the
+        // genuinely SHOWN stretch from this frontier, so frames nobody ever
+        // saw are not part of the books and shown frames are not counted
+        // twice ("left: 100, right: 300", "pos=8 wall=4").
+        if self.state == TransportState::Playing {
+            let lead = pos.saturating_sub(self.current_frame);
+            let shown_upto = self
+                .last_commit_at
+                .checked_add(std::time::Duration::from_secs_f64(
+                    lead as f64 / self.played_sr.max(1) as f64,
+                ))
+                .unwrap_or(self.last_commit_at)
+                .min(std::time::Instant::now());
+            if shown_upto > self.last_display_at.get() {
+                self.last_display_at.set(shown_upto);
+            }
+        }
         pos.clamp(lo, hi)
     }
 
@@ -869,13 +823,10 @@ impl Controller {
     /// session [start,end) bounded by the document's exact EOF (preferred
     /// whenever a Document is available).
     pub fn current_frame_in(&self, doc: &Document) -> u64 {
-        let (pos, naive) = self.position_at_since_untracked(doc.total_frames(), None);
-        // This read IS the displayed cursor: remember how far ahead of the
-        // stored commit it genuinely went (the UNCLAMPED projection — the
-        // ceiling rule may show less, but the span up to `naive` was paid
-        // for and seen) so the next `tick` quantum folds only shown frames.
-        self.register_lead(naive.max(pos));
-        pos
+        // The projection itself advances the display frontier (`raw_pro-
+        // jection` registers what each read shows) — no separate bookkeeping
+        // pass here.
+        self.position_at(doc.total_frames())
     }
     /// Elapsed time in seconds as displayed — same projection layer as
     /// `current_frame_in`, expressed in seconds at `sample_rate`.
@@ -900,110 +851,53 @@ impl Controller {
         }
         let sr = doc.sample_rate.max(1) as u64;
         self.played_sr = sr as u32;
-        let now = std::time::Instant::now();
-        // Honest span (§1.2 cadence contract): wall time since the LAST
-        // COMMIT by any mover, measured against `last_commit_at` — the never
-        // back-dated record of when the stored frame actually landed. The raw
-        // projection anchor (`clock_base_at`) sits a hair in the PAST (it is
-        // parked at the virtual end of the previous commit), so measuring
-        // from it overlaps the new quantum with the span it already paid
-        // for: on cadence every poll re-counted its own interval and the
-        // fallback clock ran at twice real time ("pos=8 wall=4"). A poll
-        // arriving EARLIER than its nominal claim commits only what really
-        // elapsed since then — an early first tick cannot teleport the
-        // cursor ("left: 99, right: 50").
-        // The span is measured from when the LAST POLL landed (`last_tick_at`,
-        // seeded one nominal interval behind the session birth by `play` /
-        // `unpause`) — the mover's own cadence clock. Measuring from the
-        // commit instant instead loses whatever the previous quantum could
-        // not pay as whole frames: its sub-frame remainder AND, on a loop,
-        // the wrap overshoot (the frames past the ceiling that the modulo
-        // discarded) — each lap silently refunded, so the fallback clock ran
-        // ahead of real time ("pos=8 wall=4"). The commit floor keeps the
-        // guarantee that an explicit seek/skip commits nothing until real
-        // time has passed since it landed.
-        let since_poll = self
-            .last_tick_at
-            .map(|t| now.duration_since(t).as_secs_f64())
-            .unwrap_or_else(|| now.duration_since(self.last_commit_at).as_secs_f64());
-        let since_commit = now.duration_since(self.last_commit_at).as_secs_f64().max(0.0);
-        // Honest poll interval, PLUS the sub-frame remainder the previous
-        // quantum could not pay as whole frames (`last_tick_delta_frames`
-        // carries it through — see the commit step below). Without the
-        // carry, every lap of a short loop silently refunds its overshoot:
-        // the modulo discards the frames past the ceiling, the anchors park
-        // at NOW anyway, and the next span starts from zero again — the
-        // fallback clock then runs ahead of real time ("pos=8 wall=4": on a
-        // 10-frame loop with ~4 ms polls each wrap donated back up to a
-        // whole frame per lap). The commit floor (`min(since_commit)`) still
-        // guarantees nothing teleports past wall time after an explicit
-        // seek/skip.
         let sr_f = sr as f64;
-        // Sub-frame remainder carry: `last_tick_delta_frames` normally holds
-        // the WHOLE-FRAME count of the previous quantum (whose fractional
-        // part is already encoded in the back-dated anchors), but when a
-        // quantum committed NO whole frames — typical on a short loop polled
-        // every few milliseconds, where each honest span is under one frame —
-        // it stores the un-paid seconds scaled by 1e6 instead. The two cases
-        // are told apart by `last_commit_at == clock_base_at`: the remainder
-        // branch parks both at the same instant, the whole-frame branch parks
-        // `clock_base_at` behind `last_commit_at` by exactly the remainder.
-        // Without this carry every sub-frame poll refunded its un-paid
-        // stretch and the fallback clock ran ahead of real time.
-        let carried_secs = if self.last_tick_delta_frames == u64::MAX {
-            0.0
-        } else if self.last_commit_at == self.clock_base_at {
-            // Remainder-only stamp from a no-frame quantum.
-            self.last_tick_delta_frames as f64 / 1e6
+        let now = std::time::Instant::now();
+        // ONE span model shared with the display projection (§1.2 cadence
+        // contract): the honest length of the current poll interval — wall
+        // time since the previous poll landed (`last_tick_at`, seeded one
+        // nominal interval behind the session birth by `play` / `unpause`)
+        // plus the sub-frame remainder the previous quantum could not pay as
+        // whole frames, clamped by the real time since the last commit so an
+        // early first tick cannot fabricate progress ahead of the wall clock
+        // ("left: 99, right: 50"). The raw projection anchor (`clock_base_at`)
+        // sits a hair in the PAST (parked at the virtual end of the previous
+        // commit), so measuring from it would overlap the new quantum with
+        // the span it already paid for — on cadence every poll re-counted
+        // its own interval and the fallback clock ran at twice real time
+        // ("pos=8 wall=4").
+        let span = self.poll_span_secs(now);
+        // What the DISPLAY shows right now is `stored + floor(span x sr)` —
+        // the same formula `raw_projection` uses — so committing that value
+        // hands the shown stretch to the stored clock verbatim: each
+        // microsecond is counted once, either inside a committed quantum or
+        // by the projection, never both and never lost. The old code folded
+        // only what getter reads had registered into the frontier; when no
+        // read happened between polls (or several did), the un-shown gap ate
+        // frames on every lap and the loop clock lagged real time.
+        // EXCEPTION: an explicit commit (seek / skip) just parked the stored
+        // clock at a fresh target while the mover's cadence clock still owes
+        // its nominal seed interval — committing the full open span then
+        // teleported the cursor past where the user saw it ("left: 100,
+        // right: 300"). Immediately after such a commit the quantum is the
+        // honest wall time since it landed; the display caps at the same
+        // value (`min(span, since_commit)` in `extrapolation_lead_frames`),
+        // so nothing shown is ever lost from the books. A no-op jump (the
+        // commit landed back on the SAME frame the clock already carried) is
+        // not a teleport and does not reset the mover's books.
+        let fresh_explicit = self.last_tick_at.is_none()
+            && self.last_commit_frame == self.current_frame
+            && self.last_commit_at > self.session_clock_at
+            && self.last_commit_frame != self.session_clock_frame;
+        let delta_frames = if fresh_explicit {
+            (now.duration_since(self.last_commit_at).as_secs_f64().max(0.0) * sr_f) as u64
         } else {
-            let last_claimed = self.last_tick_delta_frames as f64 / sr_f;
-            // Remainder of the PREVIOUS honest span that was not committed,
-            // derived from the parked anchors.
-            let parked_span = self
-                .last_commit_at
-                .duration_since(self.clock_base_at)
-                .as_secs_f64();
-            (parked_span - last_claimed).max(0.0)
+            (span * sr_f) as u64
         };
-        let span = (since_poll.max(0.0) + carried_secs).min(since_commit.max(0.0));
-        // The display frontier (`last_display_at`, a wall INSTANT): the
-        // stretch of playback time up to which the user has ALREADY been
-        // shown progress (committed quanta plus whole frames registered by
-        // genuine projection reads). Anything paid for beyond this
-        // quantum's honest span must fold into the BASE, so each microsecond
-        // is counted exactly once — committed or shown, never both. The old
-        // code measured the claim from the frontier while keeping the base at
-        // the raw commit: the stretch between the commit and the frontier
-        // (shown but never committed) then vanished from the books every lap
-        // — the loop clock lagged real time ("pos=8 wall=4" on a 10-frame
-        // loop with ~4 ms polls, where each read showed 1-2 frames ahead of
-        // the commit).
-        let frontier = self.last_display_at.get().max(self.last_commit_at);
-        let since_frontier = now.duration_since(frontier).as_secs_f64().max(0.0);
-        let claimed = dt.as_secs_f64();
-        // Honest claim: what this poll may advance, never more than real
-        // wall time since the last commit and since the last poll landed.
-        let delta_secs = claimed.min(span).min((span + since_frontier).max(0.0));
-        // Whole frames genuinely SHOWN ahead of the stored commit since the
-        // last commit (registered by real display reads — never a re-assumed
-        // full-span extrapolation: phantom lead nobody saw would run the
-        // clock at ~2x, "pos=8 wall=4").
-        let shown_lead = ((frontier
-            .duration_since(self.last_commit_at)
-            .as_secs_f64()
-            .max(0.0))
-            * sr_f) as u64;
-        // Base = stored commit + the shown-but-uncommitted lead. This quantum
-        // pays only what comes AFTER the frontier, so the lead rides along
-        // without being counted twice.
-        let base = self
-            .stored_frame()
-            .saturating_add(shown_lead)
-            .clamp(
-                self.start_frame,
-                if self.end_frame > self.start_frame { self.end_frame } else { doc.total_frames() },
-            );
-        let delta_frames = (delta_secs * sr_f) as u64;
+        let delta_secs = delta_frames as f64 / sr_f;
+        let base = self.stored_frame();
+        let next = base.saturating_add(delta_frames);
+        let end = if self.end_frame > self.start_frame { self.end_frame } else { doc.total_frames() };
         // Virtual end of the committed span: NOW minus everything this
         // quantum did NOT pay as whole frames — its own sub-frame remainder
         // AND the wrap overshoot past the ceiling (the frames the modulo
@@ -1011,25 +905,19 @@ impl Controller {
         // back on every lap ("pos=8 wall=4": a 10-frame loop polled at ~4 ms
         // gained a frame per lap because the wrap ate 0.5-0.9 ms of paid wall
         // time while the anchors reset anyway). Parking at `commit_end`
-        // computed from the UNWRAPPED landing keeps the books: the next span
-        // starts behind the frontier and the freshness checks clamp the claim
-        // to what really elapsed.
+        // computed from the UNWRAPPED landing keeps the books honest.
         let overshoot_secs = {
-            let end = if self.end_frame > self.start_frame { self.end_frame } else { doc.total_frames() };
-            let landing = base.saturating_add(delta_frames);
-            if self.loop_enabled && end > self.start_frame && landing >= end {
+            if self.loop_enabled && end > self.start_frame && next >= end {
                 let spanf = (end - self.start_frame) as f64;
-                ((landing - end) as f64 % spanf) / sr_f
+                ((next - end) as f64 % spanf) / sr_f
             } else {
                 0.0
             }
         };
         let commit_end = now
             - std::time::Duration::from_secs_f64(
-                (delta_secs - (delta_frames as f64) / sr_f + overshoot_secs).max(0.0),
+                (span - delta_secs + overshoot_secs).max(0.0),
             );
-        let next = base.saturating_add(delta_frames);
-        let end = if self.end_frame > self.start_frame { self.end_frame } else { doc.total_frames() };
         if next >= end {
             if self.loop_enabled && end > self.start_frame {
                 let span_frames = end - self.start_frame;
@@ -1047,8 +935,8 @@ impl Controller {
                 self.repark_display_frontier(commit_end);
                 self.last_tick_delta_frames = if delta_frames == 0 {
                     // Sub-frame quantum: carry the un-paid remainder in the
-                    // stamp (see `carried_secs`); both anchors park together.
-                    ((delta_secs - overshoot_secs).max(0.0) * 1e6) as u64
+                    // stamp (see `poll_span_secs`); both anchors park together.
+                    ((span - overshoot_secs).max(0.0) * 1e6) as u64
                 } else {
                     delta_frames
                 };
@@ -1069,7 +957,7 @@ impl Controller {
             self.last_commit_frame = self.current_frame;
             self.repark_display_frontier(commit_end);
             self.last_tick_delta_frames = if delta_frames == 0 {
-                ((delta_secs).max(0.0) * 1e6) as u64
+                (span.max(0.0) * 1e6) as u64
             } else {
                 delta_frames
             };
