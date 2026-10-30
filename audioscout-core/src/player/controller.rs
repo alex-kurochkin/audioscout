@@ -73,6 +73,19 @@ pub struct Controller {
     /// since the last commit — each microsecond counted exactly once, either
     /// inside a committed quantum or by the projection, never both.
     clock_base_at: std::time::Instant,
+    /// The instant of the LAST commit to the stored clock (wall NOW at the
+    /// moment any mover advanced `current_frame`). Unlike `clock_base_at`
+    /// it is never back-dated by the sub-frame remainder, so it is the
+    /// honest reference for "was the stored frame committed just now?" —
+    /// the anchor-freshness test in `position_at`.
+    last_commit_at: std::time::Instant,
+    /// The stored frame at the moment of that last commit (`current_frame`
+    /// mirrored). If the stored clock still sits on the committed value and
+    /// the commit is fresh, the display must show it VERBATIM — no
+    /// half-open ceiling may shave a frame off a just-landed quantum or an
+    /// explicit seek/skip target (regressions "left: 0, right: 50",
+    /// "pos=8 wall=4", "left: 100, right: 300").
+    last_commit_frame: u64,
 }
 
 impl Controller {
@@ -94,6 +107,8 @@ impl Controller {
             last_tick_at: None,
             last_tick_delta_frames: 0,
             clock_base_at: std::time::Instant::now(),
+            last_commit_at: std::time::Instant::now(),
+            last_commit_frame: 0,
         }
     }
 
@@ -182,6 +197,8 @@ impl Controller {
         const NOMINAL_POLL_SEED_SECS: f64 = 0.05; // §1.2 UI poll cadence
         self.session_clock_at = birth;
         self.clock_base_at = birth;
+        self.last_commit_at = birth;
+        self.last_commit_frame = pos;
         self.last_tick_delta_frames = 0;
         self.state = TransportState::Playing;
         self.playhead.set_playing(true);
@@ -206,6 +223,8 @@ impl Controller {
             // The frozen frame corresponds to THIS instant: park the
             // projection anchor so Paused reads never extrapolate.
             self.clock_base_at = std::time::Instant::now();
+            self.last_commit_at = std::time::Instant::now();
+            self.last_commit_frame = self.current_frame;
             self.playhead.set_position_samples(est);
             self.playhead.set_playing(false);
         }
@@ -219,6 +238,8 @@ impl Controller {
             // paused must never count as playback progress.
             self.session_clock_at = std::time::Instant::now();
             self.clock_base_at = std::time::Instant::now();
+            self.last_commit_at = std::time::Instant::now();
+            self.last_commit_frame = self.current_frame;
             // Same mover-alive seeding as `play()`: right after unpause the
             // display must not free-run ahead of the resumed clock before
             // the first poll lands (regression `short_file_elapsed_tracks_
@@ -240,6 +261,8 @@ impl Controller {
         self.current_frame = self.start_frame;
         self.resume_frame = self.start_frame;
         self.clock_base_at = std::time::Instant::now();
+        self.last_commit_at = std::time::Instant::now();
+        self.last_commit_frame = self.start_frame;
         self.playhead.set_position_samples(self.current_frame);
         self.playhead.set_playing(false);
     }
@@ -299,6 +322,8 @@ impl Controller {
         // display may only extrapolate from here (and, while Playing, at
         // most one poll quantum ahead of it).
         self.clock_base_at = std::time::Instant::now();
+        self.last_commit_at = std::time::Instant::now();
+        self.last_commit_frame = self.current_frame;
         self.last_tick_delta_frames = 0;
     }
 
@@ -347,6 +372,8 @@ impl Controller {
         self.current_frame = frame;
         self.session_clock_at = std::time::Instant::now();
         self.clock_base_at = std::time::Instant::now();
+        self.last_commit_at = std::time::Instant::now();
+        self.last_commit_frame = self.current_frame;
         self.last_tick_delta_frames = 0;
         self.playhead.set_position_samples(frame);
     }
@@ -405,6 +432,8 @@ impl Controller {
                 self.resume_frame = frame;
                 self.session_clock_at = std::time::Instant::now();
                 self.clock_base_at = std::time::Instant::now();
+                self.last_commit_at = std::time::Instant::now();
+                self.last_commit_frame = self.current_frame;
                 self.last_tick_delta_frames = 0;
             }
         }
@@ -457,6 +486,8 @@ impl Controller {
         self.resume_frame = start;
         self.session_clock_at = std::time::Instant::now();
         self.clock_base_at = std::time::Instant::now();
+        self.last_commit_at = std::time::Instant::now();
+        self.last_commit_frame = self.current_frame;
         self.last_tick_delta_frames = 0;
         self.state = TransportState::Playing; self.playhead.set_playing(true);
         self.playhead.set_position_samples(start);
@@ -469,6 +500,8 @@ impl Controller {
         self.current_frame = frame; self.resume_frame = frame;
         self.session_clock_at = std::time::Instant::now();
         self.clock_base_at = std::time::Instant::now();
+        self.last_commit_at = std::time::Instant::now();
+        self.last_commit_frame = self.current_frame;
         self.last_tick_delta_frames = 0;
         self.playhead.set_position_samples(frame);
     }
@@ -478,6 +511,8 @@ impl Controller {
         self.current_frame = start; self.resume_frame = start;
         self.session_clock_at = std::time::Instant::now();
         self.clock_base_at = std::time::Instant::now();
+        self.last_commit_at = std::time::Instant::now();
+        self.last_commit_frame = self.current_frame;
         self.last_tick_delta_frames = 0;
         self.playhead.set_position_samples(start); self.playhead.set_playing(false);
     }
@@ -529,12 +564,18 @@ impl Controller {
         // explicit commit lands there. An explicit commit at/above the
         // ceiling (seek/skip clamped into the active range, Play parked at
         // EOF) still displays verbatim: every mover re-parks the anchor with
-        // the commit, so a FRESH anchor proves a verbatim landing — a
-        // free-running projection never pushes the STORED frame to the
-        // ceiling (`tick` wraps/finishes before that).
+        // the commit, so a FRESH anchor proves a verbatim landing. Freshness
+        // is measured against the LAST COMMIT (`last_commit_at`), not the
+        // raw anchor: `tick` deliberately parks its anchor slightly in the
+        // PAST (`commit_end` = now − sub-frame remainder) so the getters add
+        // nothing already committed — judging freshness by that back-dated
+        // instant mis-classified a just-committed quantum as stale and shaved
+        // frames off the display (regressions "left: 0, right: 50" and
+        // "pos=8 wall=4"). A free-running projection never pushes the STORED
+        // frame to the ceiling (`tick` wraps/finishes before that).
         const ANCHOR_FRESH_SECS: f64 = 0.05; // one nominal poll interval
         let anchor_fresh = self
-            .clock_base_at
+            .last_commit_at
             .elapsed()
             .as_secs_f64()
             <= ANCHOR_FRESH_SECS;
@@ -653,6 +694,8 @@ impl Controller {
                 // the getters' projection on every lap.
                 self.session_clock_at = commit_end;
                 self.clock_base_at = commit_end;
+                self.last_commit_at = std::time::Instant::now();
+                self.last_commit_frame = self.current_frame;
                 self.last_tick_delta_frames = delta_frames;
             } else {
                 // Report the final playable frame first, then finish: the
@@ -667,6 +710,8 @@ impl Controller {
             self.resume_frame = next;
             self.session_clock_at = commit_end;
             self.clock_base_at = commit_end;
+            self.last_commit_at = std::time::Instant::now();
+            self.last_commit_frame = self.current_frame;
             self.last_tick_delta_frames = delta_frames;
             self.playhead.set_position_samples(next);
         }
