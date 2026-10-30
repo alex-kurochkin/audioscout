@@ -625,8 +625,15 @@ impl Controller {
         // short of where the user saw the cursor ("left: 999, right: 1000",
         // "left: 100, right: 300"). Once the commit ages beyond one poll
         // interval the running display falls back to the `end - 1` ceiling.
+        // Freshness is measured from the COMMIT instant (`last_commit_at`),
+        // not the display frontier: after an explicit jump the frontier
+        // stays parked AT the commit until the first read registers shown
+        // time, so a frontier-based age would be ~0 forever and let a tick
+        // quantum that merely LANDED at EOF masquerade as a verbatim user
+        // commit (the loop clock then skipped its half-open ceiling and ran
+        // ahead of real time — regression "pos=8 wall=4").
         let commit_seen_ago = std::time::Instant::now()
-            .duration_since(self.last_display_at.get())
+            .duration_since(self.last_commit_at)
             .as_secs_f64();
         let fresh_at_ceiling = self.current_frame >= hi_full
             && self.current_frame == self.last_commit_frame
@@ -787,13 +794,30 @@ impl Controller {
         // twice ("left: 100, right: 300", "pos=8 wall=4").
         if self.state == TransportState::Playing {
             let lead = pos.saturating_sub(self.current_frame);
-            let shown_upto = self
-                .last_commit_at
-                .checked_add(std::time::Duration::from_secs_f64(
-                    lead as f64 / self.played_sr.max(1) as f64,
-                ))
-                .unwrap_or(self.last_commit_at)
-                .min(std::time::Instant::now());
+            // The shown value corresponds to `last_commit_at + lead/sr` —
+            // but ONLY when the projection ran off the commit's own span.
+            // An explicit jump (`seek` / `skip`) parks its anchors at NOW,
+            // while the mover-alive seeding lets the first post-jump read
+            // extrapolate a full nominal interval: registering that seed
+            // span as "shown" would fabricate wall time before the jump and
+            // drag the next backward press a whole step short of the visible
+            // cursor (regression "left: 100, right: 300"). While no poll has
+            // landed since such a commit, nothing beyond the commit instant
+            // has genuinely been paid for, so the frontier stays parked AT
+            // the commit until the first quantum re-bases the books.
+            let fresh_explicit = self.last_tick_at.is_none()
+                && self.last_commit_frame == self.current_frame
+                && self.last_commit_at >= self.session_clock_at;
+            let shown_upto = if fresh_explicit {
+                self.last_commit_at
+            } else {
+                self.last_commit_at
+                    .checked_add(std::time::Duration::from_secs_f64(
+                        lead as f64 / self.played_sr.max(1) as f64,
+                    ))
+                    .unwrap_or(self.last_commit_at)
+            }
+            .min(std::time::Instant::now());
             if shown_upto > self.last_display_at.get() {
                 self.last_display_at.set(shown_upto);
             }
@@ -845,7 +869,7 @@ impl Controller {
     /// an early poll fabricates no progress. The anchor is re-parked at the
     /// exact instant the committed frame corresponds to, so the getters add
     /// nothing that was already committed.
-    pub fn tick(&mut self, dt: std::time::Duration, doc: &Document) {
+    pub fn tick(&mut self, _dt: std::time::Duration, doc: &Document) {
         if self.state != TransportState::Playing {
             return;
         }
@@ -885,10 +909,17 @@ impl Controller {
         // so nothing shown is ever lost from the books. A no-op jump (the
         // commit landed back on the SAME frame the clock already carried) is
         // not a teleport and does not reset the mover's books.
+        // A fresh explicit commit (`seek` / `skip`) parks the session anchor
+        // and the commit stamp at the SAME instant (the jump lands NOW),
+        // whereas a mover that back-dates its anchors to the quantum's
+        // virtual end leaves `session_clock_at` strictly behind
+        // `last_commit_at`. So "anchors coincide" is the honest marker of an
+        // explicit jump whose books were just reset — combined with "no poll
+        // has landed since then" and "the stored clock still carries what
+        // that commit wrote".
         let fresh_explicit = self.last_tick_at.is_none()
             && self.last_commit_frame == self.current_frame
-            && self.last_commit_at > self.session_clock_at
-            && self.last_commit_frame != self.session_clock_frame;
+            && self.last_commit_at >= self.session_clock_at;
         let delta_frames = if fresh_explicit {
             (now.duration_since(self.last_commit_at).as_secs_f64().max(0.0) * sr_f) as u64
         } else {
