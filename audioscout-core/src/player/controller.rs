@@ -1573,3 +1573,51 @@ mod tests {
         assert!(secs <= 0.2 + 1e-9, "current_secs exceeded duration: {secs}");
     }
 }
+
+#[cfg(test)]
+mod skip_base_debug {
+    use super::*;
+    use crate::player::{CursorSource, PlayheadState};
+    use crate::{Document, SampleType};
+    use std::path::PathBuf;
+
+    fn controller_with_doc(frames: usize, channels: u16) -> (Controller, Document) {
+        let doc = Document {
+            samples: vec![0.25f32; frames * channels as usize],
+            sample_rate: 1000,
+            channels,
+            markers: Vec::new(),
+            source_path: PathBuf::from("test.wav"),
+            temp_path: None,
+            dirty: false,
+            sample_type: SampleType::Float32,
+        };
+        let c = Controller::new(std::sync::Arc::new(PlayheadState::new()));
+        (c, doc)
+    }
+
+    #[test]
+    fn trace_skip_base() {
+        let (mut c, doc) = controller_with_doc(1000, 1);
+        c.seek(100, &doc, CursorSource::User);
+        c.play(&doc, None);
+        c.set_skip_seconds(1);
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        c.tick(std::time::Duration::from_millis(50), &doc);
+        eprintln!("after tick: stored={} in={}", c.current_frame(), c.current_frame_in(&doc));
+        c.skip(&doc, 1);
+        eprintln!("skip(+1): stored={} in={}", c.current_frame(), c.current_frame_in(&doc));
+        c.skip(&doc, -2);
+        eprintln!("skip(-2): stored={} in={} start={}", c.current_frame(), c.current_frame_in(&doc), c.start_frame());
+        c.seek(300, &doc, CursorSource::User);
+        eprintln!("seek(300): stored={} in={}", c.current_frame(), c.current_frame_in(&doc));
+        let base = c.skip_base_frame(doc.total_frames());
+        eprintln!("base dbg: {} explicit_jump_pending={} last_tick_delta={}", base, c.explicit_jump_pending, c.last_tick_delta_frames);
+        c.skip(&doc, 1);
+        eprintln!("skip(+1): stored={} in={}", c.current_frame(), c.current_frame_in(&doc));
+        let base2 = c.skip_base_frame(doc.total_frames());
+        eprintln!("base2 dbg: {}", base2);
+        c.skip(&doc, -1);
+        eprintln!("skip(-1): stored={} in={}", c.current_frame(), c.current_frame_in(&doc));
+    }
+}
