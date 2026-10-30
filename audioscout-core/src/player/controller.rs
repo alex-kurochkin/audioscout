@@ -612,6 +612,13 @@ impl Controller {
         let eof = total_frames.max(1);
         let lo = self.start_frame.min(eof);
         let hi_full = self.end_frame.min(eof).max(lo);
+        // An explicit-span read (`skip_base_frame` right after a jump): the
+        // stored value IS the fresh verbatim commit the user sees on screen
+        // — no ceiling shave, no freshness window maths. The span override
+        // already excludes pre-jump and un-shown lead from the projection.
+        if dt_secs.is_some() {
+            return self.raw_projection(total_frames, dt_secs).clamp(lo, hi_full.max(lo));
+        }
         if !playing || hi_full <= lo {
             return self.raw_projection(total_frames, dt_secs);
         }
@@ -688,23 +695,24 @@ impl Controller {
                 })
                 .unwrap_or(false);
             if !mover_alive {
-                // The poll loop is dead (device-less degradation / paused
-                // polling): the projection free-runs off the commit, so it
-                // shows exactly what a getter would show right now — that
-                // IS the visible cursor and the honest jump base.
-                self.position_at(u64::MAX)
+                // The poll loop is dead (device-less degradation / stopped
+                // polling): the display free-runs off the last commit, so
+                // what a getter shows right now IS the visible cursor and
+                // the honest jump base — but extrapolated from the LAST
+                // COMMIT instant only, never across an explicit teleport
+                // ("left: 100, right: 300": pre-jump wall time must not be
+                // handed to the next press).
+                let since_commit = std::time::Instant::now()
+                    .duration_since(self.last_commit_at)
+                    .as_secs_f64()
+                    .max(0.0);
+                self.position_at_since(u64::MAX, Some(since_commit))
             } else {
-                // A LIVE poll loop extrapolates up to one nominal interval
-                // of lead ahead of the stored commit — lead the user has
-                // NOT been shown yet (the next paint only happens when the
-                // next tick lands). In this mode the last COMMITTED reading
-                // is what is on screen: prefer the display frontier (what
-                // getter reads actually showed), fall back to the bare
-                // commit for a press microseconds after an explicit jump
-                // with no read in between ("left: 100, right: 300": the
-                // phantom seed span dragged the backward press past the
-                // visible cursor; "left: 0, right: 100": the open-span lead
-                // pushed it a step short).
+                // A LIVE poll loop: the visible cursor is the committed
+                // quantum plus whatever a getter read has actually SHOWN on
+                // screen (`last_display_at`, advanced by every projection
+                // read and parked at each commit). Un-shown lead inside the
+                // open poll interval is not part of the base; shown time is.
                 let sr = self.played_sr.max(1) as f64;
                 let shown_ahead_secs = self
                     .last_display_at
@@ -814,7 +822,18 @@ impl Controller {
         let span = if mover_alive {
             self.poll_span_secs(now)
         } else {
-            now.duration_since(self.last_commit_at).as_secs_f64().max(0.0)
+            // Free-run mode (-1.2 device-less degradation): the display
+            // extrapolates from the last commit - but never across an
+            // explicit jump. `seek`/`skip` park BOTH anchors at NOW, so a
+            // session anchor older than the commit belongs to the pre-jump
+            // stretch; counting it would show wall time that elapsed before
+            // the cursor was teleported to the target (and hand the same
+            // phantom lead to `skip_base_frame`, landing presses a step away
+            // from the visible cursor). After any mover quantum the anchors
+            // park together at the quantum's virtual end, so this clamp is
+            // a no-op for ordinary commits and bites only right after jumps.
+            let anchor = self.last_commit_at.max(self.session_clock_at);
+            now.duration_since(anchor).as_secs_f64().max(0.0)
         };
         (span * sr) as u64
     }
@@ -822,15 +841,28 @@ impl Controller {
     /// The pure extrapolation WITHOUT the half-open ceiling rule: stored
     /// commit + the honest display lead, clamped into [start, end]. The
     /// exclusive `end` handling lives in `position_at_since`.
-    fn raw_projection(&self, total_frames: u64, _dt_secs: Option<f64>) -> u64 {
+    fn raw_projection(&self, total_frames: u64, dt_secs: Option<f64>) -> u64 {
         // Layering (§5.3): this is the ONE display projection — extrapolation
         // and range restriction live here and nowhere else. The raw stored
         // commit is served by `current_frame()` without touching it.
         let eof = total_frames.max(1);
         let lo = self.start_frame.min(eof);
         let hi = self.end_frame.min(eof).max(lo);
+        let lead = match dt_secs {
+            // Explicit span (used by `skip_base_frame` right after an
+            // explicit jump): measure from the LAST COMMIT only — never
+            // across a teleport — and cap at one nominal poll interval so a
+            // getter read can still never show more than the next tick may
+            // commit.
+            Some(dt) => {
+                const NOMINAL_POLL_SECS: f64 = 0.05;
+                let sr_f = self.played_sr.max(1) as f64;
+                (dt.min(NOMINAL_POLL_SECS) * sr_f) as u64
+            }
+            None => self.extrapolation_lead_frames(),
+        };
         let pos = if self.state == TransportState::Playing {
-            self.current_frame.saturating_add(self.extrapolation_lead_frames())
+            self.current_frame.saturating_add(lead)
         } else {
             self.current_frame
         };
@@ -843,6 +875,7 @@ impl Controller {
         // twice ("left: 100, right: 300", "pos=8 wall=4").
         if self.state == TransportState::Playing {
             let lead = pos.saturating_sub(self.current_frame);
+            let shown_span_start = dt_secs.map(|_| self.last_commit_at);
             // The shown value corresponds to `last_commit_at + lead/sr` —
             // but ONLY when the projection ran off the commit's own span.
             // An explicit jump (`seek` / `skip`) parks its anchors at NOW,
@@ -857,14 +890,15 @@ impl Controller {
             let fresh_explicit = self.last_tick_at.is_none()
                 && self.last_commit_frame == self.current_frame
                 && self.last_commit_at >= self.session_clock_at;
-            let shown_upto = if fresh_explicit {
+            let base_anchor = shown_span_start.unwrap_or(self.last_commit_at);
+            let shown_upto = if fresh_explicit && shown_span_start.is_none() {
                 self.last_commit_at
             } else {
-                self.last_commit_at
+                base_anchor
                     .checked_add(std::time::Duration::from_secs_f64(
                         lead as f64 / self.played_sr.max(1) as f64,
                     ))
-                    .unwrap_or(self.last_commit_at)
+                    .unwrap_or(base_anchor)
             }
             .min(std::time::Instant::now());
             if shown_upto > self.last_display_at.get() {
@@ -985,16 +1019,19 @@ impl Controller {
         // so nothing shown is ever lost from the books. A no-op jump (the
         // commit landed back on the SAME frame the clock already carried) is
         // not a teleport and does not reset the mover's books.
-        // A fresh explicit commit (`seek` / `skip`) parks the session anchor
-        // and the commit stamp at the SAME instant (the jump lands NOW),
-        // whereas a mover that back-dates its anchors to the quantum's
-        // virtual end leaves `session_clock_at` strictly behind
-        // `last_commit_at`. So "anchors coincide" is the honest marker of an
-        // explicit jump whose books were just reset — combined with "no poll
-        // has landed since then" and "the stored clock still carries what
-        // that commit wrote".
+        // A no-op jump (the commit landed back on the SAME frame the clock
+        // already carried) is not a teleport and does not reset the mover's
+        // books. The marker of an explicit jump is its STAMP: `seek` parks
+        // `last_tick_delta_frames` at 0 (no quantum has been paid since),
+        // whereas every mover path — including the seeding in `play`, whose
+        // birth stamp equals the session start — leaves a non-zero stamp or
+        // a strictly back-dated commit. So "zero stamp + commit at/after
+        // session birth + stored clock still carries what that commit wrote
+        // + no poll landed since" identifies the jump whose books were just
+        // reset, independent of how many getter reads happened in between.
         let fresh_explicit = self.last_tick_at.is_none()
             && self.last_commit_frame == self.current_frame
+            && self.last_tick_delta_frames == 0
             && self.last_commit_at >= self.session_clock_at;
         let delta_frames = if fresh_explicit {
             (now.duration_since(self.last_commit_at).as_secs_f64().max(0.0) * sr_f) as u64
@@ -1462,62 +1499,5 @@ mod tests {
         assert_eq!(capped, 199, "estimate over-ran the short session end: {capped}");
         let secs = c.current_secs(doc.sample_rate);
         assert!(secs <= 0.2 + 1e-9, "current_secs exceeded duration: {secs}");
-    }
-}
-
-
-#[cfg(test)]
-mod dbg_tests {
-    use super::*;
-    use crate::player::{CursorSource, PlayheadState};
-    use crate::{Document, SampleType};
-    use std::path::PathBuf;
-
-    fn doc(frames: usize) -> Document {
-        Document {
-            samples: vec![0.25f32; frames],
-            sample_rate: 1000,
-            channels: 1,
-            markers: Vec::new(),
-            source_path: PathBuf::from("t.wav"),
-            temp_path: None,
-            dirty: false,
-            sample_type: SampleType::Float32,
-        }
-    }
-
-    #[test]
-    fn dbg_skip() {
-        let d = doc(1000);
-        let mut c = Controller::new(std::sync::Arc::new(PlayheadState::new()));
-        c.seek(300, &d, CursorSource::User);
-        c.play(&d, None);
-        c.set_skip_seconds(1);
-        std::thread::sleep(std::time::Duration::from_millis(50));
-        c.tick(std::time::Duration::from_millis(50), &d);
-        eprintln!("after tick: stored={} disp={}", c.current_frame(), c.current_frame_in(&d));
-        c.skip(&d, 1);
-        eprintln!("after skip+1b: stored={} disp={}", c.current_frame(), c.current_frame_in(&d));
-        c.skip(&d, -1);
-        eprintln!("after skip-1b: stored={} disp={}", c.current_frame(), c.current_frame_in(&d));
-    }
-
-    #[test]
-    fn dbg_loop() {
-        let d = doc(1000);
-        let mut c = Controller::new(std::sync::Arc::new(PlayheadState::new()));
-        c.set_loop(true);
-        c.play(&d, Some((0, 10)));
-        let mut last = std::time::Instant::now();
-        for i in 0..8 {
-            std::thread::sleep(std::time::Duration::from_millis(4));
-            let now = std::time::Instant::now();
-            let dt = now - last;
-            c.tick(dt, &d);
-            last = now;
-            let p = c.current_frame_in(&d);
-            let wall = (dt.as_secs_f64() * 1000.0) as i64 % 10;
-            eprintln!("i={} dt_ms={:.2} pos={} wall={} stored={}", i, dt.as_secs_f64()*1000.0, p, wall, c.current_frame());
-        }
     }
 }
