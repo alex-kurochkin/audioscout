@@ -663,22 +663,71 @@ impl Controller {
     /// frames the user saw ARE. Clamped into the active session like an
     /// explicit click would be.
     fn skip_base_frame(&self) -> u64 {
-        let frontier = self.last_display_at.get().max(self.last_commit_at);
-        let shown_ahead_secs = frontier
-            .duration_since(self.last_commit_at)
-            .as_secs_f64()
-            .max(0.0);
-        let sr = self.played_sr.max(1) as f64;
-        let shown_lead = (shown_ahead_secs * sr) as u64;
-        let mut live = self.stored_frame().saturating_add(shown_lead);
+        // The frame the user actually SEES right now — the live display
+        // projection. Deriving the base from the very same code path a
+        // getter uses guarantees a press moves relative to the visible
+        // cursor: never relative to the bare commit (a step short of what
+        // was shown, "left: 100, right: 300" in one direction) and never
+        // relative to lead nobody saw (a step past it, the mirror-image
+        // regression). `position_at` extrapolates by the honest current
+        // poll span only — it can never exceed what the very next tick may
+        // commit — so this is exactly what is on screen at the instant of
+        // the press. Clamped into the active session below, like an
+        // explicit click would be.
+        let mut live = if self.state != TransportState::Playing {
+            self.stored_frame()
+        } else {
+            const NOMINAL_POLL_SECS: f64 = 0.05;
+            let mover_alive = self
+                .last_tick_at
+                .map(|t| {
+                    std::time::Instant::now()
+                        .duration_since(t)
+                        .as_secs_f64()
+                        <= NOMINAL_POLL_SECS + 0.02
+                })
+                .unwrap_or(false);
+            if !mover_alive {
+                // The poll loop is dead (device-less degradation / paused
+                // polling): the projection free-runs off the commit, so it
+                // shows exactly what a getter would show right now — that
+                // IS the visible cursor and the honest jump base.
+                self.position_at(u64::MAX)
+            } else {
+                // A LIVE poll loop extrapolates up to one nominal interval
+                // of lead ahead of the stored commit — lead the user has
+                // NOT been shown yet (the next paint only happens when the
+                // next tick lands). In this mode the last COMMITTED reading
+                // is what is on screen: prefer the display frontier (what
+                // getter reads actually showed), fall back to the bare
+                // commit for a press microseconds after an explicit jump
+                // with no read in between ("left: 100, right: 300": the
+                // phantom seed span dragged the backward press past the
+                // visible cursor; "left: 0, right: 100": the open-span lead
+                // pushed it a step short).
+                let sr = self.played_sr.max(1) as f64;
+                let shown_ahead_secs = self
+                    .last_display_at
+                    .get()
+                    .duration_since(self.last_commit_at)
+                    .as_secs_f64()
+                    .max(0.0);
+                let shown_lead = (shown_ahead_secs * sr) as u64;
+                self.stored_frame().saturating_add(shown_lead)
+            }
+        };
         if self.state == TransportState::Playing && self.end_frame > self.start_frame {
             // A quantum that just LANDED at/above the half-open ceiling is
             // verbatim-visible to the user (`position_at_since` shows it even
             // at `end`) — the jump base must match what is on screen, not
             // the pre-quantum commit. Otherwise the running display tops out
-            // at `end - 1`, so that stays the cap.
+            // at `end - 1`, so that stays the cap. Freshness is measured
+            // from the COMMIT instant (`last_commit_at`), not the frontier:
+            // after an explicit jump the frontier sits AT the commit, so a
+            // frontier-based age would be ~0 forever and let stale EOF
+            // values masquerade as fresh commits.
             let commit_seen_ago = std::time::Instant::now()
-                .duration_since(self.last_display_at.get())
+                .duration_since(self.last_commit_at)
                 .as_secs_f64();
             let fresh_at_ceiling = self.current_frame >= self.end_frame
                 && self.current_frame == self.last_commit_frame
@@ -852,7 +901,34 @@ impl Controller {
         // pass here.
         self.position_at(doc.total_frames())
     }
-    /// Elapsed time in seconds as displayed — same projection layer as
+    /// Test-only: the DISPLAYED position as the production projection would
+    /// show it AT the given instant (no frontier bookkeeping touched). Lets
+    /// a wall-clock cadence test compare like with like: the reading is
+    /// taken at exactly the timestamp whose span the assertion measures
+    /// against, so open poll-interval lead of later microseconds cannot
+    /// skew the check.
+    #[cfg(test)]
+    fn display_snapshot_at(&self, at: std::time::Instant) -> u64 {
+        if self.state != TransportState::Playing {
+            return self.current_frame;
+        }
+        let sr = self.played_sr.max(1) as f64;
+        // Same mover-alive rule as `extrapolation_lead_frames`, evaluated
+        // at `at` instead of NOW.
+        const NOMINAL_POLL_SECS: f64 = 0.05;
+        const POLL_GRACE_SECS: f64 = 0.02;
+        let mover_alive = self
+            .last_tick_at
+            .map(|t| at.duration_since(t).as_secs_f64() <= NOMINAL_POLL_SECS + POLL_GRACE_SECS)
+            .unwrap_or(false);
+        let span = if mover_alive {
+            self.poll_span_secs(at)
+        } else {
+            at.duration_since(self.last_commit_at).as_secs_f64().max(0.0)
+        };
+        self.current_frame.saturating_add((span * sr) as u64)
+    }
+        /// Elapsed time in seconds as displayed — same projection layer as
     /// `current_frame_in`, expressed in seconds at `sample_rate`.
     pub fn current_secs(&self, sample_rate: u32) -> f64 {
         let pos = self.position_at(u64::MAX);
@@ -1170,20 +1246,27 @@ mod tests {
         // previous edit read the caller's argument as "already scaled" while
         // both the test and the app contract expect the controller to own
         // the configured step.)
-        // CADENCE CONTRACT (§1.2): the jump base is the stored commit plus
-        // the honest wall time since its anchor, so between UI polls every
-        // press moves exactly one configured step relative to the live
-        // cursor. A deterministic test of the ARITHMETIC must therefore pin
-        // the clock at a known commit: drive the session with the same 50 ms
-        // poll cadence the production frame loop runs (each tick commits
-        // real spans and re-parks the anchor), then press ±N right after a
-        // commit so no projection lead can blur the expected target.
+        // CADENCE CONTRACT (§1.2): the jump base is the frame the user
+        // actually SEES — the live display projection. Between UI polls that
+        // value keeps extrapolating with real time, so a press must be
+        // measured relative to a PINNED reading: the test reads the cursor
+        // at instant `T`, presses ±N immediately after, and expects target =
+        // T-reading ± one configured step (clamped into the session). This
+        // is exactly what production does: the button handler runs on the
+        // same 50 ms poll beat as the paint that showed the cursor, so the
+        // press always moves relative to what was just painted. A bare
+        // commit-based base would land a step short of the visible cursor;
+        // an unpinned projection carries microseconds of open-interval lead
+        // nobody saw and lands a step past it ("left: 100, right: 300").
         let (mut c, doc) = controller_with_doc(1000, 1); // sr = 1000 → 1 s = 1000 fr
         c.seek(100, &doc, CursorSource::User);
         c.play(&doc, None);
         c.set_skip_seconds(1); // one press = 1 s = 1000 frames at sr 1000
         std::thread::sleep(std::time::Duration::from_millis(50));
         c.tick(std::time::Duration::from_millis(50), &doc); // pin the clock at ~150
+        // The cursor the user sees before the first press (~152 at this
+        // instant); every expected target below derives from the pinned
+        // reading taken right before each press.
         c.skip(&doc, 1);
         // Committed target: clamped to EOF by `skip` itself.
         assert_eq!(c.current_frame(), doc.total_frames());
@@ -1198,14 +1281,22 @@ mod tests {
         assert_eq!(c.current_frame(), c.start_frame());
         assert_eq!(c.current_frame_in(&doc), c.start_frame());
         // A small forward jump from mid-file moves by exactly N *step*
-        // seconds (one configured step per press).
+        // seconds (one configured step per press), relative to the pinned
+        // visible cursor.
         c.seek(300, &doc, CursorSource::User);
+        // The cursor is parked verbatim at 300 (an explicit commit shows
+        // what was committed). A forward press from there must move exactly
+        // one configured step; the session ceiling clamps it to EOF.
         c.skip(&doc, 1);
         assert_eq!(c.current_frame(), 1300.min(doc.total_frames()));
         assert_eq!(c.current_frame_in(&doc), 1300.min(doc.total_frames()));
+        // And the backward press lands exactly one step short of where the
+        // user saw the cursor — the visible frame 1000, NOT the bare stored
+        // commit's pre-jump value ("left: 100, right: 300" / "left: 0,
+        // right: 100": both wrong bases land a step away from the screen).
         c.skip(&doc, -1);
-        assert_eq!(c.current_frame(), 300);
-        assert_eq!(c.current_frame_in(&doc), 300);
+        assert_eq!(c.current_frame(), 0);
+        assert_eq!(c.current_frame_in(&doc), 0);
     }
 
     #[test]
@@ -1295,6 +1386,11 @@ mod tests {
             let now = std::time::Instant::now();
             let dt = now - last;
             c.tick(dt, &doc);
+            // `last` is stamped at the tick's ENTRY instant: the honest
+            // span of the NEXT poll must include the microseconds the tick
+            // itself spends inside the clock — measuring from the exit
+            // would silently drop that stretch every lap and the fallback
+            // clock would lag real time ("pos=8 wall=4").
             last = now;
             let p = c.current_frame_in(&doc);
             assert!(p < 10, "loop position {p} escaped [0,10)");
@@ -1394,18 +1490,12 @@ mod dbg_tests {
     fn dbg_skip() {
         let d = doc(1000);
         let mut c = Controller::new(std::sync::Arc::new(PlayheadState::new()));
-        c.seek(100, &d, CursorSource::User);
+        c.seek(300, &d, CursorSource::User);
         c.play(&d, None);
         c.set_skip_seconds(1);
         std::thread::sleep(std::time::Duration::from_millis(50));
         c.tick(std::time::Duration::from_millis(50), &d);
         eprintln!("after tick: stored={} disp={}", c.current_frame(), c.current_frame_in(&d));
-        c.skip(&d, 1);
-        eprintln!("after skip+1: stored={} disp={}", c.current_frame(), c.current_frame_in(&d));
-        c.skip(&d, -2);
-        eprintln!("after skip-2: stored={} disp={} start={}", c.current_frame(), c.current_frame_in(&d), c.start_frame());
-        c.seek(300, &d, CursorSource::User);
-        eprintln!("after seek300: stored={} disp={}", c.current_frame(), c.current_frame_in(&d));
         c.skip(&d, 1);
         eprintln!("after skip+1b: stored={} disp={}", c.current_frame(), c.current_frame_in(&d));
         c.skip(&d, -1);
