@@ -1041,58 +1041,41 @@ impl Controller {
         // session birth + stored clock still carries what that commit wrote
         // + no poll landed since" identifies the jump whose books were just
         // reset, independent of how many getter reads happened in between.
-        // The quantum commits what the DISPLAY has taken responsibility
-        // for: the honest cadence span PLUS whatever getter reads have
-        // already shown beyond it (`last_display_at` — the capped-nominal
-        // branch of the projection paints a whole nominal interval microse-
-        // conds after a teleport, before the cadence clock has lived it).
-        // Committing less than was shown makes the next press inherit the
-        // difference AGAIN and the books pay the same stretch twice
-        // ("left: 100, right: 0"); committing exactly the shown frontier is
-        // safe because the un-lived excess is refunded below — the anchors
-        // park at the virtual end of the PAID part only, so the loop clock
-        // stays on real time ("pos=8 wall=4").
-        let shown_secs = now
-            .duration_since(self.last_display_at.get().max(self.last_commit_at))
-            .as_secs_f64()
-            .max(0.0);
-        let effective_span = span.max(shown_secs);
+        // CADENCE CONTRACT (§1.2): `tick` must be a PURE function of real
+        // elapsed wall time — one shared accounting model with the display
+        // projection. The committed quantum is exactly the honest poll span
+        // (`poll_span_secs`: wall time since the previous poll landed plus
+        // the sub-frame remainder the previous quantum could not pay), never
+        // "the span OR whatever a getter happened to show": a projection read
+        // is a VIEW of the books, not an additional debt on them. Folding the
+        // frontier into the quantum double-paid every stretch that was both
+        // extrapolated by a read and lived by the cadence clock — on a short
+        // loop polled every few milliseconds that ran the fallback clock at
+        // about twice real time (regression "pos=8 wall=4" at ~2x speed).
+        // What getter reads showed is reconciled through the anchors alone:
+        // each commit parks them at the virtual end of the paid part, so the
+        // next read adds only wall time nobody has been charged for yet.
+        let effective_span = span;
         let delta_frames = (effective_span * sr_f) as u64;
         let delta_secs = delta_frames as f64 / sr_f;
         let base = self.stored_frame();
         let next = base.saturating_add(delta_frames);
         let end = if self.end_frame > self.start_frame { self.end_frame } else { doc.total_frames() };
         // Virtual end of the committed span: NOW minus everything this
-        // quantum did NOT pay as whole frames — its own sub-frame remainder
-        // AND the wrap overshoot past the ceiling (the frames the modulo
-        // discarded). Parking at NOW would silently donate the eaten stretch
-        // back on every lap ("pos=8 wall=4": a 10-frame loop polled at ~4 ms
-        // gained a frame per lap because the wrap ate 0.5-0.9 ms of paid wall
-        // time while the anchors reset anyway). Parking at `commit_end`
-        // computed from the UNWRAPPED landing keeps the books honest.
-        let overshoot_secs = {
-            if self.loop_enabled && end > self.start_frame && next >= end {
-                let spanf = (end - self.start_frame) as f64;
-                ((next - end) as f64 % spanf) / sr_f
-            } else {
-                0.0
-            }
-        };
-        // Virtual end of the committed span: NOW minus everything this
-        // quantum did NOT pay as whole frames — its own sub-frame remainder
-        // AND the wrap overshoot past the ceiling (the frames the modulo
-        // discarded). Parking at NOW would silently donate the eaten stretch
-        // back on every lap ("pos=8 wall=4": a 10-frame loop polled at ~4 ms
-        // gained a frame per lap because the wrap ate 0.5-0.9 ms of paid wall
-        // time while the anchors reset anyway). Parking at `commit_end`
-        // computed from the UNWRAPPED landing keeps the books honest: the
-        // next span measures from here, so the un-paid remainder rides along
-        // exactly once (via `poll_span_secs`) and the discarded overshoot is
-        // refunded instead of re-paid.
+        // quantum did NOT pay as whole frames — ONLY its own sub-frame
+        // remainder. The wrap overshoot is deliberately NOT refunded here:
+        // a loop that discards frames at the ceiling loses that stretch
+        // from media time by construction, but the CLOCK must keep running
+        // on real time. Parking at `now - (remainder + overshoot)` used to
+        // hand the discarded overshoot back as free wall time on every lap
+        // and the fallback clock ran ahead of real time ("pos=8 wall=4":
+        // a 10-frame loop polled at ~4 ms gained ~0.5 frame per lap). With
+        // the honest remainder-only back-dating, the next span measures
+        // from the true paid frontier: exactly `effective_span - delta_secs`
+        // un-paid seconds ride along via the anchor carry in
+        // `poll_span_secs`, and each wall microsecond is charged once.
         let commit_end = now
-            - std::time::Duration::from_secs_f64(
-                (effective_span - delta_secs + overshoot_secs).max(0.0),
-            );
+            - std::time::Duration::from_secs_f64((effective_span - delta_secs).max(0.0));
         if next >= end {
             if self.loop_enabled && end > self.start_frame {
                 let span_frames = end - self.start_frame;
@@ -1101,8 +1084,8 @@ impl Controller {
                 self.resume_frame = wrapped;
                 self.playhead.set_position_samples(wrapped);
                 // Park BOTH anchors at the wrap's virtual end (`commit_end`,
-                // overshoot-refunded) — see the note above; parking at NOW
-                // donates the wrap's eaten stretch on every lap.
+                // remainder-refunded) — see the note above; parking at NOW
+                // would donate the sub-frame remainder back on every lap.
                 self.session_clock_at = commit_end;
                 self.clock_base_at = commit_end;
                 self.last_commit_at = commit_end;
@@ -1111,9 +1094,9 @@ impl Controller {
                 self.last_tick_delta_frames = if delta_frames == 0 {
                     // Sub-frame quantum: carry the un-paid remainder in the
                     // stamp (see `poll_span_secs`); both anchors park
-                    // together at the virtual commit end — which already
-                    // refunded the wrap's eaten stretch via `commit_end`.
-                    ((effective_span - overshoot_secs).max(0.0) * 1e6) as u64
+                    // together at the virtual commit end, which already
+                    // back-dated exactly the remainder of THIS span.
+                    (effective_span.max(0.0) * 1e6) as u64
                 } else {
                     delta_frames
                 };
@@ -1479,6 +1462,29 @@ mod tests {
             assert!(diff <= 3 || diff >= 7, "fallback clock drifted: pos={p} wall={wall}");
         }
         assert_eq!(c.state(), TransportState::Playing);
+    }
+
+    #[test]
+    fn dbg_loop_trace() {
+        let (mut c, doc) = controller_with_doc(1000, 1);
+        c.set_loop(true);
+        c.play(&doc, Some((0, 10)));
+        let mut last = std::time::Instant::now();
+        let t0 = last;
+        for i in 0..8 {
+            std::thread::sleep(std::time::Duration::from_millis(4));
+            let now = std::time::Instant::now();
+            let dt = now - last;
+            c.tick(dt, &doc);
+            last = now;
+            let p = c.current_frame_in(&doc);
+            println!(
+                "i={i} stored={} disp={p} wall_ms={:.2} since_t0_disp={:.2}",
+                c.current_frame(),
+                dt.as_secs_f64() * 1000.0,
+                now.duration_since(t0).as_secs_f64() * 1000.0
+            );
+        }
     }
 
     #[test]
