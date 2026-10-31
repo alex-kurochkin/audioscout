@@ -511,7 +511,27 @@ impl Controller {
     /// later Pause still resumes where playback actually is, and Play/Pause
     /// keeps its "resume from current position" semantics.
     pub fn sync_playback_position(&mut self, frame: u64) {
-        self.sync_playback_position_in(frame, None);
+        // Thin public wrapper required by the UI-poll contract (§5.3): the
+        // poll reads the audio clock and mirrors it here every 50 ms tick.
+        // The lagging-reading guard lives in THIS wrapper (not only in the
+        // document-aware variant below) so any caller that cannot compute
+        // the true audible position may safely feed the raw stored commit
+        // counter: readings that merely sit behind the display are dropped
+        // instead of dragging the state machine backwards. Resume-point
+        // bookkeeping stays inside `sync_playback_position_in` — this
+        // playback-side mirror never mentions it directly (§5.3).
+        if self.state != TransportState::Playing {
+            return;
+        }
+        let displayed = self.position_at(u64::MAX);
+        if frame >= displayed || frame >= self.current_frame {
+            self.last_sync_frame = u64::MAX; // force adoption in the body
+            self.sync_playback_position_in(frame, None);
+        } else {
+            // Stale lagging sample while Playing: keep the anchor, just
+            // refresh the playhead mirror so the widget never goes blank.
+            self.playhead.set_position_samples(displayed);
+        }
     }
 
     /// Document-aware variant: also captures the file sample rate so future

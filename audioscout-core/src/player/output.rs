@@ -1634,44 +1634,19 @@ fn pump_thread(pump: Arc<PumpState>, stream_format: (u32, u16)) {
         // How many STREAM samples correspond to CHUNK_SECONDS of wall time?
         let chunk_stream_samples = ((CHUNK_SECONDS * dst_rate as f64) as u64 * dst_ch).max(dst_ch);
 
-        // BUGFIX (playback dies ~0.5 s after start; "no sound", consumed
-        // clock frozen): pacing by the sink QUEUE DEPTH (queued_chunks) is
-        // wrong - cpal pulls samples from rodio's Sink in big batches, so a
-        // source that is still audibly playing gets drained to exhaustion
-        // almost immediately and the counter collapses while only ~1 s of
-        // audio has actually reached the speakers -> the pump waits forever.
-        // Pace instead by how far the hardware clock (`consumed_samples`,
-        // advanced inside the cpal callback by MeteredSource) has caught up
-        // with what we appended: keep at most LEAD_SECONDS of audio queued
-        // ahead of the clock. Self-correcting under bursty consumption and
-        // underruns alike. The pump always resumes at `cursor_frame`, which
-        // the controller resets to the session start on Play/Seek (5.3).
-        const LEAD_SECONDS: f64 = 0.75;
-        let lead_stream_samples = ((LEAD_SECONDS * dst_rate as f64) as u64 * dst_ch).max(chunk_stream_samples);
-        // Stream samples already handed to the Sink but not yet consumed.
-        let queued_stream_samples = {
-            let file_frames_queued = cursor.saturating_sub(s_start);
-            // BUGFIX (playhead froze at ~75% of the track): the queued-ahead
-            // amount must be measured in STREAM samples of the RESAMPLED
-            // output. The old formula scaled by dst_rate/src_rate only — for a
-            // 22050 Hz file on a 44100 Hz device that UNDERCOUNTS the queue by
-            // 2x, so the pump stopped topping up while the Sink still held
-            // real audio; once the hardware clock caught up, no chunk was
-            // appended and the stream went silent mid-session. Count exactly
-            // what `slice_to_buffer` emits: per-slice frame count after
-            // resampling (floor + at-least-one-frame, same as the builder).
-            if file_frames_queued == 0 {
-                0
-            } else {
-                let out_frames = ((file_frames_queued * dst_rate) / src_rate.max(1)).max(1);
-                out_frames.saturating_mul(dst_ch)
-            }
-        };
-        let consumed_now = match pump.shared.as_ref() {
-            Some(sh) => sh.consumed_samples.load(Ordering::Relaxed),
-            None => 0,
-        };
-        if queued_stream_samples.saturating_sub(consumed_now) >= lead_stream_samples {
+        // Pacing by the sink QUEUE BUDGET, not wall-clock sleeps: at most
+        // MAX_QUEUED_CHUNKS chunks (0.5 s each) may sit in the Sink ahead of
+        // the device. Every appended chunk reserves a slot (`fetch_add`) and
+        // releases it exactly once when MeteredSource is exhausted — the cpal
+        // callback drains queued sources to exhaustion almost immediately on
+        // bursty ALSA consumption, so the counter tracks real queue pressure
+        // and self-corrects under underruns alike. The old blind-sleep pacing
+        // either raced ahead (disk hammering) or starved the queue (~0.5 s of
+        // audio, then silence). Feeding always resumes at `cursor_frame`,
+        // which the controller resets to the session start on Play/Seek (§5.3).
+        const MAX_QUEUED_CHUNKS: usize = 2;
+        let max_queued_chunks = MAX_QUEUED_CHUNKS;
+        if queued_chunks.load(Ordering::Acquire) >= max_queued_chunks {
             std::thread::sleep(POLL_INTERVAL);
             continue;
         }

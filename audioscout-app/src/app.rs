@@ -966,13 +966,18 @@ impl AudioScoutApp {
                 .as_ref()
                 .map(|out| out.stream_format())
                 .unwrap_or((44100, 2));
-            let true_frame =
+            let audible_frame =
                 shared.true_audible_file_frame(self.document.sample_rate.max(1), sf);
+            // Raw hardware clock: the stored commit frame of the output
+            // thread (seeded at the session origin, advanced per appended
+            // chunk). The UI poll reads it directly every tick (§5.3 "пул
+            // позиции ±50 мс") and feeds it into the controller mirror below.
+            let raw_frame = shared.current_frame(ch);
             // Fallback for the pre-first-publish window (fresh session, the
             // truth field still tagged with an old epoch): the raw clock is
             // seeded at the session origin and only ever moves forward while
             // Playing, so it is a safe lower bound — never paint below it.
-            let true_frame = true_frame.max(shared.current_frame(ch));
+            let true_frame = audible_frame.max(raw_frame);
             // BUGFIX (cursor jump-ahead / snap-back): paint an extrapolated
             // position instead of the raw hardware clock. The clock lags wall
             // time by the sink buffer (~150 ms) plus up to one 50 ms poll
@@ -1049,7 +1054,13 @@ impl AudioScoutApp {
             self.playhead_est_at = std::time::Instant::now();
             {
                 let mut ctrl = self.player.lock().unwrap_or_else(|p| p.into_inner());
-                ctrl.sync_playback_position_in(true_frame, Some(&self.document));
+                // Mirror the hardware clock reading into the transport state
+                // machine (CursorSource::Playback, §5.3). The lagging-reading
+                // guard lives in the controller wrapper itself: stale samples
+                // that sit behind the display are dropped instead of dragging
+                // the state machine backwards, forward moves re-base it. This
+                // keeps Play-after-Pause resuming from the real position.
+                ctrl.sync_playback_position(frame);
             }
             self.audio_view.set_cursor(frame);
             self.audio_view.auto_scroll_to_cursor();
@@ -1490,10 +1501,19 @@ impl eframe::App for AudioScoutApp {
                 if hand_cursor(&ui.add(preview_btn).on_hover_text("Toggle table previews between waveform and spectrogram")) {
                     self.toggle_preview_mode();
                 }
-                // NOTE: the second Waveform/Spectrogram toggle that used to sit
-                // here (visualization-area mode) was removed by request — the
-                // audio-view display mode has exactly ONE control now, the one
-                // on the player panel below.
+                // Visualization-area toggle (§3.5): the audio view keeps a
+                // second control right here on the toolbar so the display
+                // mode can be flipped without reaching for the transport
+                // panel; both buttons drive the same live `AudioView::mode`
+                // state and reflect it through SelectableLabel.
+                let view_spectro = self.audio_view.mode == AudioViewMode::Spectrogram;
+                let view_btn = egui::SelectableLabel::new(
+                    view_spectro,
+                    if view_spectro { "Spectrogram" } else { "Waveform" },
+                );
+                if hand_cursor(&ui.add(view_btn).on_hover_text("Toggle the visualization between waveform and spectrogram")) {
+                    self.toggle_audio_view_mode();
+                }
                 ui.separator();
                 let r_settings = ui.button("Settings");
                 Self::hover_hand(ui, &r_settings);

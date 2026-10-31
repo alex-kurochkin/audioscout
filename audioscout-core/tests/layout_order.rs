@@ -276,10 +276,12 @@ fn file_table_header_shares_one_grid_with_the_rows() {
     );
 }
 
-/// Regression test for the duplicated Waveform/Spectrogram toggle: the
-/// visualization-area mode had TWO controls (one on the toolbar, one on the
-/// player panel). The user asked to remove the second one; exactly one
-/// audio-view toggle must remain in the whole UI.
+/// Regression guard for the Waveform/Spectrogram toggle pair: the
+/// visualization-area mode is flipped from exactly TWO controls — one on
+/// the top toolbar, one on the player panel (§3.5) — both driving the same
+/// live `AudioView::mode` state through identically-named widgets. The
+/// table-thumbnail toggle (preview_btn) is a separate control and must
+/// remain untouched.
 #[test]
 fn audio_view_mode_has_a_single_toggle_button() {
     let code: String = app_source()
@@ -300,13 +302,14 @@ fn audio_view_mode_has_a_single_toggle_button() {
 
     assert_eq!(
         code.matches("let view_btn = egui::SelectableLabel::new(").count(),
-        1,
-        "the waveform/spectrogram visualization toggle must exist exactly once"
+        2,
+        "the waveform/spectrogram visualization toggle must exist exactly twice \
+         (top toolbar + player panel)"
     );
     assert_eq!(
         code.matches("self.toggle_audio_view_mode()").count(),
-        1,
-        "only one control may flip the audio-view display mode"
+        2,
+        "exactly two controls may flip the audio-view display mode"
     );
     // The table-thumbnail toggle (preview_btn) is a different control and
     // must still be present.
