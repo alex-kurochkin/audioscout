@@ -767,64 +767,21 @@ impl Controller {
         let mut live = if self.state != TransportState::Playing {
             self.stored_frame()
         } else {
-            const NOMINAL_POLL_SECS: f64 = 0.05;
-            let mover_alive = self
-                .last_tick_at
-                .map(|t| {
-                    std::time::Instant::now()
-                        .duration_since(t)
-                        .as_secs_f64()
-                        <= NOMINAL_POLL_SECS + 0.02
-                })
-                .unwrap_or(false);
-            if !mover_alive {
-                // The poll loop is dead (device-less degradation / stopped
-                // polling): the display free-runs off the last commit, so
-                // what a getter shows right now IS the visible cursor and
-                // the honest jump base — but extrapolated from the LAST
-                // COMMIT instant only, never across an explicit teleport
-                // ("left: 100, right: 300": pre-jump wall time must not be
-                // handed to the next press).
-                let since_commit = std::time::Instant::now()
-                    .duration_since(self.last_commit_at)
-                    .as_secs_f64()
-                    .max(0.0);
-                self.position_at_since(u64::MAX, Some(since_commit))
-            } else {
-                // A LIVE poll loop: the visible cursor is the committed
-                // quantum plus whatever the display has ACTUALLY SHOWN on
-                // screen since. The shown stretch rides on top of the
-                // virtual end of the CURRENT commit — `last_commit_at` for
-                // an explicit teleport (nothing of the new span was lived
-                // before it landed), or the back-dated frontier for a mover
-                // quantum whose remainder still belongs to the books. The
-                // frontier itself can sit BEFORE that span end while the
-                // seed interval of a fresh jump has not been lived yet, so
-                // the measurement starts at the later of the two: taking
-                // the bare frontier would credit pre-jump wall time to the
-                // next press and land it a step away from the visible
-                // cursor ("left: 100, right: 300"). Never the full open-
-                // interval projection either: microseconds after a teleport
-                // it carries a nominal seed interval nobody has lived
-                // ("left: 0, right: 100", "left: 100, right: 0"). And never
-                // the bare commit — shown frames must be part of the base.
-                let sr = self.played_sr.max(1) as f64;
-                // Shown lead rides on top of the frontier when it carries
-                // genuinely displayed time beyond the current commit's
-                // span end; otherwise (fresh teleport whose seed interval
-                // nobody has lived) the measurement starts at the span end
-                // itself — pre-jump wall time must never be credited to
-                // the press ("left: 0, right: 100").
-                let span_end = self.last_span_end_at.get();
-                let frontier = self.last_display_at.get();
-                let origin = if frontier > span_end { frontier } else { span_end };
-                let shown_ahead_secs = std::time::Instant::now()
-                    .duration_since(origin)
-                    .as_secs_f64()
-                    .max(0.0);
-                let shown_lead = (shown_ahead_secs * sr) as u64;
-                self.stored_frame().saturating_add(shown_lead)
-            }
+            // CADENCE CONTRACT (§1.2 / §5.3): the base is EXACTLY what the
+            // display getter shows at this very instant — ONE shared model
+            // (`position_at`) with `current_frame_in`. Deriving a parallel
+            // "shown lead" formula here was the root of every step-away
+            // regression ("left: 100, right: 300", "left: 0, right: 100"):
+            // any microsecond the press measured but the paint did not (or
+            // vice versa) landed the jump a step off the screen. The getter
+            // already caps live lead at one honest poll span, parks fresh
+            // verbatim commits (click-to-EOF) at their committed value, and
+            // free-runs only when the mover is dead — so whatever the user
+            // can see IS what the next press moves relative to. Repeated
+            // reads are idempotent by design: the frontier books never
+            // rewind, so the press sees precisely the cursor the earlier
+            // paint showed.
+            self.position_at(doc_total_hint.max(1))
         };
         if self.state == TransportState::Playing && self.end_frame > self.start_frame {
             // The base must be exactly what the DISPLAY getter shows at this
@@ -1451,7 +1408,13 @@ mod tests {
         c.tick(std::time::Duration::from_millis(50), &doc);
         // The visible cursor right now — the pinned reading every expected
         // target below derives from (same-instant getter + same projection
-        // model as the press's base).
+        // model as the press's base). Register the read through the honest
+        // display-frontier books FIRST, exactly like production: the paint
+        // pass shows the value and the projection registers what was shown
+        // at that instant; the press then measures relative to the frontier.
+        // Taking a raw snapshot instead would leave microseconds of lived,
+        // displayed-but-unregistered stretch out of the base and land the
+        // next press a step short of the screen ("left: 100, right: 300").
         let shown = c.current_frame_in(&doc);
         // A forward press from there must move exactly one configured step;
         // the session ceiling clamps it to EOF.
