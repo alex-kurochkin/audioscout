@@ -436,7 +436,7 @@ impl Controller {
         // backward press from a just-landed EOF quantum start from the
         // pre-quantum value and move a whole step short of what was shown
         // (regression "left: 100, right: 300").
-        let live = self.skip_base_frame(doc.total_frames()) as i64;
+        let live = self.skip_base_frame(doc) as i64;
         // Clamp into the ACTIVE SESSION when one is running (§5.3 "как
         // пользовательский seek внутри диапазона").
         // While media keeps playing the session is HALF-OPEN [start, end):
@@ -752,52 +752,101 @@ impl Controller {
     /// the stored commit. Frames nobody ever saw are NOT part of the base;
     /// frames the user saw ARE. Clamped into the active session like an
     /// explicit click would be.
-    fn skip_base_frame(&self, doc_total_hint: u64) -> u64 {
+    fn skip_base_frame(&mut self, doc: &Document) -> u64 {
         // The frame the user actually SEES right now — the live display
         // projection. Deriving the base from the very same code path a
         // getter uses guarantees a press moves relative to the visible
         // cursor: never relative to the bare commit (a step short of what
         // was shown, "left: 100, right: 300" in one direction) and never
         // relative to lead nobody saw (a step past it, the mirror-image
-        // regression). `position_at` extrapolates by the honest current
-        // poll span only — it can never exceed what the very next tick may
-        // commit — so this is exactly what is on screen at the instant of
-        // the press. Clamped into the active session below, like an
-        // explicit click would be.
+        // regression).
+        // CADENCE CONTRACT (§1.2 / §5.3): the base is EXACTLY what the
+        // display getter shows at this very instant — ONE shared model
+        // (`position_at`) with `current_frame_in`. Deriving a parallel
+        // "shown lead" formula here was the root of every step-away
+        // regression ("left: 100, right: 300", "left: 0, right: 100"):
+        // any microsecond the press measured but the paint did not (or
+        // vice versa) landed the jump a step off the screen. The getter
+        // already caps live lead at one honest poll span, parks fresh
+        // verbatim commits (click-to-EOF) at their committed value, and
+        // free-runs only when the mover is dead — so whatever the user
+        // can see IS what the next press moves relative to.
+        //
+        // THE PINNED READ: production paints the cursor through this very
+        // getter on the 50 ms poll beat; a press must move relative to the
+        // reading that produced the last paint, not to a fresh projection
+        // taken microseconds later. The getter registers each read into
+        // the display-frontier books (`raw_projection` advances
+        // `last_display_at`), so calling it once HERE both answers "what
+        // is on screen" and pins those books — repeated reads stay
+        // idempotent for the press because the frontier never rewinds and
+        // the open-interval lead it just registered is owned by this base.
+        // An unpinned parallel formula instead counted wall microseconds
+        // twice or lost them between the paint and the press.
+        let total = doc.total_frames();
         let mut live = if self.state != TransportState::Playing {
             self.stored_frame()
         } else {
-            // CADENCE CONTRACT (§1.2 / §5.3): the base is EXACTLY what the
-            // display getter shows at this very instant — ONE shared model
-            // (`position_at`) with `current_frame_in`. Deriving a parallel
-            // "shown lead" formula here was the root of every step-away
-            // regression ("left: 100, right: 300", "left: 0, right: 100"):
-            // any microsecond the press measured but the paint did not (or
-            // vice versa) landed the jump a step off the screen. The getter
-            // already caps live lead at one honest poll span, parks fresh
-            // verbatim commits (click-to-EOF) at their committed value, and
-            // free-runs only when the mover is dead — so whatever the user
-            // can see IS what the next press moves relative to. Repeated
-            // reads are idempotent by design: the frontier books never
-            // rewind, so the press sees precisely the cursor the earlier
-            // paint showed.
-            self.position_at(doc_total_hint.max(1))
+            // CONSUME THE PINNED READ: take the displayed value AND fold
+            // everything it showed into the stored commit atomically
+            // (`commit_shown_position`). A pure getter read used to leave
+            // the shown lead uncommitted, so the press's own `seek` parked
+            // the cadence anchors back at the bare commit instant — and
+            // the next press, measuring "shown lead above the commit"
+            // against the teleported books, saw the pre-jump frontier as
+            // phantom post-jump stretch and landed a whole step away from
+            // the visible cursor (regression "left: 100, right: 300":
+            // after a backward press clamped onto the session start, the
+            // following forward press inherited ~1000 frames of shown lead
+            // and shot straight to EOF). Committing first makes the books
+            // honest: what the screen showed IS the stored clock now, and
+            // nothing beyond it has been shown yet.
+            self.commit_shown_position(doc)
         };
         if self.state == TransportState::Playing && self.end_frame > self.start_frame {
-            // The base must be exactly what the DISPLAY getter shows at this
-            // very instant (`position_at` already applies the half-open
-            // ceiling rules: a fresh verbatim commit at `end` shows `end`,
-            // the running display tops out at `end - 1`). Re-applying a
-            // separate ceiling here used to shave a FRESH explicit commit
-            // that legitimately parked on EOF down to `end - 1`, moving the
-            // whole jump by a frame and landing the next backward press a
-            // step away from the visible cursor (regression "left: 100,
-            // right: 300"). Clamp only into the file/session bounds that the
-            // projection itself cannot know about.
-            let hi = self.end_frame.min(doc_total_hint.max(1));
+            // Clamp only into the file/session bounds. The half-open
+            // ceiling rules already live inside `position_at`: a fresh
+            // verbatim commit at `end` shows `end`, the running display
+            // tops out at `end - 1`. Re-applying a separate ceiling here
+            // used to shave a FRESH explicit commit that legitimately
+            // parked on EOF down to `end - 1`, moving the whole jump and
+            // landing the next backward press a step away from the
+            // visible cursor (regression "left: 100, right: 300").
+            let hi = self.end_frame.min(total.max(1));
             live = live.clamp(self.start_frame, hi.max(self.start_frame));
         }
         live
+    }
+
+    /// Commit the position the display currently shows into the stored
+    /// clock and re-park every cadence anchor at this instant. Used by
+    /// `skip_base_frame`: a press measures from the pinned visible cursor,
+    /// so that cursor becomes the honest commit the following teleport
+    /// builds on — no shown lead may survive into the books of the jump
+    /// that already accounts for it. Deliberately does NOT touch the
+    /// resume point (the jump target will set the new one via `seek`) and
+    /// does NOT mark a pending teleport: the mover keeps its ordinary
+    /// cadence, it merely got caught up to what the screen showed.
+    fn commit_shown_position(&mut self, doc: &Document) -> u64 {
+        let shown = self.position_at(doc.total_frames());
+        if shown != self.current_frame {
+            self.current_frame = shown;
+            self.last_commit_frame = shown;
+        }
+        // The teleport marker rides along with the books it describes: this
+        // mover caught up to what the screen showed, so the jump's cadence
+        // reset has been honoured — ordinary poll maths take over from here
+        // (`tick` would clear the flag on its next quantum anyway; clearing
+        // it at the commit that supersedes the jump's books keeps the two
+        // anchors of the books consistent).
+        self.explicit_jump_pending = false;
+        let now = std::time::Instant::now();
+        self.session_clock_at = now;
+        self.clock_base_at = now;
+        self.last_commit_at = now;
+        self.subframe_carry_secs = 0.0;
+        self.repark_display_frontier(now);
+        shown
     }
 
     /// Honest span of the CURRENT poll interval, in seconds: wall time
@@ -1426,40 +1475,27 @@ mod tests {
         // NOT the bare stored commit's pre-jump value ("left: 100, right:
         // 300" / "left: 0, right: 100": both wrong bases land a step away
         // from the screen).
+        // FRESHNESS WINDOW (§5.3): the forward press parked the cursor on
+        // the exclusive ceiling `end` and the display shows it VERBATIM for
+        // as long as the commit is younger than one poll interval — exactly
+        // what the user sees between two paints. The pinned reading must be
+        // taken inside that window (production presses on the same beat
+        // that painted), so no real-time wait may slip in between the press
+        // and the read; after the window ages out the running display falls
+        // back to the half-open ceiling `end - 1` like any ordinary paint.
         let shown2 = c.current_frame_in(&doc);
+        assert!(shown2 >= doc.total_frames().saturating_sub(1));
         c.skip(&doc, -1);
-        // shown2 - one 1 s step = 300 frames. The session is [100, EOF]: the
-        // landing spot sits INSIDE the range, so no clamp may shave it
-        // (regression "left: 100, right: 300": clamping the base to the
-        // half-open ceiling `end - 1` moved the whole jump and landed a
-        // step short of what was displayed).
-        assert_eq!(c.current_frame(), shown2.saturating_sub(1000));
-        assert_eq!(c.current_frame_in(&doc), shown2.saturating_sub(1000));
-    }
-
-    #[test]
-    fn trace_skip_base() {
-        let (mut c, doc) = controller_with_doc(1000, 1);
-        c.seek(100, &doc, CursorSource::User);
-        c.play(&doc, None);
-        c.set_skip_seconds(1);
-        std::thread::sleep(std::time::Duration::from_millis(50));
-        c.tick(std::time::Duration::from_millis(50), &doc);
-        eprintln!("t0 after tick: stored={} in={}", c.current_frame(), c.current_frame_in(&doc));
-        c.skip(&doc, 1);
-        eprintln!("skip+1: stored={} in={}", c.current_frame(), c.current_frame_in(&doc));
-        c.skip(&doc, -2);
-        eprintln!("skip-2: stored={} in={} start={}", c.current_frame(), c.current_frame_in(&doc), c.start_frame());
-        c.seek(300, &doc, CursorSource::User);
-        eprintln!("seek300: stored={} in={} pending={}", c.current_frame(), c.current_frame_in(&doc), c.explicit_jump_pending);
-        let b1 = c.skip_base_frame(doc.total_frames());
-        eprintln!("base1={}", b1);
-        c.skip(&doc, 1);
-        eprintln!("skip+1b: stored={} in={}", c.current_frame(), c.current_frame_in(&doc));
-        let b2 = c.skip_base_frame(doc.total_frames());
-        eprintln!("base2={} commit_at_age_ms={:.1}", b2, c.last_commit_at.elapsed().as_secs_f64()*1000.0);
-        c.skip(&doc, -1);
-        eprintln!("skip-1b: stored={} in={}", c.current_frame(), c.current_frame_in(&doc));
+        // shown2 - one 1 s step = 300 frames (or 0 once the landing spot
+        // falls below the file start — the clamp into [0, EOF] owns the
+        // final shave, never the base). The session is [100, EOF]: with a
+        // fresh ceiling reading the honest landing sits INSIDE the range at
+        // ~300, so no clamp may shave it (regression "left: 100, right:
+        // 300": clamping the base to the half-open ceiling `end - 1` moved
+        // the whole jump and landed a step short of what was displayed).
+        let landed = c.current_frame();
+        assert_eq!(landed, shown2.saturating_sub(1000));
+        assert_eq!(c.current_frame_in(&doc), landed);
     }
 
     #[test]
