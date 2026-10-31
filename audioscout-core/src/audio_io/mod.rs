@@ -34,12 +34,31 @@ pub trait PcmFile {
 
 pub fn load_audio(path: &Path) -> Result<(Vec<f32>, u32, u16, SampleType)> {
     let ext = path.extension().and_then(|e| e.to_str()).map(|e| e.to_lowercase()).unwrap_or_default();
+    // Formats symphonia cannot decode at all (tz §2.4): straight to the
+    // external-ffmpeg fallback → cached session-temp WAV → hound read.
+    if matches!(ext.as_str(), "wma" | "wv") {
+        return load_via_ffmpeg(path);
+    }
     match ext.as_str() {
         "wav" => wav::WavFile::load(path),
         "aiff" | "aif" => aiff::AiffFile::load(path),
         "caf" => caf::CafFile::load(path),
-        _ => load_with_symphonia(path),
+        _ => match load_with_symphonia(path) {
+            // Native chain failed — last resort is ffmpeg (§2.4:
+            // native → temp-WAV → reload).
+            Err(_) if ffmpeg::ffmpeg_available() => load_via_ffmpeg(path),
+            other => other,
+        },
     }
+}
+
+/// ffmpeg-fallback chain: decode into the session temp cache (`pcm_f32le`,
+/// source sample rate untouched) and reload the resulting WAV natively.
+fn load_via_ffmpeg(path: &Path) -> Result<(Vec<f32>, u32, u16, SampleType)> {
+    let tmp = ffmpeg::decode_to_temp_wav(path)?;
+    // pcm_f32le output always round-trips through the WAV reader; whatever
+    // exotic sub-chunking survives, hound reports the concrete type.
+    wav::WavFile::load(&tmp)
 }
 
 /// Per-channel min/max envelope reduced directly from the decoder output.
@@ -308,8 +327,22 @@ pub fn probe_file(path: &Path) -> AudioMeta {
         meta
     } else {
         let ext = path.extension().and_then(|e| e.to_str()).map(|e| e.to_lowercase()).unwrap_or_default();
-        let status = match ext.as_str() { "wma" | "wv" => ProbeStatus::Unavailable, _ => ProbeStatus::Broken };
-        AudioMeta { duration_secs: 0.0, sample_rate: 0, channels: 0, sample_type: SampleType::Compressed, comment: None, status }
+        // wma/wv are technically fine — they simply need the external ffmpeg
+        // decoder (§2.3). With ffprobe present we can still show duration,
+        // rate and tags even when decoding is impossible, so the row renders
+        // as Unavailable (neutral colour, load/playback blocked) instead of
+        // Broken.
+        if matches!(ext.as_str(), "wma" | "wv") {
+            match ffmpeg::ffprobe_meta(path) {
+                Ok(Some(mut meta)) => {
+                    meta.status = ProbeStatus::Unavailable;
+                    meta
+                }
+                _ => AudioMeta { duration_secs: 0.0, sample_rate: 0, channels: 0, sample_type: SampleType::Compressed, comment: None, status: ProbeStatus::Unavailable },
+            }
+        } else {
+            AudioMeta { duration_secs: 0.0, sample_rate: 0, channels: 0, sample_type: SampleType::Compressed, comment: None, status: ProbeStatus::Broken }
+        }
     };
 
     // Always try to extract comments via lofty (works for all formats)
@@ -377,7 +410,7 @@ fn probe_with_lofty(path: &Path) -> Result<AudioMeta> {
 
 /// Extract comment/description from audio file tags
 /// Supports: WAV (ICMT), FLAC (DESCRIPTION), ID3 (COMM), etc.
-fn extract_comment(tagged_file: &lofty::file::TaggedFile) -> Option<String> {
+pub(crate) fn extract_comment(tagged_file: &lofty::file::TaggedFile) -> Option<String> {
     use lofty::file::TaggedFileExt;
     use lofty::tag::{Accessor, ItemKey, ItemValue};
 

@@ -63,14 +63,48 @@ pub fn load_audio_envelope(
         .unwrap_or_default();
     let (mut env, sr) = match ext.as_str() {
         "wav" => envelope_from_hound(path, target, budget)?,
+        // WMA/WV (and anything else symphonia rejects): decode through the
+        // external ffmpeg fallback straight into memory (`-f f32le -` pipe,
+        // no temp file) and fold the min/max envelope from the PCM stream.
+        // Without ffmpeg this returns an error and the preview worker keeps
+        // the row's Unavailable placeholder (§2.3 — not broken).
+        "wma" | "wv" => envelope_from_ffmpeg(path, target)?,
         // MP4/M4A: symphonia's seek targets land outside the mdat payload,
         // so the seek-sampled plan decodes nothing. A full sequential pass is
         // the only way to cover the whole file here.
         "mp4" | "m4a" | "m4b" | "aac" => envelope_sequential_full(path, target, 2)?,
-        _ => envelope_seek_sampled(path, target, budget)?,
+        _ => match envelope_seek_sampled(path, target, budget) {
+            Ok(pair) => pair,
+            // Native demux failed on an unknown extension — retry via ffmpeg.
+            Err(e) if super::ffmpeg::ffmpeg_available() => {
+                tracing::debug!("envelope: native decode failed ({e}), trying ffmpeg for {path:?}");
+                envelope_from_ffmpeg(path, target)?
+            }
+            Err(e) => return Err(e),
+        },
     };
     pad_envelope_to(&mut env, target);
     Ok((env, sr))
+}
+
+/// Envelope via the external-ffmpeg fallback (tz §2.4).
+///
+/// Decodes the whole file to interleaved f32 through a raw pipe and folds it
+/// into `target` evenly sized blocks — same peak semantics as every other
+/// path, one ffmpeg spawn, no intermediate file.
+fn envelope_from_ffmpeg(path: &Path, target: usize) -> Result<(super::Envelope, u32)> {
+    let (samples, sr, channels) = super::ffmpeg::decode_to_pcm(path)?;
+    let ch = (channels.max(1) as usize).min(8);
+    let frames = samples.len() / ch;
+    // Block size chosen so the pass emits ~exactly `target` points.
+    let block_frames = ((frames / target).max(1)).min(frames.max(1));
+    let mut acc = super::EnvAccum::new(ch, block_frames);
+    const CHUNK_FRAMES: usize = 65536;
+    for chunk in samples.chunks(CHUNK_FRAMES * ch) {
+        acc.push(chunk);
+    }
+    acc.finish();
+    Ok((acc.into_envelope(), sr))
 }
 
 /// Pads the envelope with flat (silent) points up to exactly `target` frames.
