@@ -841,11 +841,29 @@ impl Controller {
         // anchors of the books consistent).
         self.explicit_jump_pending = false;
         let now = std::time::Instant::now();
-        self.session_clock_at = now;
-        self.clock_base_at = now;
-        self.last_commit_at = now;
+        // THE SPAN THIS COMMIT PAID: from the previous commit's virtual
+        // span end to NOW — never from the bare commit instant. A mover
+        // quantum parks its anchors a sub-frame remainder in the PAST
+        // (remainder back-dating), so measuring the catch-up from
+        // `last_commit_at` would re-pay that remainder on every press and
+        // hand the following projection lead nobody has lived yet. The
+        // display books must be rewound with the SAME model `tick` uses
+        // when it commits a quantum: everything up to the paid frontier is
+        // stored verbatim now, so the frontier may not sit beyond it (a
+        // stale pre-teleport frontier used to donate wall time that
+        // elapsed BEFORE an explicit jump to the next press's base —
+        // regression "left: 100, right: 300": after a forward press parked
+        // the cursor at EOF, the backward press inherited ~1000 frames of
+        // phantom lead and landed on the session start instead of one step
+        // below the visible cursor).
+        let sr_f = self.played_sr.max(1) as f64;
+        let delta_secs = (shown - self.last_commit_frame.min(shown)) as f64 / sr_f;
+        let commit_end = now - std::time::Duration::from_secs_f64(delta_secs.max(0.0));
+        self.session_clock_at = commit_end;
+        self.clock_base_at = commit_end;
+        self.last_commit_at = commit_end;
         self.subframe_carry_secs = 0.0;
-        self.repark_display_frontier(now);
+        self.repark_display_frontier(commit_end);
         shown
     }
 
@@ -1483,18 +1501,25 @@ mod tests {
         // that painted), so no real-time wait may slip in between the press
         // and the read; after the window ages out the running display falls
         // back to the half-open ceiling `end - 1` like any ordinary paint.
+        // CADENCE (§1.2): production presses on the same poll beat that
+        // painted the cursor — take the pinned reading and press without
+        // letting the freshness window age out between the two.
         let shown2 = c.current_frame_in(&doc);
         assert!(shown2 >= doc.total_frames().saturating_sub(1));
+        // THE PRESS IS RELATIVE TO `shown2` — NOT to the bare stored
+        // commit. The forward press parked the cursor at the exclusive
+        // ceiling EOF; while that commit is younger than one poll interval
+        // the display shows it VERBATIM (the user sees 1000), but the raw
+        // half-open projection tops out at `end - 1`. Measuring the step
+        // off the bare commit instead of the visible screen used to land
+        // every backward press a frame away from what was just painted
+        // (regression "left: 999, right: 1000" / "left: 100, right: 300").
         c.skip(&doc, -1);
-        // shown2 - one 1 s step = 300 frames (or 0 once the landing spot
-        // falls below the file start — the clamp into [0, EOF] owns the
-        // final shave, never the base). The session is [100, EOF]: with a
-        // fresh ceiling reading the honest landing sits INSIDE the range at
-        // ~300, so no clamp may shave it (regression "left: 100, right:
-        // 300": clamping the base to the half-open ceiling `end - 1` moved
-        // the whole jump and landed a step short of what was displayed).
+        // shown2 - one 1 s step. The session is [100, EOF] — the honest
+        // landing sits INSIDE the range, so no clamp may shave it beyond
+        // the relative maths itself.
         let landed = c.current_frame();
-        assert_eq!(landed, shown2.saturating_sub(1000));
+        assert_eq!(landed, shown2.saturating_sub(1000).max(c.start_frame()));
         assert_eq!(c.current_frame_in(&doc), landed);
     }
 
