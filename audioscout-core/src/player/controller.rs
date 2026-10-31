@@ -1082,34 +1082,8 @@ impl Controller {
         // pass here.
         self.position_at(doc.total_frames())
     }
-    /// Test-only: the DISPLAYED position as the production projection would
-    /// show it AT the given instant (no frontier bookkeeping touched). Lets
-    /// a wall-clock cadence test compare like with like: the reading is
-    /// taken at exactly the timestamp whose span the assertion measures
-    /// against, so open poll-interval lead of later microseconds cannot
-    /// skew the check.
-    #[cfg(test)]
-    fn display_snapshot_at(&self, at: std::time::Instant) -> u64 {
-        if self.state != TransportState::Playing {
-            return self.current_frame;
-        }
-        let sr = self.played_sr.max(1) as f64;
-        // Same mover-alive rule as `extrapolation_lead_frames`, evaluated
-        // at `at` instead of NOW.
-        const NOMINAL_POLL_SECS: f64 = 0.05;
-        const POLL_GRACE_SECS: f64 = 0.02;
-        let mover_alive = self
-            .last_tick_at
-            .map(|t| at.duration_since(t).as_secs_f64() <= NOMINAL_POLL_SECS + POLL_GRACE_SECS)
-            .unwrap_or(false);
-        let span = if mover_alive {
-            self.poll_span_secs(at)
-        } else {
-            at.duration_since(self.last_commit_at).as_secs_f64().max(0.0)
-        };
-        self.current_frame.saturating_add((span * sr) as u64)
-    }
-        /// Elapsed time in seconds as displayed — same projection layer as
+
+    /// Elapsed time in seconds as displayed — same projection layer as
     /// `current_frame_in`, expressed in seconds at `sample_rate`.
     pub fn current_secs(&self, sample_rate: u32) -> f64 {
         let pos = self.position_at(u64::MAX);
