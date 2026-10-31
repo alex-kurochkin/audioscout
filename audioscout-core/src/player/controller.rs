@@ -120,6 +120,19 @@ pub struct Controller {
     /// ("pos=8 wall=4" on short loops polled every few ms). Reset by every
     /// explicit commit (`seek`/`skip`) — nothing carries across a teleport.
     subframe_carry_secs: f64,
+    /// The virtual end of the span the LAST commit paid for (the same
+    /// instant `repark_display_frontier` receives from every mover): NOW
+    /// for an explicit teleport, the remainder-back-dated span end for a
+    /// fallback-clock quantum. The display frontier (`last_display_at`)
+    /// measures shown lead on top of THIS instant while it still belongs
+    /// to the current books — it is what separates "the seed interval of a
+    /// fresh jump nobody has lived yet" from "wall time after the previous
+    /// quantum's paid span that the screen genuinely showed". A rewind of
+    /// the frontier across an explicit teleport therefore cannot erase
+    /// already-shown lead ("left: 100, right: 300"), and a pre-jump
+    /// frontier can never donate phantom stretch to the next press
+    /// ("left: 0, right: 100").
+    last_span_end_at: std::cell::Cell<std::time::Instant>,
 }
 
 impl Controller {
@@ -144,6 +157,7 @@ impl Controller {
             last_commit_at: std::time::Instant::now(),
             last_commit_frame: 0,
             last_display_at: std::cell::Cell::new(std::time::Instant::now()),
+            last_span_end_at: std::cell::Cell::new(std::time::Instant::now()),
             explicit_jump_pending: false,
             subframe_carry_secs: 0.0,
         }
@@ -157,9 +171,26 @@ impl Controller {
     /// leftover used to donate lead time across explicit seeks and make a
     /// backward `skip` land a step short of where the user saw the cursor).
     fn repark_display_frontier(&mut self, commit_end: std::time::Instant) {
-        self.last_display_at.set(commit_end);
+        // Remember the virtual end of THIS commit's paid span: an explicit
+        // teleport parks it at NOW (nothing of the new span was lived
+        // before the jump landed), a mover quantum passes its remainder-
+        // back-dated span end. The display frontier may only be rewound to
+        // where the OLD books ended — never below what the screen has
+        // genuinely shown ("left: 100, right: 300").
+        let prev_span_end = self.last_span_end_at.get();
+        self.last_span_end_at.set(commit_end);
+        if commit_end >= self.last_display_at.get() || self.last_display_at.get() <= prev_span_end {
+            // Either nothing was displayed beyond this commit's span end,
+            // or the frontier belongs entirely to the books this commit
+            // replaces outright (a plain teleport): move it along.
+            self.last_display_at.set(commit_end);
+        }
+        // Otherwise the frontier carries SHOWN lead of the previous span
+        // (e.g. a getter read registered time beyond a quantum's own
+        // remainder back-dating): keep it — rewinding would hand already-
+        // displayed wall time back to the next press and land a backward
+        // `skip` a step away from the visible cursor.
     }
-
     pub fn state(&self) -> TransportState {
         self.state
     }
@@ -762,18 +793,33 @@ impl Controller {
             } else {
                 // A LIVE poll loop: the visible cursor is the committed
                 // quantum plus whatever the display has ACTUALLY SHOWN on
-                // screen since (`last_display_at`, advanced by every getter
-                // read in wall time and parked at each commit). Never the
-                // full open-interval projection: microseconds after a
-                // teleport it still carries a nominal seed interval nobody
-                // has lived, and handing that phantom lead to the press
-                // lands a step off the visible cursor ("left: 0,
-                // right: 100", "left: 100, right: 0"). Never the bare
-                // commit either — shown frames must be part of the base
-                // ("left: 100, right: 300").
+                // screen since. The shown stretch rides on top of the
+                // virtual end of the CURRENT commit — `last_commit_at` for
+                // an explicit teleport (nothing of the new span was lived
+                // before it landed), or the back-dated frontier for a mover
+                // quantum whose remainder still belongs to the books. The
+                // frontier itself can sit BEFORE that span end while the
+                // seed interval of a fresh jump has not been lived yet, so
+                // the measurement starts at the later of the two: taking
+                // the bare frontier would credit pre-jump wall time to the
+                // next press and land it a step away from the visible
+                // cursor ("left: 100, right: 300"). Never the full open-
+                // interval projection either: microseconds after a teleport
+                // it carries a nominal seed interval nobody has lived
+                // ("left: 0, right: 100", "left: 100, right: 0"). And never
+                // the bare commit — shown frames must be part of the base.
                 let sr = self.played_sr.max(1) as f64;
+                // Shown lead rides on top of the frontier when it carries
+                // genuinely displayed time beyond the current commit's
+                // span end; otherwise (fresh teleport whose seed interval
+                // nobody has lived) the measurement starts at the span end
+                // itself — pre-jump wall time must never be credited to
+                // the press ("left: 0, right: 100").
+                let span_end = self.last_span_end_at.get();
+                let frontier = self.last_display_at.get();
+                let origin = if frontier > span_end { frontier } else { span_end };
                 let shown_ahead_secs = std::time::Instant::now()
-                    .duration_since(self.last_display_at.get().max(self.last_commit_at))
+                    .duration_since(origin)
                     .as_secs_f64()
                     .max(0.0);
                 let shown_lead = (shown_ahead_secs * sr) as u64;
@@ -1400,6 +1446,31 @@ mod tests {
     }
 
     #[test]
+    fn trace_skip_base() {
+        let (mut c, doc) = controller_with_doc(1000, 1);
+        c.seek(100, &doc, CursorSource::User);
+        c.play(&doc, None);
+        c.set_skip_seconds(1);
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        c.tick(std::time::Duration::from_millis(50), &doc);
+        eprintln!("t0 after tick: stored={} in={}", c.current_frame(), c.current_frame_in(&doc));
+        c.skip(&doc, 1);
+        eprintln!("skip+1: stored={} in={}", c.current_frame(), c.current_frame_in(&doc));
+        c.skip(&doc, -2);
+        eprintln!("skip-2: stored={} in={} start={}", c.current_frame(), c.current_frame_in(&doc), c.start_frame());
+        c.seek(300, &doc, CursorSource::User);
+        eprintln!("seek300: stored={} in={} pending={}", c.current_frame(), c.current_frame_in(&doc), c.explicit_jump_pending);
+        let b1 = c.skip_base_frame(doc.total_frames());
+        eprintln!("base1={}", b1);
+        c.skip(&doc, 1);
+        eprintln!("skip+1b: stored={} in={}", c.current_frame(), c.current_frame_in(&doc));
+        let b2 = c.skip_base_frame(doc.total_frames());
+        eprintln!("base2={} commit_at_age_ms={:.1}", b2, c.last_commit_at.elapsed().as_secs_f64()*1000.0);
+        c.skip(&doc, -1);
+        eprintln!("skip-1b: stored={} in={}", c.current_frame(), c.current_frame_in(&doc));
+    }
+
+    #[test]
     fn volume_is_live_and_clamped() {
         let (mut c, _doc) = controller_with_doc(1000, 1);
         c.set_volume(2.0);
@@ -1571,53 +1642,5 @@ mod tests {
         assert_eq!(capped, 199, "estimate over-ran the short session end: {capped}");
         let secs = c.current_secs(doc.sample_rate);
         assert!(secs <= 0.2 + 1e-9, "current_secs exceeded duration: {secs}");
-    }
-}
-
-#[cfg(test)]
-mod skip_base_debug {
-    use super::*;
-    use crate::player::{CursorSource, PlayheadState};
-    use crate::{Document, SampleType};
-    use std::path::PathBuf;
-
-    fn controller_with_doc(frames: usize, channels: u16) -> (Controller, Document) {
-        let doc = Document {
-            samples: vec![0.25f32; frames * channels as usize],
-            sample_rate: 1000,
-            channels,
-            markers: Vec::new(),
-            source_path: PathBuf::from("test.wav"),
-            temp_path: None,
-            dirty: false,
-            sample_type: SampleType::Float32,
-        };
-        let c = Controller::new(std::sync::Arc::new(PlayheadState::new()));
-        (c, doc)
-    }
-
-    #[test]
-    fn trace_skip_base() {
-        let (mut c, doc) = controller_with_doc(1000, 1);
-        c.seek(100, &doc, CursorSource::User);
-        c.play(&doc, None);
-        c.set_skip_seconds(1);
-        std::thread::sleep(std::time::Duration::from_millis(50));
-        c.tick(std::time::Duration::from_millis(50), &doc);
-        eprintln!("after tick: stored={} in={}", c.current_frame(), c.current_frame_in(&doc));
-        c.skip(&doc, 1);
-        eprintln!("skip(+1): stored={} in={}", c.current_frame(), c.current_frame_in(&doc));
-        c.skip(&doc, -2);
-        eprintln!("skip(-2): stored={} in={} start={}", c.current_frame(), c.current_frame_in(&doc), c.start_frame());
-        c.seek(300, &doc, CursorSource::User);
-        eprintln!("seek(300): stored={} in={}", c.current_frame(), c.current_frame_in(&doc));
-        let base = c.skip_base_frame(doc.total_frames());
-        eprintln!("base dbg: {} explicit_jump_pending={} last_tick_delta={}", base, c.explicit_jump_pending, c.last_tick_delta_frames);
-        c.skip(&doc, 1);
-        eprintln!("skip(+1): stored={} in={}", c.current_frame(), c.current_frame_in(&doc));
-        let base2 = c.skip_base_frame(doc.total_frames());
-        eprintln!("base2 dbg: {}", base2);
-        c.skip(&doc, -1);
-        eprintln!("skip(-1): stored={} in={}", c.current_frame(), c.current_frame_in(&doc));
     }
 }
