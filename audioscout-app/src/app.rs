@@ -2664,8 +2664,24 @@ impl eframe::App for AudioScoutApp {
                         ui.label(egui::RichText::new(text).strong());
                     };
 
+                    // Section frames must span the FULL window width (per
+                    // review): `ui.group()` shrinks its frame to the content
+                    // width, so each section's right edge sat at a different
+                    // distance from the window border.  egui 0.29's `Frame`
+                    // has no `min_size()`, but its painted rect is
+                    // `content.min_rect() + inner_margin` — so an invisible
+                    // zero-height strip that starts at the left edge and is
+                    // as wide as the available area forces every section
+                    // frame to the same full width (left and right insets
+                    // become identical), while height still hugs content.
+                    let section_frame = |ui: &mut egui::Ui| {
+                        let w = ui.available_width();
+                        ui.add_sized([w, 0.0], egui::Label::new("").selectable(false));
+                        egui::Frame::group(ui.style())
+                    };
+
                     // ---- Storage maintenance --------------------------------
-                    ui.group(|ui| {
+                    section_frame(ui).show(ui, |ui| {
                         header(ui, "Storage maintenance");
                         ui.horizontal(|ui| {
                             // Plain text labels only — no icons (per review).
@@ -2676,7 +2692,7 @@ impl eframe::App for AudioScoutApp {
                     });
 
                     // ---- Undo history ----------------------------------------
-                    ui.group(|ui| {
+                    section_frame(ui).show(ui, |ui| {
                         header(ui, "Undo history");
                         ui.horizontal(|ui| {
                             ui.label("History depth (steps):");
@@ -2731,7 +2747,7 @@ impl eframe::App for AudioScoutApp {
                     });
 
                     // ---- Behaviour and appearance ----------------------------
-                    ui.group(|ui| {
+                    section_frame(ui).show(ui, |ui| {
                         header(ui, "Behavior and appearance");
                         ui.horizontal(|ui| {
                             ui.label("Preview prefetch count:");
@@ -2788,18 +2804,22 @@ impl eframe::App for AudioScoutApp {
                     });
 
                     // ---- Hotkeys ----------------------------------------------
-                    ui.group(|ui| {
+                    section_frame(ui).show(ui, |ui| {
                         header(ui, "Hotkeys (click a shortcut to reassign)");
                         // Two-column table: Action | Shortcut.  The rows live
                         // in a vertical ScrollArea — mouse wheel and the
                         // slider on the right both scroll through it (§ tz).
                         let avail = ui.available_width();
                         let action_col = 240.0;
+                        // Shortcut column fills the rest of the section width
+                        // so the table (and its right edge / scrollbar) spans
+                        // the frame uniformly (per review).
                         let shortcut_col = (avail - action_col - 22.0).max(80.0);
                         egui::Grid::new("hotkey_table")
                             .num_columns(2)
                             .striped(true)
                             .min_col_width(action_col)
+                            .max_col_width(shortcut_col)
                             .show(ui, |ui| {
                                 ui.label(egui::RichText::new("Action").strong());
                                 ui.label(egui::RichText::new("Shortcut").strong());
