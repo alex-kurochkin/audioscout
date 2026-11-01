@@ -21,33 +21,43 @@ use image::GenericImageView;
 // Panel layout constants (§ UI panels)
 // ---------------------------------------------------------------------------
 // Heights of the fixed docked panels. `default_height()` alone is NOT enough
-// to make a code change take effect: egui caches every panel's measured size
-// in `egui::Memory` keyed by the panel id, so the cached value keeps winning
-// over the newly compiled-in `default_height` (this is exactly why editing
-// `default_height(20.0)` -> `default_height(200.0)` did nothing at runtime).
-// To guarantee that editing a constant below and rebuilding actually changes
-// the rendered height, each panel id embeds its configured height
-// (`panel_id_with_height`). Changing a constant therefore produces a brand-new
-// id -> a fresh entry in `Memory` -> the new default is applied on first show.
-// `PANEL_LAYOUT_ID` additionally stamps the whole layout with the exact set of
-// heights; whenever that stamp differs from the one saved at app construction
-// time, ALL panel size caches are wiped once — belt-and-braces so even panels
-// whose id scheme ever changes are guaranteed to pick up the new constants.
+// to make a code change take effect: egui caches every panel's measured rect
+// in `Memory` under the panel id (`PanelState::load`, see egui-0.29
+// containers/panel.rs), and the cached value wins over the newly compiled-in
+// default — this is exactly why editing `default_height(20.0)` into
+// `default_height(200.0)` changed nothing at runtime.
+// Two independent mechanisms make a rebuild-with-new-constant GUARANTEED to
+// change the rendered height:
+//  1. Layout fingerprint (`PANEL_LAYOUT_ID`): stamped at app construction;
+//     when a rebuilt binary carries different constants, the fingerprint
+//     mismatches and ALL cached `PanelState` entries are purged once, on the
+//     very first frame — before any panel is shown (see
+//     `purge_panel_size_caches`). The panels then behave like a first run and
+//     adopt the fresh defaults. This mechanism alone already guarantees the
+//     behaviour for *any* id scheme.
+//  2. Height-versioned ids (`panel_id_with_height`): changing a constant also
+//     produces a brand-new panel id, so egui finds no stored `PanelState` for
+//     it even if some cache entry survived the purge. NOTE: an id change also
+//     resets each panel's internal widget state (scroll offsets, open
+//     popups...), because those are keyed by the panel id — which is fine
+//     here: it only ever happens across rebuilds with edited constants.
+//     The version suffix uses the raw bit pattern (`to_bits`) so it round-
+//     trips exactly ("player@0x42a00000" style).
 const TOOLBAR_HEIGHT: f32 = 40.0;
 const AUDIO_VIEW_HEIGHT: f32 = 200.0;
 const PLAYER_HEIGHT: f32 = 80.0;
 const ACTIONS_HEIGHT: f32 = 40.0;
 const STATUS_HEIGHT: f32 = 20.0;
 
-/// Build a stable-but-versioned panel id: `"player@80"` style. Any change to
-/// the height constant yields a different id, invalidating egui's cached size.
+/// Build a stable-but-versioned panel id. Any change to the height constant
+/// yields a different id, which invalidates egui's cached `PanelState`.
 fn panel_id_with_height(name: &str, h: f32) -> String {
-    format!("{name}@{h}")
+    format!("{name}@{:#x}", h.to_bits())
 }
 
 /// Aggregate fingerprint of every panel height constant. Stored at startup;
 /// if a rebuilt binary has different constants, the fingerprint changes and
-/// the stale per-panel size caches get cleared exactly once.
+/// the stale per-panel size caches get purged exactly once.
 const PANEL_LAYOUT_ID: u64 = {
     // deterministic mix of the five heights (bit patterns of f32 constants)
     let mut hash: u64 = 0xcbf29ce484222325; // FNV-1a offset basis
@@ -72,6 +82,26 @@ const PANEL_LAYOUT_ID: u64 = {
     }
     hash
 };
+
+/// Drop every cached `PanelState` — the struct egui's `TopBottomPanel` stores
+/// under the panel id to remember last frame's rect (`PanelState::store`,
+/// egui-0.29 containers/panel.rs). Two facts about that store drive this
+/// implementation:
+///  * entries are inserted with `insert_persisted`, i.e. they survive across
+///    runs via eframe's persistence — so wiping them must happen at runtime,
+///    not just rely on a fresh process;
+///  * the map key is `TypeId ^ id`, so entries can be deleted *by type*
+///    without knowing the panel ids: `remove_by_type::<PanelState>()` removes
+///    exactly the panel-size cache and touches nothing else (focus, popups,
+///    window geometry all stay intact — unlike a full memory reset, which
+///    egui 0.29 does not even expose publicly: `Memory` has no `clear()`).
+/// Must be called BEFORE any panel is shown in the frame, so the panels read
+/// "no stored state" and fall back to the freshly compiled-in heights.
+fn purge_panel_size_caches(ctx: &egui::Context) {
+    ctx.data_mut(|d| {
+        d.remove_by_type::<egui::containers::panel::PanelState>();
+    });
+}
 
 /// Main application state
 pub struct AudioScoutApp {
@@ -1388,7 +1418,9 @@ impl eframe::App for AudioScoutApp {
         // makes the guarantee independent of the id scheme.
         if self.panel_layout_id != PANEL_LAYOUT_ID {
             self.panel_layout_id = PANEL_LAYOUT_ID;
-            ctx.memory_mut(|m| m.clear());
+            // Rebuilt binary with new height constants: purge the stale
+            // cached panel sizes once so the new defaults take effect.
+            purge_panel_size_caches(ctx);
         }
 
         // Meter decay when nothing new arrives (pause/stop): exponential-ish
