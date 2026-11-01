@@ -1710,6 +1710,16 @@ impl AudioScoutApp {
 
 impl eframe::App for AudioScoutApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Window title: "AudioScout - <loaded file name>". The title follows
+        // the file currently loaded into the player (document.source_path);
+        // when nothing is loaded only the app name is shown. Updated every
+        // frame — egui applies it only if the string actually changed.
+        let window_title = match self.document.source_path.file_name() {
+            Some(name) => format!("AudioScout - {}", name.to_string_lossy()),
+            None => "AudioScout".to_string(),
+        };
+        ctx.send_viewport_cmd(egui::ViewportCommand::Title(window_title));
+
         // Panel-height constants changed since this Memory was populated
         // (e.g. a rebuilt binary after editing TOOLBAR_HEIGHT/...): wipe all
         // cached per-panel sizes once so the new `default_height`s apply.
