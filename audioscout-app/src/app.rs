@@ -182,6 +182,53 @@ fn purge_panel_size_caches(ctx: &egui::Context) {
 }
 
 /// Main application state
+
+/// One frame of raw pointer information for the manual column-drag state
+/// machine (`handle_column_drag`). Snapshotting the input ourselves instead
+/// of relying on `ctx.input()` is deliberate: egui *takes* pointer events
+/// (`PointerEvent::take()`) while panels are laid out, so by the time a
+/// frame is over the press/release transitions are already consumed and
+/// would read as `false` in any post-panel resolver.
+#[derive(Clone, Copy)]
+struct PtrFrame {
+    down: bool,
+    pos: Option<egui::Pos2>,
+}
+
+/// A header cell that was pressed this frame — a drag candidate. Recorded by
+/// the table header widgets (x-range = exact cell rect) and consumed by the
+/// resolver at the end of the frame.
+#[derive(Clone)]
+struct ColPress {
+    key: String,
+    x0: f32,
+    x1: f32,
+    start: Option<egui::Pos2>,
+}
+
+/// Live column-drag state, owned by `AudioScoutApp`. Created on every press
+/// over a header cell; becomes an ACTIVE drag once the pointer moves past
+/// `DRAG_THRESHOLD` from the press position. On release an active drag
+/// reorders columns; an inactive one was just a click.
+pub struct ColDrag {
+    /// Key of the column being dragged.
+    src: String,
+    /// The press that armed this drag (start position + source cell range).
+    press: ColPress,
+    /// x-ranges of ALL visible header cells, frozen at mousedown (see
+    /// `header_cells_snapshot`).
+    cells: Vec<(String, f32, f32)>,
+    /// True once the pointer moved far enough — distinguishes drags from
+    /// plain clicks.
+    active: bool,
+}
+
+/// Id under which header cell #`ci` reports its exact rect during the frame's
+/// layout pass (read back by `header_cells_snapshot`).
+fn hdr_cell_id(ci: usize) -> egui::Id {
+    egui::Id::new(("hdr_cell", ci))
+}
+
 pub struct AudioScoutApp {
     config_store: ConfigStore,
     db: Database,
@@ -338,6 +385,14 @@ pub struct AudioScoutApp {
     /// `Memory` was built with, all cached panel sizes are wiped once so the
     /// new `default_height`s take effect — guarantees rebuild -> visible change.
     panel_layout_id: u64,
+    /// Manual column-drag state machine (header reorder by mouse). Ring of
+    /// per-frame raw pointer snapshots + live drag info; see
+    /// `handle_column_drag`.
+    col_presses: HashMap<egui::Id, ColPress>,
+    col_drag: Option<ColDrag>,
+    /// Frame index of the release that ended a column drag; clicks reported
+    /// by header widgets on that frame are ignored (reorder ≠ re-sort).
+    col_suppress_click_frame: u64,
 }
 
 impl AudioScoutApp {
@@ -448,6 +503,9 @@ impl AudioScoutApp {
             audio_view_rect: None,
             last_wheel_apply: 0.0,
             panel_layout_id: PANEL_LAYOUT_ID,
+            col_presses: HashMap::new(),
+            col_drag: None,
+            col_suppress_click_frame: 0,
         };
 
         // Restore the two independent Waveform/Spectrogram toggles from the
@@ -1556,6 +1614,196 @@ impl AudioScoutApp {
         }
     }
 
+    /// Manual column-drag state machine for the file-table header.
+    ///
+    /// Why hand-rolled: egui's built-in drag responses (`drag_started`,
+    /// `drag_stopped`) are tied to the widget's own click-id and stop being
+    /// reported once the pointer leaves that widget — releasing a header
+    /// title over ANOTHER header therefore never produced a drop, and the
+    /// titles felt impossible to grab. This resolver works purely on raw
+    /// pointer geometry: press inside a header cell arms a candidate, the
+    /// first movement past a small threshold starts the real drag, and the
+    /// release resolves against the header-cell x-ranges frozen at
+    /// mousedown — no matter which widget "owns" the pointer afterwards.
+    ///
+    /// Press/release transitions are read from THIS frame's raw event list
+    /// (`i.events`): egui consumes them with `PointerEvent::take()` while
+    /// panels lay out, so by end of frame `pointer.button(...)`/
+    /// `any_click()` would all report `false`. The event list itself is not
+    /// taken, so it stays readable after all panels have run.
+    fn handle_column_drag(&mut self, ctx: &egui::Context) {
+        const DRAG_THRESHOLD: f32 = 4.0;
+
+        // --- This frame's primary-pointer transition + live position.
+        let mut transition: Option<(egui::Pos2, bool)> = None; // (pos, pressed)
+        let cur = ctx.input(|i| {
+            for e in i.events.iter().rev() {
+                if let egui::Event::PointerButton { pos, button, pressed, .. } = e {
+                    if *button == egui::PointerButton::Primary {
+                        return PtrFrame { down: *pressed, pos: Some(*pos) };
+                    }
+                }
+            }
+            PtrFrame {
+                down: i.pointer.button_down(egui::PointerButton::Primary),
+                pos: i.pointer.interact_pos(),
+            }
+        });
+        if let Some(p) = cur.pos {
+            transition = Some((p, cur.down));
+        }
+        let pressed_now = matches!(transition, Some((_, true)));
+        let released_now = matches!(transition, Some((_, false)));
+        let frame_id = ctx.frame_index() as u64;
+
+        // --- Drag candidates armed by the header widgets this frame. A
+        // candidate lives exactly one frame; stale ones must never start a
+        // drag later, so they are dropped unconditionally.
+        let candidate: Option<ColPress> = if pressed_now {
+            let keys: Vec<egui::Id> = self.col_presses.keys().copied().collect();
+            let mut first = None;
+            for k in keys {
+                if let Some(p) = self.col_presses.remove(&k) {
+                    if first.is_none() {
+                        first = Some(p);
+                    }
+                }
+            }
+            first
+        } else {
+            self.col_presses.clear();
+            None
+        };
+
+        if let Some(p) = candidate {
+            // A fresh press always replaces any lingering drag. Freeze the
+            // FULL header geometry now (exact rects of every header cell
+            // were recorded during this frame's layout pass).
+            let cells = self.header_cells_snapshot(ctx);
+            self.col_drag = Some(ColDrag {
+                src: p.key.clone(),
+                press: p,
+                cells,
+                active: false,
+            });
+            ctx.request_repaint();
+            return;
+        }
+
+        // --- Mid-drag: promote the pending press into an active drag once
+        // the pointer has moved far enough from the press position.
+        if let Some(drag) = self.col_drag.as_mut() {
+            if !drag.active {
+                if let (Some(start), Some(pos)) = (drag.press.start, cur.pos) {
+                    if (pos - start).length() > DRAG_THRESHOLD {
+                        drag.active = true;
+                        ctx.request_repaint();
+                    }
+                }
+            }
+        }
+
+        // --- Release: resolve the drop or cancel the drag.
+        if !released_now {
+            return;
+        }
+        let Some(drag) = self.col_drag.take() else { return };
+        if !drag.active {
+            // Press + release without movement: a plain click. Sorting is
+            // handled by egui's `clicked()` response — nothing to do here.
+            return;
+        }
+        let pos = match transition {
+            Some((p, _)) => p,
+            None => match cur.pos {
+                Some(p) => p,
+                None => return,
+            },
+        };
+
+        // Find the target column under the release point.
+        let mut target: Option<(String, bool)> = None;
+        for (key, x0, x1) in &drag.cells {
+            if key == &drag.src {
+                continue;
+            }
+            if pos.x >= *x0 && pos.x <= *x1 {
+                target = Some((key.clone(), pos.x > (x0 + x1) / 2.0));
+                break;
+            }
+        }
+        if target.is_none() {
+            // Released outside every known cell: pick the nearest cell edge.
+            let mut best: Option<(f32, String, bool)> = None;
+            for (key, x0, x1) in &drag.cells {
+                if key == &drag.src {
+                    continue;
+                }
+                let d = if pos.x < *x0 {
+                    x0 - pos.x
+                } else if pos.x > *x1 {
+                    pos.x - x1
+                } else {
+                    0.0
+                };
+                let a = pos.x > (x0 + x1) / 2.0;
+                if best.as_ref().map_or(true, |(bd, _, _)| d < *bd) {
+                    best = Some((d, key.clone(), a));
+                }
+            }
+            target = best.map(|(_, k, a)| (k, a));
+        }
+
+        if let Some((tcol, after)) = target
+            .and_then(|(k, a)| Column::from_key(&k).map(|c| (c, a)))
+        {
+            let Some(scol) = Column::from_key(&drag.src) else { return };
+            if scol != tcol {
+                self.column_layout.move_column(&scol, &tcol, after);
+                // Persist the new order (same storage as the Columns-dialog
+                // selection — `columns.visible` doubles as display order).
+                let vis = self.column_layout.visible_keys();
+                let cc = &mut self.config_store.config_mut().columns;
+                cc.visible = Some(vis.clone());
+                cc.order = vis;
+                let _ = self.config_store.save();
+            }
+            // Remember the frame whose release ended the drag: the click
+            // egui may report for the source header that frame must be
+            // ignored (a completed reorder must never also re-sort).
+            self.col_suppress_click_frame = frame_id;
+            ctx.request_repaint();
+        }
+    }
+
+    /// Exact x-ranges of all visible header cells, collected by the table
+    /// header widgets DURING this frame's layout pass (each cell reports
+    /// its rect under a per-column id). Falls back to widths computed from
+    /// the layout constants when the report is missing (e.g. the panel was
+    /// not shown this frame), so a drop can always be resolved.
+    fn header_cells_snapshot(&self, ctx: &egui::Context) -> Vec<(String, f32, f32)> {
+        let mut cells: Vec<(usize, String, f32, f32)> = Vec::new();
+        for (ci, col) in self.column_layout.visible.iter().enumerate() {
+            let key = col.key().to_string();
+            if let Some(r) = ctx.data(|d| d.get_temp::<egui::Rect>(hdr_cell_id(ci))) {
+                cells.push((ci, key, r.left(), r.right()));
+            }
+        }
+        if cells.is_empty() {
+            // Fallback: reconstruct approximate ranges from widths.
+            let mut x = 8.0_f32;
+            let mut out = Vec::new();
+            for col in &self.column_layout.visible {
+                let w = self.column_layout.width(col);
+                out.push((col.key().to_string(), x, x + w));
+                x += w + 10.0; // grid spacing [10.0, 4.0]
+            }
+            return out;
+        }
+        cells.sort_by_key(|(ci, _, _, _)| *ci);
+        cells.into_iter().map(|(_, k, x0, x1)| (k, x0, x1)).collect()
+    }
+
     fn navigate_file(&mut self, direction: i32) {
         if self.file_rows.is_empty() { return; }
         let current_idx = self.selected_row.unwrap_or(0) as i32;
@@ -2547,13 +2795,9 @@ impl eframe::App for AudioScoutApp {
                 let sort_column = self.column_layout.sort_column;
                 let sort_ascending = self.column_layout.sort_ascending;
 
-                // Column drag-and-drop reorder state, read *before* the grid
-                // closure (which borrows `column_layout` immutably). The
-                // header titles act as both drag sources and drop targets:
-                // press a title, drag it over another title and release to
-                // move the dragged column before/after the hovered one
-                // (left/right half of the target decides the side).
-                let mut reorder_request: Option<(Column, Column, bool)> = None;
+                // Column drag-and-drop is resolved by `handle_column_drag`,
+                // run at the end of `update()` on raw pointer state — the
+                // header cells only arm a press candidate here.
 
                 // --- The files table: ONE grid whose FIRST ROW is the header
                 // and all following rows are data rows (scrollable). Because
@@ -2618,12 +2862,17 @@ impl eframe::App for AudioScoutApp {
                                 let col_copy = *col;
                                 let col_key = col.key();
 
-                                // Drag payload is read INSIDE the cell closure:
-                                // `drag_started()` only becomes true in the very
-                                // frame the drag begins, so the freshly stored
-                                // key must be re-read after storing it — a value
-                                // captured before the grid would always lag one
-                                // frame behind and the drop would never fire.
+                                // Column drag-and-drop (manual state machine,
+                                // see `handle_column_drag`, run at the end of
+                                // update()). The press here only ARMS a drag
+                                // candidate; the resolver turns it into a real
+                                // drag once the pointer moves. egui's own drag
+                                // responses (`drag_started/drag_stopped`)
+                                // proved useless for header-to-header drops —
+                                // they stop being reported once the pointer
+                                // leaves the source widget, so a release over
+                                // another header never fired a drop and titles
+                                // felt un-grabbable.
                                 draw_cell(ui, width, 24.0, |ui| {
                                     let response = if sortable {
                                         ui.add_sized(
@@ -2637,54 +2886,30 @@ impl eframe::App for AudioScoutApp {
                                         )
                                     };
 
-                                    // --- Drag source: press a header title
-                                    // and move the pointer away from it to
-                                    // start dragging this column. The payload
-                                    // lives in `ctx.data` under one well-known
-                                    // id (egui has no built-in DnD), so only
-                                    // one drag can be active at a time.
-                                    if response.drag_started() {
-                                        ctx.data_mut(|d| {
-                                            d.insert_temp(egui::Id::new("col_drag_src"), col_key.to_string())
-                                        });
+                                    // Every header cell reports its exact rect
+                                    // each frame (the drag resolver freezes the
+                                    // full header geometry from these on
+                                    // mousedown), and a press arms a candidate.
+                                    ctx.data_mut(|d| {
+                                        d.insert_temp(hdr_cell_id(ci), response.rect)
+                                    });
+                                    if response.is_pointer_button_down_on() {
+                                        self.col_presses.insert(
+                                            hdr_cell_id(ci),
+                                            ColPress {
+                                                key: col_key.to_string(),
+                                                x0: response.rect.left(),
+                                                x1: response.rect.right(),
+                                                start: ui.input(|i| i.pointer.interact_pos()),
+                                            },
+                                        );
                                     }
 
-                                    // Current drag payload (if any): the column
-                                    // key being dragged right now.
-                                    let src_key: Option<String> = ctx
-                                        .data(|d| d.get_temp::<String>(egui::Id::new("col_drag_src")));
-
-                                    // --- Drop target: while some column is
-                                    // being dragged, hovering ANOTHER title
-                                    // records a reorder request as soon as the
-                                    // button is released over it. Which half of
-                                    // the target cell the pointer is over
-                                    // decides before/after. (`drag_stopped()`
-                                    // fires on every widget whose drag ends
-                                    // this frame — here it means "released
-                                    // exactly over me", i.e. a drop.)
-                                    if let Some(src) = &src_key {
-                                        if *src != col_key && response.hovered() && response.drag_stopped() {
-                                            let after = ui.input(|i| {
-                                                i.pointer
-                                                    .interact_pos()
-                                                    .map_or(false, |p| p.x > response.rect.center().x)
-                                            });
-                                            if let Some(src_col) = Column::from_key(src) {
-                                                reorder_request = Some((src_col, col_copy, after));
-                                            }
-                                        }
-                                    }
-
-                                    // --- End of drag anywhere outside a valid
-                                    // drop: clear the payload so the next press
-                                    // starts a fresh drag. (`drag_stopped()` is
-                                    // reported by the SOURCE widget's response.)
-                                    if response.drag_stopped() {
-                                        ctx.data_mut(|d| d.remove::<String>(egui::Id::new("col_drag_src")));
-                                    }
-
-                                    if sortable && response.clicked() {
+                                    // A completed drag-release must not also
+                                    // re-sort the column it dropped through.
+                                    let click_suppressed =
+                                        ctx.frame_index() as u64 == self.col_suppress_click_frame;
+                                    if sortable && response.clicked() && !click_suppressed {
                                         sort_request = Some(col_copy);
                                     }
                                 });
@@ -2867,20 +3092,6 @@ impl eframe::App for AudioScoutApp {
                         self.column_layout.sort_ascending = true;
                     }
                     self.column_layout.sort_rows(&mut self.file_rows);
-                }
-
-                // A column header dropped onto another header: reorder the
-                // visible columns and persist the new order into config.json
-                // (same storage as the Columns-dialog selection — the key is
-                // `columns.visible`, which doubles as the display order).
-                if let Some((src, target, after)) = reorder_request {
-                    self.column_layout.move_column(&src, &target, after);
-                    let vis = self.column_layout.visible_keys();
-                    let cc = &mut self.config_store.config_mut().columns;
-                    cc.visible = Some(vis.clone());
-                    cc.order = vis;
-                    let _ = self.config_store.save();
-                    ctx.request_repaint();
                 }
             }
         });
