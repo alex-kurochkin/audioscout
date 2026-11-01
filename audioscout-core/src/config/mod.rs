@@ -160,7 +160,18 @@ where S: serde::Serializer {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ColumnConfig { pub order: Vec<String>, pub full_order: Vec<String>, pub widths: HashMap<String, f32> }
+pub struct ColumnConfig {
+    pub order: Vec<String>,
+    pub full_order: Vec<String>,
+    pub widths: HashMap<String, f32>,
+    /// Subset of columns the user chose to display in the Columns dialog.
+    /// Persisted so the selection survives an app restart; previously only
+    /// `order`/`widths` were stored and the visible set was lost on relaunch.
+    /// Optional + validated at load time for forward/backward compatibility
+    /// with configs written by older builds (which lack this key).
+    #[serde(default)]
+    pub visible: Option<Vec<String>>,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HotkeyBinding { pub key: String, pub ctrl: bool, pub shift: bool, pub alt: bool }
@@ -179,6 +190,7 @@ impl Default for AppConfig {
                 order: vec!["name","preview","duration","sample_rate","sample_type","channels","size","comment","date_created","date_modified"].into_iter().map(String::from).collect(),
                 full_order: vec!["name","preview","duration","sample_rate","sample_type","channels","size","comment","date_created","date_modified"].into_iter().map(String::from).collect(),
                 widths: HashMap::new(),
+                visible: None,
             },
             hotkeys,
             preview_mode: "wave".into(),

@@ -460,6 +460,13 @@ impl AudioScoutApp {
             _ => AudioViewMode::Waveform,
         };
 
+        // BUGFIX (persisted column selection): the Columns-dialog checkboxes
+        // used to mutate only the in-memory `column_layout`, so the visible
+        // set reset to "all columns" on every relaunch. Rebuild the layout
+        // from config.json at startup (keys validated/deduped in core; an
+        // absent/empty list keeps the all-columns default).
+        app.column_layout = ColumnLayout::from_config(&app.config_store.config().columns.clone());
+
         if let Some(dir_str) = app.db.load_session("lastDir") {
             let dir = PathBuf::from(dir_str);
             if dir.exists() {
@@ -3421,6 +3428,16 @@ impl eframe::App for AudioScoutApp {
                 ui.label("Visible columns:");
                 for col in Column::all() { let mut visible = self.column_layout.is_visible(col); if ui.checkbox(&mut visible, col.title()).changed() { self.column_layout.toggle_visibility(col); } }
             });
+            // BUGFIX (persisted column selection): mirror the checkbox state
+            // into config.json as soon as the dialog closes, so the choice
+            // survives a restart (it is re-applied in `App::new` above;
+            // `on_exit` also saves it as a fallback).
+            if !self.show_columns_dialog {
+                let vis = self.column_layout.visible_keys();
+                let cc = &mut self.config_store.config_mut().columns;
+                cc.visible = Some(vis);
+                let _ = self.config_store.save();
+            }
         }
 
         if let Some(dir) = &self.current_dir { let _ = self.db.save_session("lastDir", &dir.to_string_lossy()); }
@@ -3440,6 +3457,11 @@ impl eframe::App for AudioScoutApp {
             let pos = self.player_current_secs();
             let _ = self.db.save_session("lastPos", &pos.to_string());
         }
+        // Persist the Columns-dialog selection here too (fallback in case the
+        // app is closed while the dialog is still open; normally it is saved
+        // right after the dialog closes).
+        let vis = self.column_layout.visible_keys();
+        self.config_store.config_mut().columns.visible = Some(vis);
         let _ = self.config_store.save();
     }
 }

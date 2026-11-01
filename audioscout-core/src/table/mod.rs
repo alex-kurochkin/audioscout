@@ -51,6 +51,33 @@ pub struct ColumnLayout {
 
 impl ColumnLayout {
     pub fn new() -> Self { Self { visible: Column::all().to_vec(), widths: std::collections::HashMap::new(), sort_column: None, sort_ascending: true } }
+
+    /// Rebuild the layout from the persisted `ColumnConfig` (config.json).
+    /// Used at app start so the Columns-dialog selection survives restarts.
+    /// Rules: unknown keys are dropped, duplicates collapse to the first
+    /// occurrence, and an empty/absent list falls back to all columns — the
+    /// table must always render at least one column.
+    pub fn from_config(cfg: &crate::config::ColumnConfig) -> Self {
+        let mut layout = Self::new();
+        if let Some(vis) = &cfg.visible {
+            let mut cols: Vec<Column> = Vec::new();
+            for key in vis {
+                if let Some(c) = Column::from_key(key) {
+                    if !cols.contains(&c) { cols.push(c); }
+                }
+            }
+            if !cols.is_empty() { layout.visible = cols; }
+        }
+        layout.widths = cfg.widths.clone();
+        layout
+    }
+
+    /// Snapshot of the current selection as column keys, in display order,
+    /// ready to store into `ColumnConfig::visible`.
+    pub fn visible_keys(&self) -> Vec<String> {
+        self.visible.iter().map(|c| c.key().to_string()).collect()
+    }
+
     pub fn width(&self, col: &Column) -> f32 { self.widths.get(col.key()).copied().unwrap_or(col.default_width()) }
     pub fn set_width(&mut self, col: &Column, width: f32) { self.widths.insert(col.key().to_string(), width); }
     pub fn toggle_visibility(&mut self, col: &Column) {
