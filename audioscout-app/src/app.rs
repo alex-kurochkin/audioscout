@@ -2804,9 +2804,9 @@ impl eframe::App for AudioScoutApp {
                         });
                         // ---- Volumeter options (tz §3.5.1) -------------------
                         ui.horizontal(|ui| {
+                            ui.label("Volumeter enable peak hold");
                             ui.checkbox(&mut meter_hold_enabled, "")
                                 .on_hover_text("Keep the peak marker on the volume meter for a while after the signal drops");
-                            ui.label("Volumeter enable peak hold");
                         });
                         ui.horizontal(|ui| {
                             ui.label("Volumeter red value:");
