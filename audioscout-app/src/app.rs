@@ -204,7 +204,11 @@ pub struct AudioScoutApp {
     /// Volume-meter display state (§3.5.1): live values + peak-hold timer.
     meter_live: MeterData,
     meter_hold: MeterData,
-    meter_hold_until: f64,
+    /// Monotonic wall-clock (ctx.input time) of the last NEW peak — the hold
+    /// is released `meter_hold_ms` after this moment (see the hold algorithm
+    /// in `UiEvent::VolumeMeterUpdate`).  Replaces the old "hold_until"
+    /// deadline so the delay value from config is applied per-frame.
+    meter_peak_at: f64,
     /// Wall-clock of the previous UI frame — drives the ~300 ms meter
     /// decay after pause/stop (§3.5.1 "При паузе/стопе шкалы гаснут до нуля").
     last_frame_time: f64,
@@ -414,7 +418,7 @@ impl AudioScoutApp {
             column_layout: ColumnLayout::new(), selected_row: None, filter_text: String::new(),
             document: Document::new(), active_file: None, player, output,
             meter_live: MeterData::default(), meter_hold: MeterData::default(),
-            meter_hold_until: 0.0, last_frame_time: 0.0,
+            meter_peak_at: 0.0, last_frame_time: 0.0,
             audio_view: AudioView::new(0), undo_stack,
             preview_mode,
             preview_cache_wave: HashMap::new(),
@@ -661,22 +665,40 @@ impl AudioScoutApp {
                 UiEvent::VolumeMeterUpdate { peak_l, peak_r, rms_l, rms_r } => {
                     // Volume meter (§3.5.1): instantaneous scale with optional
                     // peak-hold; RMS scale is always live.
+                    //
+                    // Peak-hold algorithm (Settings→"Volumeter peak hold
+                    // delay", default 200 ms), evaluated per meter frame on a
+                    // monotonic wall clock (`ctx.input` time — NOT a frame
+                    // counter):
+                    //   L > H (strictly)  -> H = L, restart timer (t_last = now)
+                    //   L <= H            -> keep H, do not touch the timer
+                    //   now - t_last >= delay -> H = L (instant reset), t_last = now
+                    // The painted marker always shows H; the initial H equals
+                    // the level of the first frame after hold is enabled.
                     let cfg = self.config_store.config();
                     let now = ctx.input(|i| i.time);
                     self.meter_live = MeterData { peak_l, peak_r, rms_l, rms_r };
-                    let hold = cfg.meter_hold_enabled;
-                    let secs = cfg.meter_hold_seconds.max(0.2).min(5.0);
-                    if hold {
-                        if peak_l >= self.meter_hold.peak_l || now >= self.meter_hold_until {
+                    if cfg.meter_hold_enabled {
+                        let delay = cfg.meter_hold_ms as f64 / 1000.0;
+                        let new_peak = peak_l > self.meter_hold.peak_l
+                            || peak_r > self.meter_hold.peak_r;
+                        if new_peak {
+                            // Strict greater-than: a fresh maximum captures H
+                            // and restarts the release timer from zero.
                             self.meter_hold.peak_l = peak_l;
-                        }
-                        if peak_r >= self.meter_hold.peak_r || now >= self.meter_hold_until {
                             self.meter_hold.peak_r = peak_r;
+                            self.meter_peak_at = now;
+                        } else if now - self.meter_peak_at >= delay {
+                            // Delay expired without a new peak: drop H to the
+                            // current level instantly and re-arm the timer.
+                            self.meter_hold.peak_l = peak_l;
+                            self.meter_hold.peak_r = peak_r;
+                            self.meter_peak_at = now;
                         }
-                        if peak_l.max(peak_r) > 0.0 { self.meter_hold_until = now + secs; }
+                        // Otherwise (L <= H, timer still running): H stays.
                     } else {
                         self.meter_hold = self.meter_live;
-                        self.meter_hold_until = now;
+                        self.meter_peak_at = now;
                     }
                 }
                 UiEvent::DisksChanged { disks } => {
@@ -2634,6 +2656,8 @@ impl eframe::App for AudioScoutApp {
             // is live-applied on change; the red threshold is persisted only.
             let mut meter_hold_enabled = self.config_store.config().meter_hold_enabled;
             let mut meter_red_abs = self.config_store.config().meter_red_db.abs();
+            // Peak-hold release delay in ms (plain `Copy` field mirror).
+            let mut meter_hold_ms = self.config_store.config().meter_hold_ms;
             // Local mirrors of the two `self` fields the closure may touch:
             // the window-open flag (`Window::open`) and the hotkey-capture
             // toggle — both are written back after the frame.
@@ -2807,6 +2831,18 @@ impl eframe::App for AudioScoutApp {
                             ui.label("Volumeter enable peak hold");
                             ui.checkbox(&mut meter_hold_enabled, "")
                                 .on_hover_text("Keep the peak marker on the volume meter for a while after the signal drops");
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Volumeter peak hold delay:");
+                            // Three digits in ms; default 200.  Time the held
+                            // peak is kept after the last new maximum, before
+                            // it snaps back to the live level.
+                            ui.add(
+                                egui::DragValue::new(&mut meter_hold_ms)
+                                    .range(0..=999)
+                                    .speed(10)
+                                    .suffix(" ms"),
+                            );
                         });
                         ui.horizontal(|ui| {
                             ui.label("Volumeter red value:");
@@ -3023,6 +3059,12 @@ impl eframe::App for AudioScoutApp {
             // read by the meter update/draw paths straight from the config.
             if meter_hold_enabled != self.config_store.config().meter_hold_enabled {
                 self.config_store.config_mut().meter_hold_enabled = meter_hold_enabled;
+                changed = true;
+            }
+            // Peak-hold release delay (ms): read per meter frame from the
+            // config, so persisting it here is all that's needed.
+            if meter_hold_ms != self.config_store.config().meter_hold_ms {
+                self.config_store.config_mut().meter_hold_ms = meter_hold_ms;
                 changed = true;
             }
             // Volumeter red value: persisted to config.json as a negative dB

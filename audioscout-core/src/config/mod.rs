@@ -109,7 +109,12 @@ pub fn pretty_key_name(key: &str) -> String {
 pub struct AppConfig {
     pub volume: f32, pub space_behavior_stop: bool, pub undo_depth: usize, pub undo_disk_limit_mb: usize,
     pub undo_dir: Option<String>, pub preview_prefetch: usize, pub skip_seconds: u32,
-    pub meter_hold_enabled: bool, pub meter_hold_seconds: f64,
+    pub meter_hold_enabled: bool,
+    /// Peak-hold release delay in milliseconds (Settings→Behavior and
+    /// appearance, "Volumeter peak hold delay").  Once the held peak stops
+    /// being beaten for this long it resets to the live level.  Default 200.
+    #[serde(default = "default_meter_hold_ms")]
+    pub meter_hold_ms: u32,
     /// Volume-meter "red" threshold in dB (e.g. -0.1).  Tunable in
     /// Settings→Behavior and appearance; currently only persisted to
     /// config.json (the meter still uses its built-in red cutoff).
@@ -135,6 +140,10 @@ fn default_preview_mode() -> String { "wave".into() }
 /// appearance, "Volumeter red value").  Stored as a negative dB level; the
 /// UI shows its absolute magnitude ("0.1" + "dB" suffix).
 fn default_meter_red_db() -> f32 { -0.1 }
+
+/// Default peak-hold release delay: 200 ms (Settings→Behavior and
+/// appearance, "Volumeter peak hold delay").
+fn default_meter_hold_ms() -> u32 { 200 }
 
 // The mode values live in `audioscout_core::PreviewMode` (string forms
 // "wave"/"spectro"). Config must not depend on egui-side types, so they are
@@ -164,7 +173,7 @@ impl Default for AppConfig {
         Self {
             volume: 0.8,
             space_behavior_stop: true, undo_depth: 20, undo_disk_limit_mb: 2048, undo_dir: None,
-            preview_prefetch: 30, skip_seconds: 5, meter_hold_enabled: false, meter_hold_seconds: 1.0,
+            preview_prefetch: 30, skip_seconds: 5, meter_hold_enabled: false, meter_hold_ms: default_meter_hold_ms(),
             meter_red_db: default_meter_red_db(),
             columns: ColumnConfig {
                 order: vec!["name","preview","duration","sample_rate","sample_type","channels","size","comment","date_created","date_modified"].into_iter().map(String::from).collect(),
