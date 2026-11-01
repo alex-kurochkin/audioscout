@@ -1292,12 +1292,16 @@ fn controller_thread(
                 }
                 ctrl.stop_at_session_start(start);
             }
-            Some(Cmd::Seek { frame, source: _source }) => {
+            Some(Cmd::Seek { frame, source }) => {
                 if let Some(d) = &doc {
                     let ch = d.channels.max(1);
                     // Click-to-seek outside a selection never extends it; the
                     // session keeps running up to its original boundary (§5.3).
-                    let target = if sel_end > sel_start { frame.clamp(sel_start, sel_end.saturating_sub(1)) } else { frame };
+                    // BUGFIX (backward click/drag impossible while playing):
+                    // a `UserJump` teleports OUT of the running session — the
+                    // app restarts playback from the new frame, so no clamp.
+                    let jump_out = source == CursorSource::UserJump;
+                    let target = if !jump_out && sel_end > sel_start { frame.clamp(sel_start, sel_end.saturating_sub(1)) } else { frame };
                     let target = target.min(d.total_frames());
                     sink.stop(); // drop the current source BEFORE appending the new slice
                     *pump.session.lock().unwrap_or_else(|p| p.into_inner()) = None;
@@ -1312,7 +1316,7 @@ fn controller_thread(
                         shared.pumped_to_frame.store(target, Ordering::Release);
                         shared.true_playhead_file_frame.store(target, Ordering::Release);
                         if ctrl.is_playing() {
-                            let (s, e) = (target, if sel_end > sel_start { sel_end } else { d.total_frames() });
+                            let (s, e) = (target, if !jump_out && sel_end > sel_start { sel_end } else { d.total_frames() });
                             pump.cursor_frame.store(s, Ordering::Relaxed);
                             *pump.session.lock().unwrap_or_else(|p| p.into_inner()) = Some((s, e));
                             shared.source_active.store(true, Ordering::Relaxed);

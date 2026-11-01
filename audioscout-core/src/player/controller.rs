@@ -375,7 +375,15 @@ impl Controller {
         let max_frame = doc.total_frames();
         self.played_sr = doc.sample_rate.max(1);
         let mut target = frame.min(max_frame);
-        if self.state == TransportState::Playing && self.end_frame > self.start_frame {
+        // BUGFIX (backward click/drag impossible while playing/paused): a
+        // `UserJump` is an explicit teleport OUT of the running session —
+        // the app restarts playback from the new frame, so neither this arm
+        // nor the output thread may clamp it back into [start, end].
+        let jump_out = source == CursorSource::UserJump;
+        if !jump_out
+            && self.state == TransportState::Playing
+            && self.end_frame > self.start_frame
+        {
             // Click-to-seek outside the selection does not extend it: clamp
             // into the active range (§5.3). The session covers [start,end):
             // the FINAL frame `end` is the legitimate "play to EOF" position

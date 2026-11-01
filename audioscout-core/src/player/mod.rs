@@ -6,7 +6,19 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 pub enum TransportState { Stopped, Playing, Paused }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CursorSource { Playback, User }
+pub enum CursorSource {
+    /// Clock mirror from the output thread / UI poll: never reinterprets the
+    /// resume point and always stays inside the active session.
+    Playback,
+    /// Ordinary user cursor move (click, drag, skip buttons): while a session
+    /// plays it is clamped into [start, end] (§5.3).
+    User,
+    /// Explicit teleport OUT of the running session (backward click/drag in
+    /// the waveform while playing/paused): the app restarts the session from
+    /// the new frame, so the transport arms must NOT clamp the target back
+    /// into the old range.
+    UserJump,
+}
 
 pub struct PlayheadState {
     pub position_samples: AtomicU64,

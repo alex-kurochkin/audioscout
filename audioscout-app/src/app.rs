@@ -1069,6 +1069,43 @@ impl AudioScoutApp {
     }
 
     fn transport_seek(&mut self, frame: u64, source: audioscout_core::player::CursorSource) {
+        // BUGFIX (backward click/drag impossible while playing/paused): a
+        // `UserJump` is an explicit teleport OUT of the running session.
+        // Both transport arms clamp a plain User seek into [start,end] while
+        // Playing (§5.3), which made every backward click snap the cursor to
+        // the session start and blocked scrubbing left during playback AND
+        // pause (the resume point was clobbered too). Restart the session
+        // from the new frame instead: play → play on from `frame`; pause →
+        // stay paused with the resume point at `frame`.
+        if source == audioscout_core::player::CursorSource::UserJump {
+            let state = self.player_state();
+            if state == TransportState::Playing || state == TransportState::Paused {
+                if state == TransportState::Playing {
+                    if let Some(out) = &self.output { out.play(frame, self.document.total_frames()); }
+                    let mut ctrl = self.player.lock().unwrap_or_else(|p| p.into_inner());
+                    if self.output.is_some() {
+                        ctrl.mark_playing(frame, self.document.total_frames(), self.document.sample_rate);
+                    } else {
+                        ctrl.play(&self.document, Some((frame, self.document.total_frames())));
+                    }
+                    drop(ctrl);
+                    // Re-arm the UI extrapolation exactly at the new session
+                    // origin (same bookkeeping as transport_play_pause).
+                    self.playhead_est_frame = frame;
+                    self.playhead_est_at = std::time::Instant::now();
+                    self.playhead_fed_ceiling = None;
+                    self.playhead_session = Some((frame, self.document.total_frames()));
+                } else {
+                    // Paused: move the frozen resume point together with the
+                    // cursor so Play continues from where the user parked it.
+                    let mut ctrl = self.player.lock().unwrap_or_else(|p| p.into_inner());
+                    ctrl.seek(frame, &self.document, audioscout_core::player::CursorSource::User);
+                    ctrl.freeze_resume_at(frame.min(self.document.total_frames()), self.document.sample_rate);
+                }
+                return;
+            }
+            // Stopped: an ordinary seek — fall through below.
+        }
         if let Some(out) = &self.output { out.seek(frame, source); }
         // BUGFIX (cursor jump-ahead / snap-back): a seek teleports the true
         // clock; move the extrapolation anchor with it immediately, otherwise
@@ -1202,6 +1239,33 @@ impl AudioScoutApp {
             // seeded at the session origin and only ever moves forward while
             // Playing, so it is a safe lower bound — never paint below it.
             let true_frame = audible_frame.max(raw_frame);
+            // BUGFIX (backward click/drag impossible while playing): after a
+            // `UserJump` session restart the extrapolation anchor sits at the
+            // new (earlier) frame, but the lagging hardware clock still reads
+            // the PRE-jump position for up to the sink-buffer depth (~150 ms).
+            // The old monotonic guard (`max(true_frame)`) then snapped the
+            // cursor straight back to where it was before the jump. Until the
+            // audio clock actually reaches the new session origin, treat the
+            // origin as the floor instead of the stale pre-jump reading.
+            if let Some((s, _e)) = self.playhead_session {
+                if true_frame < s && self.playhead_est_frame >= s {
+                    // Fresh restart: the clock has not caught up yet.
+                }
+                if true_frame < s {
+                    let true_frame_now = s;
+                    let _ = true_frame_now;
+                }
+            }
+            let true_frame = if self.playhead_est_frame > 0
+                && true_frame < self.playhead_est_frame.saturating_sub(self.document.sample_rate.max(1) as u64 / 2)
+            {
+                // A teleport backwards just happened (session restart): pull
+                // the truth floor down with it so the display can follow the
+                // cursor left instead of being pinned at the old position.
+                self.playhead_est_frame
+            } else {
+                true_frame
+            };
             // BUGFIX (cursor jump-ahead / snap-back): paint an extrapolated
             // position instead of the raw hardware clock. The clock lags wall
             // time by the sink buffer (~150 ms) plus up to one 50 ms poll
