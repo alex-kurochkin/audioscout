@@ -12,21 +12,24 @@ pub const HOTKEY_ACTIONS: &[&str] = &[
 
 /// Human-readable labels for the Hotkeys table (Settings dialog).
 pub fn hotkey_label(action: &str) -> &'static str {
+    // The Settings-window mock-up shows the raw action ids (camelCase, e.g.
+    // "addMarker", "clearSelection") in the Action column of the Hotkeys
+    // table, so we display the id itself.
     match action {
-        "playpause" => "Play / Pause",
-        "prev" => "Previous file",
-        "next" => "Next file",
-        "gotoStart" => "Go to start",
-        "mute" => "Mute selection",
-        "normalize" => "Normalize selection",
-        "undo" => "Undo",
-        "redo" => "Redo",
-        "addMarker" => "Add marker",
-        "deleteMarker" => "Delete marker",
-        "clearSelection" => "Clear selection",
-        "zoomIn" => "Zoom in",
-        "zoomOut" => "Zoom out",
-        "zoomReset" => "Zoom reset",
+        "playpause" => "playPause",
+        "prev" => "prevFile",
+        "next" => "nextFile",
+        "gotoStart" => "goToStart",
+        "mute" => "muteSelection",
+        "normalize" => "normalizeSelection",
+        "undo" => "undo",
+        "redo" => "redo",
+        "addMarker" => "addMarker",
+        "deleteMarker" => "deleteMarker",
+        "clearSelection" => "clearSelection",
+        "zoomIn" => "zoomIn",
+        "zoomOut" => "zoomOut",
+        "zoomReset" => "zoomReset",
         _ => "Unknown",
     }
 }
@@ -62,13 +65,27 @@ pub fn is_rebindable_key(key: &str) -> bool {
 }
 
 /// Pretty label for a binding in the Hotkeys table ("Ctrl+Shift+Z").
+/// Key names are title-cased (`Escape` -> `Esc`, `ArrowLeft` -> `Left`),
+/// matching the compact shortcuts shown in the Settings mock-up.
 pub fn format_hotkey(b: &HotkeyBinding) -> String {
     let mut s = String::new();
     if b.ctrl { s.push_str("Ctrl+"); }
     if b.shift { s.push_str("Shift+"); }
     if b.alt { s.push_str("Alt+"); }
-    s.push_str(&b.key);
+    s.push_str(&pretty_key_name(&b.key));
     s
+}
+
+/// Compact display name for an egui `Key` debug string.
+pub fn pretty_key_name(key: &str) -> String {
+    match key {
+        "Escape" => "Esc".to_string(),
+        "ArrowLeft" => "Left".to_string(),
+        "ArrowRight" => "Right".to_string(),
+        "ArrowUp" => "Up".to_string(),
+        "ArrowDown" => "Down".to_string(),
+        other => other.to_string(),
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
