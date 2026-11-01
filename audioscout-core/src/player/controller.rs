@@ -258,7 +258,7 @@ impl Controller {
         // rewound to 0 mid-session. Degenerate selections normalise to
         // (s, total) below, so the adopted value always equals the real
         // session start.
-        let mut resume_after_start = start;
+        let resume_after_start = start;
         // Degenerate `end <= start` means "play from `start` to EOF" (§5.3) —
         // normalise it NOW so every downstream consumer (the pos snapshot
         // below, the output thread's `apply_play`, the session getters) sees
