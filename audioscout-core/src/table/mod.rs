@@ -86,6 +86,33 @@ impl ColumnLayout {
         } else { self.visible.push(*col); }
     }
     pub fn is_visible(&self, col: &Column) -> bool { self.visible.contains(col) }
+
+    /// Move the column currently at index `from` so that it ends up at index
+    /// `to` in the visible order (drag-and-drop reordering in the table
+    /// header). Out-of-range indices and no-op moves are ignored.
+    pub fn move_by_indices(&mut self, from: usize, to: usize) {
+        if from >= self.visible.len() || to >= self.visible.len() || from == to {
+            return;
+        }
+        let col = self.visible.remove(from);
+        self.visible.insert(to, col);
+    }
+
+    /// Move column `col` before/after its new neighbour by key — convenience
+    /// wrapper used by callers that track columns by identity rather than by
+    /// live index (indices shift while items are dragged).
+    pub fn move_column(&mut self, col: &Column, target: &Column, after: bool) {
+        if col == target {
+            return;
+        }
+        let Some(from) = self.visible.iter().position(|c| c == col) else { return };
+        let Some(mut to) = self.visible.iter().position(|c| c == target) else { return };
+        // Removing `from` shifts every later index down by one; compensate so
+        // `to` still points at the same neighbour after the removal.
+        if from < to { to -= 1; }
+        self.move_by_indices(from, if after { to + 1 } else { to });
+    }
+
     pub fn sort_rows(&self, rows: &mut [FileRow]) {
         if let Some(col) = self.sort_column {
             rows.sort_by(|a, b| {

@@ -2547,6 +2547,14 @@ impl eframe::App for AudioScoutApp {
                 let sort_column = self.column_layout.sort_column;
                 let sort_ascending = self.column_layout.sort_ascending;
 
+                // Column drag-and-drop reorder state, read *before* the grid
+                // closure (which borrows `column_layout` immutably). The
+                // header titles act as both drag sources and drop targets:
+                // press a title, drag it over another title and release to
+                // move the dragged column before/after the hovered one
+                // (left/right half of the target decides the side).
+                let mut reorder_request: Option<(Column, Column, bool)> = None;
+
                 // --- The files table: ONE grid whose FIRST ROW is the header
                 // and all following rows are data rows (scrollable). Because
                 // both live in the same Grid over the same allocated rect,
@@ -2608,6 +2616,14 @@ impl eframe::App for AudioScoutApp {
                                 };
                                 let sortable = col.sortable();
                                 let col_copy = *col;
+                                let col_key = col.key();
+
+                                // Drag payload is read INSIDE the cell closure:
+                                // `drag_started()` only becomes true in the very
+                                // frame the drag begins, so the freshly stored
+                                // key must be re-read after storing it — a value
+                                // captured before the grid would always lag one
+                                // frame behind and the drop would never fire.
                                 draw_cell(ui, width, 24.0, |ui| {
                                     let response = if sortable {
                                         ui.add_sized(
@@ -2620,6 +2636,54 @@ impl eframe::App for AudioScoutApp {
                                             egui::Label::new(egui::RichText::new(label).strong()),
                                         )
                                     };
+
+                                    // --- Drag source: press a header title
+                                    // and move the pointer away from it to
+                                    // start dragging this column. The payload
+                                    // lives in `ctx.data` under one well-known
+                                    // id (egui has no built-in DnD), so only
+                                    // one drag can be active at a time.
+                                    if response.drag_started() {
+                                        ctx.data_mut(|d| {
+                                            d.insert_temp(egui::Id::new("col_drag_src"), col_key.to_string())
+                                        });
+                                    }
+
+                                    // Current drag payload (if any): the column
+                                    // key being dragged right now.
+                                    let src_key: Option<String> = ctx
+                                        .data(|d| d.get_temp::<String>(egui::Id::new("col_drag_src")));
+
+                                    // --- Drop target: while some column is
+                                    // being dragged, hovering ANOTHER title
+                                    // records a reorder request as soon as the
+                                    // button is released over it. Which half of
+                                    // the target cell the pointer is over
+                                    // decides before/after. (`drag_stopped()`
+                                    // fires on every widget whose drag ends
+                                    // this frame — here it means "released
+                                    // exactly over me", i.e. a drop.)
+                                    if let Some(src) = &src_key {
+                                        if *src != col_key && response.hovered() && response.drag_stopped() {
+                                            let after = ui.input(|i| {
+                                                i.pointer
+                                                    .interact_pos()
+                                                    .map_or(false, |p| p.x > response.rect.center().x)
+                                            });
+                                            if let Some(src_col) = Column::from_key(src) {
+                                                reorder_request = Some((src_col, col_copy, after));
+                                            }
+                                        }
+                                    }
+
+                                    // --- End of drag anywhere outside a valid
+                                    // drop: clear the payload so the next press
+                                    // starts a fresh drag. (`drag_stopped()` is
+                                    // reported by the SOURCE widget's response.)
+                                    if response.drag_stopped() {
+                                        ctx.data_mut(|d| d.remove::<String>(egui::Id::new("col_drag_src")));
+                                    }
+
                                     if sortable && response.clicked() {
                                         sort_request = Some(col_copy);
                                     }
@@ -2803,6 +2867,20 @@ impl eframe::App for AudioScoutApp {
                         self.column_layout.sort_ascending = true;
                     }
                     self.column_layout.sort_rows(&mut self.file_rows);
+                }
+
+                // A column header dropped onto another header: reorder the
+                // visible columns and persist the new order into config.json
+                // (same storage as the Columns-dialog selection — the key is
+                // `columns.visible`, which doubles as the display order).
+                if let Some((src, target, after)) = reorder_request {
+                    self.column_layout.move_column(&src, &target, after);
+                    let vis = self.column_layout.visible_keys();
+                    let cc = &mut self.config_store.config_mut().columns;
+                    cc.visible = Some(vis.clone());
+                    cc.order = vis;
+                    let _ = self.config_store.save();
+                    ctx.request_repaint();
                 }
             }
         });
