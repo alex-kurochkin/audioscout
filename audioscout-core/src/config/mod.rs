@@ -109,7 +109,13 @@ pub fn pretty_key_name(key: &str) -> String {
 pub struct AppConfig {
     pub volume: f32, pub space_behavior_stop: bool, pub undo_depth: usize, pub undo_disk_limit_mb: usize,
     pub undo_dir: Option<String>, pub preview_prefetch: usize, pub skip_seconds: u32,
-    pub meter_hold_enabled: bool, pub meter_hold_seconds: f64, pub columns: ColumnConfig,
+    pub meter_hold_enabled: bool, pub meter_hold_seconds: f64,
+    /// Volume-meter "red" threshold in dB (e.g. -0.1).  Tunable in
+    /// Settings→Behavior and appearance; currently only persisted to
+    /// config.json (the meter still uses its built-in red cutoff).
+    #[serde(default = "default_meter_red_db")]
+    pub meter_red_db: f32,
+    pub columns: ColumnConfig,
     pub hotkeys: HashMap<String, HotkeyBinding>,
     /// Table thumbnail style (Waveform/Spectrogram toggle on the top panel).
     /// Serialized as "wave"/"spectro"; old configs without this key default
@@ -124,6 +130,11 @@ pub struct AppConfig {
 }
 
 fn default_preview_mode() -> String { "wave".into() }
+
+/// Default volume-meter red threshold: -0.1 dB (Settings→Behavior and
+/// appearance, "Volumeter red value").  Stored as a negative dB level; the
+/// UI shows its absolute magnitude ("0.1" + "dB" suffix).
+fn default_meter_red_db() -> f32 { -0.1 }
 
 // The mode values live in `audioscout_core::PreviewMode` (string forms
 // "wave"/"spectro"). Config must not depend on egui-side types, so they are
@@ -154,6 +165,7 @@ impl Default for AppConfig {
             volume: 0.8,
             space_behavior_stop: true, undo_depth: 20, undo_disk_limit_mb: 2048, undo_dir: None,
             preview_prefetch: 30, skip_seconds: 5, meter_hold_enabled: false, meter_hold_seconds: 1.0,
+            meter_red_db: default_meter_red_db(),
             columns: ColumnConfig {
                 order: vec!["name","preview","duration","sample_rate","sample_type","channels","size","comment","date_created","date_modified"].into_iter().map(String::from).collect(),
                 full_order: vec!["name","preview","duration","sample_rate","sample_type","channels","size","comment","date_created","date_modified"].into_iter().map(String::from).collect(),

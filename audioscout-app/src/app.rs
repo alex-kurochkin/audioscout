@@ -2629,6 +2629,11 @@ impl eframe::App for AudioScoutApp {
             // Reading it through `&self.*` inside the closure would conflict
             // with the mutable captures passed to `open()`/the UI closure.
             let current_skip_seconds = self.config_store.config().skip_seconds;
+            // Volumeter settings mirrors (plain `Copy` fields — same disjoint
+            // -borrow pattern as `current_skip_seconds`).  The peak-hold flag
+            // is live-applied on change; the red threshold is persisted only.
+            let mut meter_hold_enabled = self.config_store.config().meter_hold_enabled;
+            let mut meter_red_abs = self.config_store.config().meter_red_db.abs();
             // Local mirrors of the two `self` fields the closure may touch:
             // the window-open flag (`Window::open`) and the hotkey-capture
             // toggle — both are written back after the frame.
@@ -2785,6 +2790,27 @@ impl eframe::App for AudioScoutApp {
                                     ui.selectable_value(&mut player_mode_idx, 0, "Waveform");
                                     ui.selectable_value(&mut player_mode_idx, 1, "Spectrogram");
                                 });
+                        });
+                        // ---- Volumeter options (tz §3.5.1) -------------------
+                        ui.horizontal(|ui| {
+                            ui.checkbox(&mut meter_hold_enabled, "")
+                                .on_hover_text("Keep the peak marker on the volume meter for a while after the signal drops");
+                            ui.label("Volumeter enable peak hold");
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Volumeter red value:");
+                            // Two digits + dot + one digit ("0.1") per spec;
+                            // stored as a negative dB level, shown as its
+                            // absolute magnitude with a "dB" suffix.
+                            ui.add(
+                                egui::DragValue::new(&mut meter_red_abs)
+                                    .range(0.0..=99.9)
+                                    .speed(0.1)
+                                    .max_decimals(1)
+                                    .min_decimals(1)
+                                    .suffix(" dB")
+                                    .update_while_editing(false),
+                            );
                         });
                         ui.horizontal(|ui| {
                             ui.label("Skip seconds:");
@@ -2980,6 +3006,20 @@ impl eframe::App for AudioScoutApp {
             }
             if preview_prefetch != self.config_store.config().preview_prefetch {
                 self.config_store.config_mut().preview_prefetch = preview_prefetch;
+                changed = true;
+            }
+            // Volumeter peak hold (Behavior and appearance): live flag, also
+            // read by the meter update/draw paths straight from the config.
+            if meter_hold_enabled != self.config_store.config().meter_hold_enabled {
+                self.config_store.config_mut().meter_hold_enabled = meter_hold_enabled;
+                changed = true;
+            }
+            // Volumeter red value: persisted to config.json as a negative dB
+            // level (the UI edits its absolute magnitude).  Not yet wired into
+            // the meter drawing — per task, this setting only saves.
+            let new_red_db = -meter_red_abs.clamp(0.0, 99.9);
+            if (new_red_db - self.config_store.config().meter_red_db).abs() > f32::EPSILON {
+                self.config_store.config_mut().meter_red_db = new_red_db;
                 changed = true;
             }
             if space_stop != self.config_store.config().space_behavior_stop {
