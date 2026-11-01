@@ -1607,19 +1607,12 @@ impl eframe::App for AudioScoutApp {
                 if hand_cursor(&ui.add(preview_btn).on_hover_text("Toggle table previews between waveform and spectrogram")) {
                     self.toggle_preview_mode();
                 }
-                // Visualization-area toggle (§3.5): the audio view keeps a
-                // second control right here on the toolbar so the display
-                // mode can be flipped without reaching for the transport
-                // panel; both buttons drive the same live `AudioView::mode`
-                // state and reflect it through SelectableLabel.
-                let view_spectro = self.audio_view.mode == AudioViewMode::Spectrogram;
-                let view_btn = egui::SelectableLabel::new(
-                    view_spectro,
-                    if view_spectro { "Spectrogram" } else { "Waveform" },
-                );
-                if hand_cursor(&ui.add(view_btn).on_hover_text("Toggle the visualization between waveform and spectrogram")) {
-                    self.toggle_audio_view_mode();
-                }
+                // §3.6: the table-preview switch lives ONLY on the top
+                // toolbar and the visualization-area switch lives ONLY on
+                // the player panel — each exists in exactly one panel,
+                // duplication is forbidden. The second Waveform/Spectrogram
+                // button that used to sit here (a duplicate of the player
+                // panel's §3.5 toggle driving `AudioView::mode`) is removed.
                 ui.separator();
                 let r_settings = ui.button("Settings");
                 Self::hover_hand(ui, &r_settings);
