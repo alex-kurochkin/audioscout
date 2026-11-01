@@ -2,6 +2,75 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+/// Canonical list of rebindable actions shown in the Settings→Hotkeys table.
+/// `hotkey_defaults()` and the runtime matcher must stay in sync with this.
+pub const HOTKEY_ACTIONS: &[&str] = &[
+    "playpause", "prev", "next", "gotoStart", "mute", "normalize",
+    "undo", "redo", "addMarker", "deleteMarker", "clearSelection",
+    "zoomIn", "zoomOut", "zoomReset",
+];
+
+/// Human-readable labels for the Hotkeys table (Settings dialog).
+pub fn hotkey_label(action: &str) -> &'static str {
+    match action {
+        "playpause" => "Play / Pause",
+        "prev" => "Previous file",
+        "next" => "Next file",
+        "gotoStart" => "Go to start",
+        "mute" => "Mute selection",
+        "normalize" => "Normalize selection",
+        "undo" => "Undo",
+        "redo" => "Redo",
+        "addMarker" => "Add marker",
+        "deleteMarker" => "Delete marker",
+        "clearSelection" => "Clear selection",
+        "zoomIn" => "Zoom in",
+        "zoomOut" => "Zoom out",
+        "zoomReset" => "Zoom reset",
+        _ => "Unknown",
+    }
+}
+
+/// Default shortcut strings per tz §9 (hotkey model): Space toggles
+/// playback, Ctrl+Z/Ctrl+Shift+Z is undo/redo, Ctrl+arrows zoom, etc.
+/// Used by Settings→Hotkeys "Reset all to defaults".
+pub fn hotkey_defaults() -> HashMap<String, HotkeyBinding> {
+    let mut hotkeys = HashMap::new();
+    hotkeys.insert("mute".into(), HotkeyBinding { key: "M".into(), ctrl: true, shift: false, alt: false });
+    hotkeys.insert("normalize".into(), HotkeyBinding { key: "N".into(), ctrl: true, shift: false, alt: false });
+    hotkeys.insert("prev".into(), HotkeyBinding { key: "P".into(), ctrl: false, shift: false, alt: false });
+    hotkeys.insert("next".into(), HotkeyBinding { key: "N".into(), ctrl: false, shift: false, alt: false });
+    hotkeys.insert("playpause".into(), HotkeyBinding { key: "Space".into(), ctrl: false, shift: false, alt: false });
+    hotkeys.insert("gotoStart".into(), HotkeyBinding { key: "W".into(), ctrl: false, shift: false, alt: false });
+    hotkeys.insert("undo".into(), HotkeyBinding { key: "Z".into(), ctrl: true, shift: false, alt: false });
+    hotkeys.insert("redo".into(), HotkeyBinding { key: "Z".into(), ctrl: true, shift: true, alt: false });
+    hotkeys.insert("zoomIn".into(), HotkeyBinding { key: "ArrowUp".into(), ctrl: true, shift: false, alt: false });
+    hotkeys.insert("zoomOut".into(), HotkeyBinding { key: "ArrowDown".into(), ctrl: true, shift: false, alt: false });
+    hotkeys.insert("zoomReset".into(), HotkeyBinding { key: "0".into(), ctrl: true, shift: false, alt: false });
+    hotkeys.insert("addMarker".into(), HotkeyBinding { key: "M".into(), ctrl: false, shift: false, alt: true });
+    hotkeys.insert("deleteMarker".into(), HotkeyBinding { key: "Delete".into(), ctrl: false, shift: false, alt: false });
+    hotkeys.insert("clearSelection".into(), HotkeyBinding { key: "Escape".into(), ctrl: false, shift: false, alt: false });
+    hotkeys
+}
+
+/// Keys egui can name back (`Key::from_name` round-trip) — used to validate
+/// a captured shortcut before rebinding it.
+pub fn is_rebindable_key(key: &str) -> bool {
+    matches!(key, "Space" | "Delete" | "Escape" | "ArrowUp" | "ArrowDown" | "ArrowLeft" | "ArrowRight" | "Home" | "End" | "Insert" | "Backspace" | "Enter" | "Tab")
+        || (key.len() == 1 && key.chars().next().map(|c| c.is_ascii_alphanumeric()).unwrap_or(false))
+        || (key.starts_with('F') && key[1..].parse::<u8>().map(|n| (1..=24).contains(&n)).unwrap_or(false))
+}
+
+/// Pretty label for a binding in the Hotkeys table ("Ctrl+Shift+Z").
+pub fn format_hotkey(b: &HotkeyBinding) -> String {
+    let mut s = String::new();
+    if b.ctrl { s.push_str("Ctrl+"); }
+    if b.shift { s.push_str("Shift+"); }
+    if b.alt { s.push_str("Alt+"); }
+    s.push_str(&b.key);
+    s
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
     pub volume: f32, pub space_behavior_stop: bool, pub undo_depth: usize, pub undo_disk_limit_mb: usize,
@@ -44,21 +113,9 @@ pub struct HotkeyBinding { pub key: String, pub ctrl: bool, pub shift: bool, pub
 
 impl Default for AppConfig {
     fn default() -> Self {
-        let mut hotkeys = HashMap::new();
-        hotkeys.insert("mute".into(), HotkeyBinding { key: "M".into(), ctrl: true, shift: false, alt: false });
-        hotkeys.insert("normalize".into(), HotkeyBinding { key: "N".into(), ctrl: true, shift: false, alt: false });
-        hotkeys.insert("prev".into(), HotkeyBinding { key: "P".into(), ctrl: false, shift: false, alt: false });
-        hotkeys.insert("next".into(), HotkeyBinding { key: "N".into(), ctrl: false, shift: false, alt: false });
-        hotkeys.insert("playpause".into(), HotkeyBinding { key: "Space".into(), ctrl: false, shift: false, alt: false });
-        hotkeys.insert("gotoStart".into(), HotkeyBinding { key: "W".into(), ctrl: false, shift: false, alt: false });
-        hotkeys.insert("undo".into(), HotkeyBinding { key: "Z".into(), ctrl: true, shift: false, alt: false });
-        hotkeys.insert("redo".into(), HotkeyBinding { key: "Z".into(), ctrl: true, shift: true, alt: false });
-        hotkeys.insert("zoomIn".into(), HotkeyBinding { key: "ArrowUp".into(), ctrl: true, shift: false, alt: false });
-        hotkeys.insert("zoomOut".into(), HotkeyBinding { key: "ArrowDown".into(), ctrl: true, shift: false, alt: false });
-        hotkeys.insert("zoomReset".into(), HotkeyBinding { key: "0".into(), ctrl: true, shift: false, alt: false });
-        hotkeys.insert("addMarker".into(), HotkeyBinding { key: "M".into(), ctrl: false, shift: false, alt: true });
-        hotkeys.insert("deleteMarker".into(), HotkeyBinding { key: "Delete".into(), ctrl: false, shift: false, alt: false });
-        hotkeys.insert("clearSelection".into(), HotkeyBinding { key: "Escape".into(), ctrl: false, shift: false, alt: false });
+        // Single source of truth for the tz §9 defaults — shared with
+        // Settings→Hotkeys "Reset all to defaults".
+        let hotkeys = hotkey_defaults();
         Self {
             volume: 0.8,
             space_behavior_stop: true, undo_depth: 20, undo_disk_limit_mb: 2048, undo_dir: None,
@@ -111,6 +168,33 @@ impl ConfigStore {
         Ok(())
     }
     pub fn version(&self) -> u64 { self.config.version }
+
+    /// Delete every stored marker (DB rows + per-file marker sidecars).
+    /// Used by Settings→Storage maintenance "Delete all markers".
+    pub fn delete_all_markers(db: &crate::db::Database, config_dir: &Path) -> std::io::Result<usize> {
+        let n = db.delete_all_markers().map_err(std::io::Error::new(std::io::ErrorKind::Other,)?;
+        // Marker sidecars are stored in the DB (tz §7); nothing on disk to
+        // purge beyond the rows themselves.
+        let _ = config_dir;
+        Ok(n)
+    }
+
+    /// Delete all cached preview images (DB rows + PNG files on disk).
+    /// Used by Settings→Storage maintenance "Delete all markers previews".
+    /// Returns the number of DB rows removed.
+    pub fn delete_all_previews(db: &crate::db::Database, config_dir: &Path) -> std::io::Result<usize> {
+        let n = db.delete_all_previews().map_err(std::io::Error::new(std::io::ErrorKind::Other,)?;
+        let previews_dir = config_dir.join("previews");
+        if previews_dir.exists() { std::fs::remove_dir_all(&previews_dir)?; }
+        Ok(n)
+    }
+
+    /// Remove preview files/rows whose source audio no longer exists or has
+    /// changed (tz §12 "Scan markers"/orphan cleanup). Thin wrapper kept so
+    /// both callers share one entry point.
+    pub fn clean_orphaned_previews() -> std::io::Result<usize> {
+        crate::preview_worker::cleanup_previews()
+    }
 }
 
 pub fn config_dir() -> PathBuf {
