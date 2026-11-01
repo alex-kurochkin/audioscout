@@ -1262,7 +1262,7 @@ impl Controller {
     pub fn start_frame(&self) -> u64 {
         self.start_frame
     }
-    /// Active session bounds `[start, end)` as stored by play/seek/reaim Ñ
+    /// Active session bounds `[start, end)` as stored by play/seek/reaim -
     /// used by the UI to restart a backward jump without inventing its own
     /// fallback range.
     pub fn session_bounds(&self) -> Option<(u64, u64)> {

@@ -1095,7 +1095,6 @@ impl AudioScoutApp {
                 // cpal callback pulls samples; for a Paused one it just
                 // parks the clock without touching the resume semantics.
                 let total = self.document.total_frames();
-                let sr = self.document.sample_rate.max(1);
                 // BUGFIX (backward click/drag STILL snapped back): the app
                 // keeps its own extrapolation anchor (`playhead_est_frame`)
                 // as the authoritative DISPLAY position — it is re-armed on
@@ -1112,33 +1111,31 @@ impl AudioScoutApp {
                         .clamp(frame, total)
                 };
                 if state == TransportState::Playing {
-                    // Synchronous UI-side transition: freeze at the DISPLAY
-                    // frame first...
+                    // BUGFIX (backward click while playing STILL snapped back
+                    // to the live position): do NOT send Cmd::Pause at all.
+                    // Its arm runs asynchronously on the output thread and
+                    // unconditionally overwrites the controller's frozen
+                    // resume point with the lagging hardware-clock reading —
+                    // queued AFTER our explicit park it still clobbered it,
+                    // dragging the cursor back to the pre-jump position.
+                    // Instead keep the controller in Paused (parked at the
+                    // DISPLAY frame) and let the teleport below restart the
+                    // session through `Cmd::Play` alone: apply_play stops the
+                    // sink, drops the pump session, reseeds the clock at the
+                    // NEW frame and re-appends [frame,end) — identical
+                    // bookkeeping to pressing Play after such a pause. The
+                    // controller-side transition happens synchronously under
+                    // our lock, so no stale sample can ever overwrite it.
                     {
                         let mut ctrl = self.player.lock().unwrap_or_else(|p| p.into_inner());
                         ctrl.pause_parked(shown_display);
                     }
-                    if let Some(out) = &self.output {
-                        // ...then silence the device; the output thread's
-                        // Cmd::Pause arm freezes at its own clock reading,
-                        // which we immediately correct below (same order as
-                        // transport_play_pause's normal Pause).
-                        out.pause();
-                        out.freeze_resume_at(shown_display, sr);
-                    }
-                    // Teleport: the Seek arm runs with the controller in
-                    // Paused state, so it parks the clock WITHOUT appending a
-                    // source; `mark_playing` below restarts playback from the
-                    // new frame through the Play path (identical bookkeeping
-                    // to pressing Play after such a jump).
+                    // Teleport the audio clock/pump/ceiling to the new frame
+                    // while Paused: the Seek arm parks without appending a
+                    // source (is_playing() is false), then Cmd::Play engages
+                    // the fresh [frame,end) session from there.
                     if let Some(out) = &self.output {
                         out.seek(frame, audioscout_core::player::CursorSource::UserJump);
-                    }
-                    {
-                        let mut ctrl = self.player.lock().unwrap_or_else(|p| p.into_inner());
-                        ctrl.mark_playing(frame, end, sr);
-                    }
-                    if let Some(out) = &self.output {
                         out.play(frame, end);
                     }
                     // Re-arm the UI extrapolation exactly at the new session
