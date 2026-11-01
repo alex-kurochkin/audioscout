@@ -2577,6 +2577,7 @@ impl eframe::App for AudioScoutApp {
                 DeletePreviews,
                 CleanOrphans,
                 ResetHotkeys,
+                Close,
             }
 
             let mut skip_seconds_changed: Option<u32> = None;
@@ -2710,8 +2711,8 @@ impl eframe::App for AudioScoutApp {
                         // Column headers of the Action | Shortcut table.
                         let col_w = (ui.available_width() - 16.0) * 0.6;
                         ui.horizontal(|ui| {
-                            ui.add_sized([col_w, 18.0], egui::Label::new(egui::RichText::strong("Action")));
-                            ui.label(egui::RichText::strong("Shortcut"));
+                            ui.add_sized([col_w, 18.0], egui::Label::new(egui::RichText::new("Action").strong()));
+                            ui.label(egui::RichText::new("Shortcut").strong());
                         });
                         ui.separator();
                         // Vertical scroll through the action list — the mouse
@@ -2735,12 +2736,57 @@ impl eframe::App for AudioScoutApp {
                                         );
                                         if resp.clicked() {
                                             // Click a shortcut -> start capturing; click again cancels.
-                                            *capture_toggle =
+                                            capture_toggle =
                                                 if capture_action.as_deref() == Some(action_name.as_str()) { None } else { Some(action_name.clone()) };
                                         }
                                     });
                                 }
                             });
+                        // ---- Keyboard capture for reassignment ----------------
+                        // While a row is armed ("Press keys…"), the next key
+                        // press becomes the new shortcut.  Escape cancels.
+                        if capture_action.is_some() {
+                            ui.input(|i| {
+                                if let Some((key, _)) = i
+                                    .events
+                                    .iter()
+                                    .find_map(|e| match e {
+                                        egui::Event::Key {
+                                            key,
+                                            pressed: true,
+                                            modifiers,
+                                            ..
+                                        } => Some((*key, *modifiers)),
+                                        _ => None,
+                                    })
+                                {
+                                    if key == egui::Key::Escape {
+                                        return None;
+                                    }
+                                    let name = format!("{:?}", key);
+                                    if !audioscout_core::config::is_rebindable_key(&name) {
+                                        return None;
+                                    }
+                                    let binding = audioscout_core::config::HotkeyBinding {
+                                        key: name,
+                                        ctrl: i.modifiers.ctrl,
+                                        shift: i.modifiers.shift,
+                                        alt: i.modifiers.alt,
+                                    };
+                                    return Some(binding);
+                                }
+                                None
+                            })
+                            .map(|b| {
+                                if let Some(a) = &capture_action {
+                                    hotkey_rebind = Some((a.clone(), b));
+                                }
+                            });
+                            // Leave capture mode once a key was consumed.
+                            if hotkey_rebind.is_some() {
+                                capture_toggle = None;
+                            }
+                        }
                         if ui.add(egui::Button::new("Reset all to defaults").min_size(ui.available_size())).clicked() {
                             action = SettingsAction::ResetHotkeys;
                         }
@@ -2752,17 +2798,19 @@ impl eframe::App for AudioScoutApp {
                     ui.separator();
                     // ---- Close -------------------------------------------------
                     if ui.add(egui::Button::new("Close").min_size(ui.available_size())).clicked() {
-                        show_settings = false;
+                        action = SettingsAction::Close;
                     }
                 });
 
             // Write back the local mirrors + apply every edited field to the
             // config store (all settings persist to ~/.config/audioscout/
-            // config.json via `ConfigStore::save`).
-            self.show_settings = show_settings;
+            // config.json via `ConfigStore::save`).  The bottom "Close"
+            // button sets `SettingsAction::Close`; otherwise `.open()` keeps
+            // the mirror in sync with the window's X-button state.
+            self.show_settings = show_settings && action != SettingsAction::Close;
             self.settings_hotkey_capture = capture_toggle.clone();
-            if let Some((a, b)) = hotkey_rebind {
-                self.config_store.config_mut().hotkeys.insert(a, b);
+            if let Some((ref a, ref b)) = hotkey_rebind {
+                self.config_store.config_mut().hotkeys.insert(a.clone(), b.clone());
             }
 
             let mut changed = false;
@@ -2833,7 +2881,7 @@ impl eframe::App for AudioScoutApp {
             }
 
             match action {
-                SettingsAction::None => {}
+                SettingsAction::None | SettingsAction::Close => {}
                 SettingsAction::ResetHotkeys => {
                     self.config_store.config_mut().hotkeys = audioscout_core::config::hotkey_defaults();
                     self.settings_hotkey_capture = None;

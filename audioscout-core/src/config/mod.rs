@@ -172,7 +172,9 @@ impl ConfigStore {
     /// Delete every stored marker (DB rows + per-file marker sidecars).
     /// Used by Settings→Storage maintenance "Delete all markers".
     pub fn delete_all_markers(db: &crate::db::Database, config_dir: &Path) -> std::io::Result<usize> {
-        let n = db.delete_all_markers().map_err(std::io::Error::new(std::io::ErrorKind::Other,)?;
+        let n = db
+            .delete_all_markers()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
         // Marker sidecars are stored in the DB (tz §7); nothing on disk to
         // purge beyond the rows themselves.
         let _ = config_dir;
@@ -183,7 +185,9 @@ impl ConfigStore {
     /// Used by Settings→Storage maintenance "Delete all markers previews".
     /// Returns the number of DB rows removed.
     pub fn delete_all_previews(db: &crate::db::Database, config_dir: &Path) -> std::io::Result<usize> {
-        let n = db.delete_all_previews().map_err(std::io::Error::new(std::io::ErrorKind::Other,)?;
+        let n = db
+            .delete_all_previews()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
         let previews_dir = config_dir.join("previews");
         if previews_dir.exists() { std::fs::remove_dir_all(&previews_dir)?; }
         Ok(n)
