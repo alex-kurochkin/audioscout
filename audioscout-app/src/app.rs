@@ -2665,8 +2665,19 @@ impl eframe::App for AudioScoutApp {
                     // repo root: bold section headers on their own line, one
                     // horizontal row per control, framed hotkey table with a
                     // footer button, full-width Close at the very bottom.
+                    // Section headers render as an underlined heading across
+                    // the full section width (per mock-up): bold label on its
+                    // own line followed by a thin separator line.
                     let header = |ui: &mut egui::Ui, text: &str| {
                         ui.label(egui::RichText::new(text).strong());
+                        // Separator line spanning the full section width,
+                        // right under the heading (per mock-up).
+                        let w = ui.available_width();
+                        let x0 = ui.cursor().min.x;
+                        let y = ui.cursor().min.y + 1.0;
+                        ui.painter()
+                            .hline(egui::Rangef::new(x0, x0 + w), y, (1.0, ui.visuals().weak_text_color()));
+                        ui.add_space(6.0);
                     };
 
                     // Section frames must span the FULL window width (per
@@ -3026,28 +3037,19 @@ impl eframe::App for AudioScoutApp {
                 self.config_store.config_mut().space_behavior_stop = space_stop;
                 changed = true;
             }
+            // Table preview mode / Player display mode are START-UP defaults
+            // only: changing them here just persists the choice to
+            // config.json.  The live UI (scanner preview mode, audio view
+            // mode) is intentionally NOT touched — it keeps whatever the
+            // user switched to during this session until the app restarts.
             if preview_mode_idx != if self.config_store.config().preview_mode == "spectro" { 1 } else { 0 } {
                 let name = if preview_mode_idx == 1 { "spectro" } else { "wave" };
                 self.config_store.config_mut().preview_mode = name.to_string();
-                let mode = PreviewMode::from_str_name(name);
-                *self.preview_mode.lock().unwrap() = mode;
-                self.scanner.set_preview_mode(mode);
                 changed = true;
-                if self.show_settings {
-                    if let Some(dir) = self.current_dir.clone() {
-                        self.scanner.scan(dir, self.event_tx.clone());
-                    } else {
-                        self.request_previews();
-                    }
-                }
             }
             if player_mode_idx != if self.config_store.config().audio_view_mode == "spectro" { 1 } else { 0 } {
                 let name = if player_mode_idx == 1 { "spectro" } else { "wave" };
                 self.config_store.config_mut().audio_view_mode = name.to_string();
-                self.audio_view.mode = match name {
-                    "spectro" => AudioViewMode::Spectrogram,
-                    _ => AudioViewMode::Waveform,
-                };
                 changed = true;
             }
             if changed || hotkey_rebind.is_some() || action != SettingsAction::None {
