@@ -1044,6 +1044,30 @@ impl AudioScoutApp {
         ctrl.stop();
     }
 
+    /// Reset the playhead to frame 0 (hotkey "gotoStart", §3.5). ABSOLUTE
+    /// behavior: always jumps to the very beginning of the file regardless
+    /// of any active selection or loop range. A plain seek would be clamped
+    /// into the running session's [start,end) range by both the controller
+    /// and the output thread — so while playing from a selection that starts
+    /// after 0, `seek(0)` snapped back to the selection start instead of the
+    /// file start. When playing, restart the session from 0 to EOF (keeping
+    /// playback going from the top of the file); otherwise just park the
+    /// cursor/resume point at 0.
+    fn transport_goto_start(&mut self) {
+        let was_playing = self.player_state() == TransportState::Playing;
+        if was_playing {
+            self.transport_stop();
+        }
+        self.audio_view.set_cursor(0);
+        self.audio_view.auto_scroll_to_cursor();
+        self.transport_seek(0, audioscout_core::player::CursorSource::User);
+        if was_playing {
+            // Continue playback from the beginning of the file (§3.5): no
+            // selection ⇒ session runs 0..total_frames.
+            self.transport_play_pause();
+        }
+    }
+
     fn transport_seek(&mut self, frame: u64, source: audioscout_core::player::CursorSource) {
         if let Some(out) = &self.output { out.seek(frame, source); }
         // BUGFIX (cursor jump-ahead / snap-back): a seek teleports the true
@@ -1492,7 +1516,10 @@ impl AudioScoutApp {
                                 "zoomReset" => self.audio_view.zoom_reset(),
                                 "prev" => self.navigate_file(-1),
                                 "next" => self.navigate_file(1),
-                                "gotoStart" => { self.audio_view.set_cursor(0); self.transport_seek(0, audioscout_core::player::CursorSource::User); }
+                                // Absolute reset to file start (§3.5): must
+                                // jump to frame 0 even mid-selection/mid-loop;
+                                // if playing, continue from the top.
+                                "gotoStart" => self.transport_goto_start(),
                                 _ => {}
                             }
                         }
