@@ -2639,6 +2639,21 @@ impl eframe::App for AudioScoutApp {
                 .collapsible(false)
                 .resizable(true)
                 .default_width(520.0)
+                // Symmetric inner margins (per review): egui 0.29's Window
+                // has no `inner_margin()` builder — its content margin comes
+                // from the window `Frame` (style.visuals.window_margin), and
+                // the default bottom margin gets an extra `item_spacing.y`,
+                // so section frames (`ui.group`) end up closer to the
+                // bottom/right edge than to the left/top one.  Override the
+                // frame with all four sides pinned to the same value: the
+                // frame's right inset then equals its left inset from the
+                // window border.
+                .frame(egui::Frame::window(&ctx.style()).inner_margin(egui::Margin {
+                    left: 8.0,
+                    right: 8.0,
+                    top: 8.0,
+                    bottom: 8.0,
+                }))
                 .open(&mut show_settings)
                 .show(ctx, |ui| {
                     // Layout follows the Settings-window.avif mock-up in the
@@ -2653,9 +2668,10 @@ impl eframe::App for AudioScoutApp {
                     ui.group(|ui| {
                         header(ui, "Storage maintenance");
                         ui.horizontal(|ui| {
-                            if ui.button("🗑 Delete all markers").clicked() { action = SettingsAction::DeleteMarkers; }
-                            if ui.button("🧹 Scan markers").clicked() { action = SettingsAction::CleanOrphans; }
-                            if ui.button("🖼 Delete all previews").clicked() { action = SettingsAction::DeletePreviews; }
+                            // Plain text labels only — no icons (per review).
+                            if ui.button("Delete all markers").clicked() { action = SettingsAction::DeleteMarkers; }
+                            if ui.button("Scan markers").clicked() { action = SettingsAction::CleanOrphans; }
+                            if ui.button("Delete all previews").clicked() { action = SettingsAction::DeletePreviews; }
                         });
                     });
 
@@ -2859,7 +2875,19 @@ impl eframe::App for AudioScoutApp {
                                 capture_toggle = None;
                             }
                         }
-                        if ui.add(egui::Button::new("Reset all to defaults").min_size(ui.available_size())).clicked() {
+                        // Reset button: normal (default) height, full width.
+                        // `min_size(ui.available_size())` was wrong here — it
+                        // stretched the button over all remaining vertical
+                        // space of the section (per review).  Only the width
+                        // is pinned; the height stays whatever egui's style
+                        // gives a plain button.
+                        if ui
+                            .add(
+                                egui::Button::new("Reset all to defaults")
+                                    .min_size(egui::vec2(ui.available_width(), 0.0)),
+                            )
+                            .clicked()
+                        {
                             action = SettingsAction::ResetHotkeys;
                         }
                         if !settings_status.is_empty() {
@@ -2869,7 +2897,16 @@ impl eframe::App for AudioScoutApp {
 
                     ui.separator();
                     // ---- Close -------------------------------------------------
-                    if ui.add(egui::Button::new("Close").min_size(ui.available_size())).clicked() {
+                    // Full width, normal button height (same fix as the
+                    // Reset button above — `available_size()` would stretch
+                    // it over all leftover vertical space).
+                    if ui
+                        .add(
+                            egui::Button::new("Close")
+                                .min_size(egui::vec2(ui.available_width(), 0.0)),
+                        )
+                        .clicked()
+                    {
                         action = SettingsAction::Close;
                     }
                 });
