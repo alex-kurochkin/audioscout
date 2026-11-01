@@ -43,19 +43,19 @@ use image::GenericImageView;
 //     here: it only ever happens across rebuilds with edited constants.
 //     The version suffix uses the raw bit pattern (`to_bits`) so it round-
 //     trips exactly ("player@0x42a00000" style).
-const TOOLBAR_HEIGHT: f32 = 26.0;
+const TOOLBAR_HEIGHT: f32 = 30.0;
 const AUDIO_VIEW_HEIGHT: f32 = 200.0;
-const PLAYER_HEIGHT: f32 = 26.0;
-const ACTIONS_HEIGHT: f32 = 26.0;
-const STATUS_HEIGHT: f32 = 26.0;
+const PLAYER_HEIGHT: f32 = 50.0;
+const ACTIONS_HEIGHT: f32 = 28.0;
+const STATUS_HEIGHT: f32 = 22.0;
 
 // Paired constants #1: LEFT content inset of each panel — how far the first
 // widget of the panel's inner horizontal row is indented from the panel's
 // left edge. Applied inside `ui.horizontal(...)` via `add_space` (see
 // `apply_content_left_inset`).
-const TOOLBAR_CONTENT_LEFT_INSET: f32 = 4.0;
-const PLAYER_CONTENT_LEFT_INSET: f32 = 4.0;
-const ACTIONS_CONTENT_LEFT_INSET: f32 = 4.0;
+const TOOLBAR_CONTENT_LEFT_INSET: f32 = 2.0;
+const PLAYER_CONTENT_LEFT_INSET: f32 = 2.0;
+const ACTIONS_CONTENT_LEFT_INSET: f32 = 2.0;
 const STATUS_CONTENT_LEFT_INSET: f32 = 2.0;
 
 // Paired constants #2: TOP content inset of each panel — the distance from
@@ -63,10 +63,10 @@ const STATUS_CONTENT_LEFT_INSET: f32 = 2.0;
 // stay <= the paired *_HEIGHT minus the content's natural height, otherwise
 // the content is clipped by the exact-height panel (see
 // `apply_content_top_inset`).
-const TOOLBAR_CONTENT_TOP_INSET: f32 = 6.0;
-const PLAYER_CONTENT_TOP_INSET: f32 = 6.0;
-const ACTIONS_CONTENT_TOP_INSET: f32 = 6.0;
-const STATUS_CONTENT_TOP_INSET: f32 = 4.0;
+const TOOLBAR_CONTENT_TOP_INSET: f32 = 1.0;
+const PLAYER_CONTENT_TOP_INSET: f32 = 1.0;
+const ACTIONS_CONTENT_TOP_INSET: f32 = 1.0;
+const STATUS_CONTENT_TOP_INSET: f32 = 1.0;
 
 /// Build a stable-but-versioned panel id. The version covers the panel
 /// height constant and its paired inset constants: any change to either
