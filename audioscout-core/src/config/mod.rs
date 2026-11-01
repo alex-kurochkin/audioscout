@@ -36,24 +36,41 @@ pub fn hotkey_label(action: &str) -> &'static str {
 
 /// Default shortcut strings per tz §9 (hotkey model): Space toggles
 /// playback, Ctrl+Z/Ctrl+Shift+Z is undo/redo, Ctrl+arrows zoom, etc.
-/// Used by Settings→Hotkeys "Reset all to defaults".
+/// Used by Settings→Hotkeys "Reset all to defaults".  The map is ordered
+/// exactly like `HOTKEY_ACTIONS` — serde_json keeps insertion order, so the
+/// persisted config.json and the Settings table list actions in the tz order.
 pub fn hotkey_defaults() -> HashMap<String, HotkeyBinding> {
-    let mut hotkeys = HashMap::new();
-    hotkeys.insert("mute".into(), HotkeyBinding { key: "M".into(), ctrl: true, shift: false, alt: false });
-    hotkeys.insert("normalize".into(), HotkeyBinding { key: "N".into(), ctrl: true, shift: false, alt: false });
-    hotkeys.insert("prev".into(), HotkeyBinding { key: "P".into(), ctrl: false, shift: false, alt: false });
-    hotkeys.insert("next".into(), HotkeyBinding { key: "N".into(), ctrl: false, shift: false, alt: false });
-    hotkeys.insert("playpause".into(), HotkeyBinding { key: "Space".into(), ctrl: false, shift: false, alt: false });
-    hotkeys.insert("gotoStart".into(), HotkeyBinding { key: "W".into(), ctrl: false, shift: false, alt: false });
-    hotkeys.insert("undo".into(), HotkeyBinding { key: "Z".into(), ctrl: true, shift: false, alt: false });
-    hotkeys.insert("redo".into(), HotkeyBinding { key: "Z".into(), ctrl: true, shift: true, alt: false });
-    hotkeys.insert("zoomIn".into(), HotkeyBinding { key: "ArrowUp".into(), ctrl: true, shift: false, alt: false });
-    hotkeys.insert("zoomOut".into(), HotkeyBinding { key: "ArrowDown".into(), ctrl: true, shift: false, alt: false });
-    hotkeys.insert("zoomReset".into(), HotkeyBinding { key: "0".into(), ctrl: true, shift: false, alt: false });
-    hotkeys.insert("addMarker".into(), HotkeyBinding { key: "M".into(), ctrl: false, shift: false, alt: true });
-    hotkeys.insert("deleteMarker".into(), HotkeyBinding { key: "Delete".into(), ctrl: false, shift: false, alt: false });
-    hotkeys.insert("clearSelection".into(), HotkeyBinding { key: "Escape".into(), ctrl: false, shift: false, alt: false });
-    hotkeys
+    // (action id, key, ctrl, shift, alt) — tz §9.
+    const DEFAULTS: [(&str, &str, bool, bool, bool); 14] = [
+        ("playpause", "Space", false, false, false),   // play/pause audio
+        ("prev", "P", false, false, false),            // previous file
+        ("next", "N", false, false, false),            // next file
+        ("gotoStart", "W", false, false, false),       // rewind to start
+        ("mute", "M", true, false, false),             // mute selection
+        ("normalize", "N", true, false, false),        // normalize selection
+        ("undo", "Z", true, false, false),             // undo
+        ("redo", "Z", true, true, false),              // redo
+        ("addMarker", "M", false, false, true),        // add marker
+        ("deleteMarker", "Delete", false, false, false), // delete marker
+        ("clearSelection", "Escape", false, false, false), // clear selection
+        ("zoomIn", "ArrowUp", true, false, false),     // zoom in
+        ("zoomOut", "ArrowDown", true, false, false),  // zoom out
+        ("zoomReset", "0", true, false, false),        // reset zoom
+    ];
+    DEFAULTS
+        .iter()
+        .map(|(id, key, ctrl, shift, alt)| {
+            (
+                (*id).to_string(),
+                HotkeyBinding {
+                    key: (*key).to_string(),
+                    ctrl: *ctrl,
+                    shift: *shift,
+                    alt: *alt,
+                },
+            )
+        })
+        .collect()
 }
 
 /// Keys egui can name back (`Key::from_name` round-trip) — used to validate

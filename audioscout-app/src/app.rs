@@ -2603,6 +2603,10 @@ impl eframe::App for AudioScoutApp {
             let mut player_mode_idx: usize =
                 if self.config_store.config().audio_view_mode == "spectro" { 1 } else { 0 };
             // Hotkey table snapshot + edit result (rebinding / capture state).
+            // Rows follow `HOTKEY_ACTIONS` order (tz §9); the defaults map is
+            // built from the same ordered list, so `remove()` here is O(1) on
+            // the hash lookup and never misses.
+            let default_hotkeys = audioscout_core::config::hotkey_defaults();
             let hotkey_rows: Vec<(String, audioscout_core::config::HotkeyBinding)> =
                 audioscout_core::config::HOTKEY_ACTIONS
                     .iter()
@@ -2614,7 +2618,7 @@ impl eframe::App for AudioScoutApp {
                                 .hotkeys
                                 .get(*a)
                                 .cloned()
-                                .unwrap_or_else(|| audioscout_core::config::hotkey_defaults().remove(*a).unwrap()),
+                                .unwrap_or_else(|| default_hotkeys.get(*a).cloned().unwrap()),
                         )
                     })
                     .collect();
@@ -2637,19 +2641,27 @@ impl eframe::App for AudioScoutApp {
                 .default_width(520.0)
                 .open(&mut show_settings)
                 .show(ctx, |ui| {
+                    // Layout follows the Settings-window.avif mock-up in the
+                    // repo root: bold section headers on their own line, one
+                    // horizontal row per control, framed hotkey table with a
+                    // footer button, full-width Close at the very bottom.
+                    let header = |ui: &mut egui::Ui, text: &str| {
+                        ui.label(egui::RichText::new(text).strong());
+                    };
+
                     // ---- Storage maintenance --------------------------------
                     ui.group(|ui| {
-                        ui.label("Storage maintenance:");
+                        header(ui, "Storage maintenance");
                         ui.horizontal(|ui| {
-                            if ui.button("Delete all markers").clicked() { action = SettingsAction::DeleteMarkers; }
-                            if ui.button("Clean orphaned previews").clicked() { action = SettingsAction::CleanOrphans; }
-                            if ui.button("Delete all markers previews").clicked() { action = SettingsAction::DeletePreviews; }
+                            if ui.button("🗑 Delete all markers").clicked() { action = SettingsAction::DeleteMarkers; }
+                            if ui.button("🧹 Scan markers").clicked() { action = SettingsAction::CleanOrphans; }
+                            if ui.button("🖼 Delete all previews").clicked() { action = SettingsAction::DeletePreviews; }
                         });
                     });
 
                     // ---- Undo history ----------------------------------------
                     ui.group(|ui| {
-                        ui.label("Undo history");
+                        header(ui, "Undo history");
                         ui.horizontal(|ui| {
                             ui.label("History depth (steps):");
                             // Two-digit number box per spec (1..=99); clicking
@@ -2673,10 +2685,29 @@ impl eframe::App for AudioScoutApp {
                         });
                         ui.horizontal(|ui| {
                             ui.label("Undo data directory:");
-                            ui.add(
-                                egui::TextEdit::singleline(&mut undo_dir_text)
+                            // Editable box per tz; the mock-up shows the path
+                            // in home-relative "~/..." form.  We edit a local
+                            // display copy (tilde-prefixed) and expand "~"
+                            // back to an absolute path when applying, so the
+                            // config keeps a real filesystem path.
+                            let home = dirs_next::home_dir()
+                                .map(|h| h.to_string_lossy().into_owned())
+                                .unwrap_or_default();
+                            let mut display_dir = undo_dir_text
+                                .strip_prefix(home.as_str())
+                                .map(|rest| format!("~{rest}"))
+                                .unwrap_or_else(|| undo_dir_text.clone());
+                            let resp = ui.add(
+                                egui::TextEdit::singleline(&mut display_dir)
                                     .desired_width((ui.available_width() - 90.0).max(120.0)),
                             );
+                            if resp.changed() {
+                                undo_dir_text = if let Some(rest) = display_dir.strip_prefix('~') {
+                                    format!("{home}{rest}")
+                                } else {
+                                    display_dir
+                                };
+                            }
                             if ui.button("Browse…").clicked() {
                                 browse_undo_dir = true;
                             }
@@ -2685,7 +2716,7 @@ impl eframe::App for AudioScoutApp {
 
                     // ---- Behaviour and appearance ----------------------------
                     ui.group(|ui| {
-                        ui.label("Behavior and appearance");
+                        header(ui, "Behavior and appearance");
                         ui.horizontal(|ui| {
                             ui.label("Preview prefetch count:");
                             // Two-digit box per spec (0..=99).
@@ -2742,44 +2773,44 @@ impl eframe::App for AudioScoutApp {
 
                     // ---- Hotkeys ----------------------------------------------
                     ui.group(|ui| {
-                        ui.label("Hotkeys (click a shortcut to reassign)");
+                        header(ui, "Hotkeys (click a shortcut to reassign)");
                         // Two-column table: Action | Shortcut.  The rows live
                         // in a vertical ScrollArea — mouse wheel and the
                         // slider on the right both scroll through it (§ tz).
                         let avail = ui.available_width();
                         let action_col = 240.0;
                         let shortcut_col = (avail - action_col - 22.0).max(80.0);
-                        ui.horizontal(|ui| {
-                            ui.add_sized([action_col, 18.0], egui::Label::new(egui::RichText::new("Action").strong()));
-                            ui.add_sized([shortcut_col, 18.0], egui::Label::new(egui::RichText::new("Shortcut").strong()));
-                        });
-                        ui.separator();
-                        egui::ScrollArea::vertical()
-                            .id_salt("hotkey_list")
-                            .max_height(240.0)
-                            .auto_shrink([false, false])
+                        egui::Grid::new("hotkey_table")
+                            .num_columns(2)
+                            .striped(true)
+                            .min_col_width(action_col)
                             .show(ui, |ui| {
+                                ui.label(egui::RichText::new("Action").strong());
+                                ui.label(egui::RichText::new("Shortcut").strong());
+                                ui.end_row();
                                 for (action_name, binding) in &hotkey_rows {
-                                    ui.horizontal(|ui| {
-                                        ui.add_sized([action_col, 18.0], egui::Label::new(audioscout_core::config::hotkey_label(action_name)));
-                                        let label = if capture_action.as_deref() == Some(action_name.as_str()) {
-                                            "Press keys…".to_string()
-                                        } else {
-                                            audioscout_core::config::format_hotkey(binding)
-                                        };
-                                        let resp = ui.add_sized(
-                                            [shortcut_col, 18.0],
-                                            egui::Button::new(
-                                                egui::RichText::new(label).monospace().color(ui.visuals().noninteractive().fg_color),
-                                            )
-                                            .frame(false),
-                                        );
-                                        if resp.clicked() {
-                                            // Click a shortcut -> start capturing; click again cancels.
-                                            capture_toggle =
-                                                if capture_action.as_deref() == Some(action_name.as_str()) { None } else { Some(action_name.clone()) };
-                                        }
-                                    });
+                                    ui.add_sized([action_col, 18.0], egui::Label::new(audioscout_core::config::hotkey_label(action_name)));
+                                    let label = if capture_action.as_deref() == Some(action_name.as_str()) {
+                                        "Press keys…".to_string()
+                                    } else {
+                                        audioscout_core::config::format_hotkey(binding)
+                                    };
+                                    let resp = ui.add_sized(
+                                        [shortcut_col, 18.0],
+                                        egui::Button::new(
+                                            // Non-interactive tint: `WidgetVisuals`
+                                            // has no fg_color in this egui version,
+                                            // the text color lives in `widgets.inactive.fg_stroke`.
+                                            egui::RichText::new(label).monospace().color(ui.visuals().noninteractive().fg_stroke.color),
+                                        )
+                                        .frame(false),
+                                    );
+                                    if resp.clicked() {
+                                        // Click a shortcut -> start capturing; click again cancels.
+                                        capture_toggle =
+                                            if capture_action.as_deref() == Some(action_name.as_str()) { None } else { Some(action_name.clone()) };
+                                    }
+                                    ui.end_row();
                                 }
                             });
                         // ---- Keyboard capture for reassignment ----------------
@@ -2791,9 +2822,12 @@ impl eframe::App for AudioScoutApp {
                             // not fire while a shortcut is being captured.
                             let mut captured: Option<audioscout_core::config::HotkeyBinding> = None;
                             let mut escape_pressed = false;
-                            ui.input(|i| {
+                            // `ui.input(|i| …)` hands out an immutable
+                            // reference — mutating the event queue (to swallow
+                            // keys during capture) needs `Input::mutation`.
+                            ui.input_mut(|i| {
                                 i.events.retain(|e| match e {
-                                    egui::Event::Key { key, pressed: true | false, repeat: false, modifiers } => {
+                                    egui::Event::Key { key, pressed: true | false, repeat: false, modifiers, physical_key: _ } => {
                                         if *key == egui::Key::Escape {
                                             escape_pressed = true;
                                             return false;
