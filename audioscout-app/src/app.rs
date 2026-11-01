@@ -43,11 +43,11 @@ use image::GenericImageView;
 //     here: it only ever happens across rebuilds with edited constants.
 //     The version suffix uses the raw bit pattern (`to_bits`) so it round-
 //     trips exactly ("player@0x42a00000" style).
-const TOOLBAR_HEIGHT: f32 = 40.0;
+const TOOLBAR_HEIGHT: f32 = 26.0;
 const AUDIO_VIEW_HEIGHT: f32 = 200.0;
-const PLAYER_HEIGHT: f32 = 80.0;
-const ACTIONS_HEIGHT: f32 = 40.0;
-const STATUS_HEIGHT: f32 = 20.0;
+const PLAYER_HEIGHT: f32 = 26.0;
+const ACTIONS_HEIGHT: f32 = 26.0;
+const STATUS_HEIGHT: f32 = 26.0;
 
 /// Build a stable-but-versioned panel id. Any change to the height constant
 /// yields a different id, which invalidates egui's cached `PanelState`.
