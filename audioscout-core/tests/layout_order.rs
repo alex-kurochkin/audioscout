@@ -20,8 +20,8 @@ fn app_source() -> String {
 /// Panels may be declared either with a plain string id
 /// (`TopBottomPanel::bottom("player")`), through the height-versioned id
 /// helper (`TopBottomPanel::bottom(panel_id_with_height("player", H))`) or
-/// through the paired height+top-inset helper
-/// (`TopBottomPanel::bottom(panel_id("player", H, INSET))`) — all forms are
+/// through the paired height+insets helper
+/// (`TopBottomPanel::bottom(panel_id("player", H, LEFT, TOP))`) — all forms are
 /// recognized and normalized to the bare panel name.
 fn bottom_panel_ids(src: &str) -> Vec<String> {
     const PLAIN: &str = "TopBottomPanel::bottom(\"";
