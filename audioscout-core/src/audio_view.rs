@@ -42,7 +42,15 @@ pub struct AudioView {
 
 impl AudioView {
     pub fn new(total_frames: u64) -> Self {
-        Self { view_range: ViewRange::new(0, total_frames), total_frames, cursor_frame: 0, selection: None, active_marker: None, auto_scroll: true, mode: AudioViewMode::Waveform }
+        Self::with_mode(total_frames, AudioViewMode::Waveform)
+    }
+
+    /// Same as [`AudioView::new`] but starts in the given display mode.
+    /// Used when loading a file so the player keeps the mode selected in
+    /// Settings (`audio_view_mode` in config.json) instead of resetting to
+    /// waveform.
+    pub fn with_mode(total_frames: u64, mode: AudioViewMode) -> Self {
+        Self { view_range: ViewRange::new(0, total_frames), total_frames, cursor_frame: 0, selection: None, active_marker: None, auto_scroll: true, mode }
     }
     /// Flip between the waveform and spectrogram visualizations.
     pub fn toggle_mode(&mut self) {

@@ -737,7 +737,11 @@ impl AudioScoutApp {
                     let mtime = meta.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_secs()).unwrap_or(0);
                     if let Ok(markers) = self.db.load_markers(path, size, mtime) { self.document.markers = markers; }
                 }
-                self.audio_view = AudioView::new(self.document.total_frames());
+                // Preserve the current player display mode (Waveform/Spectrogram)
+                // across file loads. The default comes from config.json at startup;
+                // loading a new file must not silently reset it to waveform.
+                let keep_mode = self.audio_view.mode;
+                self.audio_view = AudioView::with_mode(self.document.total_frames(), keep_mode);
                 self.active_file = Some(path.to_path_buf());
                 // Hand the fresh PCM buffer to the output thread (§5.1: stop
                 // of previous output + resume-point reset happen there).
