@@ -16,18 +16,40 @@ fn app_source() -> String {
     panic!("app.rs not found");
 }
 
-/// Extract the `id` of every TopBottomPanel declaration, in source order.
+/// Extract the base name of every bottom-panel declaration, in source order.
+/// Panels may be declared either with a plain string id
+/// (`TopBottomPanel::bottom("player")`) or through the height-versioned id
+/// helper (`TopBottomPanel::bottom(panel_id_with_height("player", H))`) —
+/// both forms are recognized and normalized to the bare panel name.
 fn bottom_panel_ids(src: &str) -> Vec<String> {
+    const PLAIN: &str = "TopBottomPanel::bottom(\"";
+    const VERSIONED: &str = "TopBottomPanel::bottom(panel_id_with_height(\"";
     let mut ids = Vec::new();
     for line in src.lines() {
-        if let Some(pos) = line.find("TopBottomPanel::bottom(\"") {
-            let rest = &line[pos + "TopBottomPanel::bottom(\"".len()..];
-            if let Some(end) = rest.find('"') {
-                ids.push(rest[..end].to_string());
-            }
+        let (needle, start) = match line.find(VERSIONED) {
+            // Versioned form is checked first; its prefix contains the plain
+            // one, so whichever matches wins exactly once per line.
+            Some(i) => (VERSIONED, i + VERSIONED.len()),
+            None => match line.find(PLAIN) {
+                Some(i) => (PLAIN, i + PLAIN.len()),
+                None => continue,
+            },
+        };
+        let _ = needle;
+        let rest = &line[start..];
+        if let Some(end) = rest.find('"') {
+            ids.push(rest[..end].to_string());
         }
     }
     ids
+}
+
+/// Byte offset of a given bottom panel's declaration, accepting both the
+/// plain-string and the `panel_id_with_height` forms.
+fn bottom_panel_src_find(src: &str, name: &str) -> usize {
+    src.find(&format!("TopBottomPanel::bottom(\"{name}\""))
+        .or_else(|| src.find(&format!("TopBottomPanel::bottom(panel_id_with_height(\"{name}\"")))
+        .unwrap_or_else(|| panic!("panel \"{name}\" missing"))
 }
 
 #[test]
@@ -38,9 +60,9 @@ fn player_panel_declared_above_audio_view() {
     // player controls (Play/Stop…), visualization window. The transport
     // panel sits *above* the audio-content view and directly under the
     // file-actions panel — exactly what bug #1 asked for.
-    let ids = bottom_panel_ids(&app_source());
-    assert_eq!(ids, vec!["audio_view", "player", "actions", "status"],
-        "unexpected bottom panel order {:?}", ids);
+    let names = bottom_panel_ids(&app_source());
+    assert_eq!(names, vec!["audio_view", "player", "actions", "status"],
+        "unexpected bottom panel order {:?}", names);
 }
 
 #[test]
@@ -52,7 +74,8 @@ fn all_bottom_panels_declared_before_central_panel() {
     let central = src.find("CentralPanel::default().show").expect("central panel");
     for name in ["\"status\"", "\"player\"", "\"audio_view\"", "\"actions\""] {
         let pos = src
-            .find(&format!("TopBottomPanel::bottom({name}"))
+            .find(&format!("TopBottomPanel::bottom(panel_id_with_height({name}"))
+            .or_else(|| src.find(&format!("TopBottomPanel::bottom({name}")))
             .unwrap_or_else(|| panic!("panel {name} missing"));
         assert!(pos < central, "panel {name} must be declared before CentralPanel");
     }
@@ -65,48 +88,35 @@ fn toggle_buttons_present() {
     assert!(src.contains("self.toggle_preview_mode()"), "toolbar preview toggle missing");
     // Visualization-area toggle (bug #3): the switch code existed but its
     // state was unknown — now `AudioView::mode` is a real, persisted state
-    // flipped through `toggle_audio_view_mode()` from a toolbar button.
+    // flipped through `toggle_audio_view_mode()`. Per §3.6 the *only* place
+    // this toggle may live is the player panel (§3.5) — the duplicate that
+    // used to sit on the top toolbar is removed.
     assert!(src.contains("self.toggle_audio_view_mode()"), "view-mode toggle missing");
 
-    // There are exactly two view-mode toggle handlers in the source: the
-    // definition (`fn toggle_audio_view_mode`) plus one call site per button.
-    // One button sits on the top toolbar (bug #3 asks for the toggle there),
-    // the other on the player panel (§3.5 "toggle Waveform/Spectrogram").
+    // Exactly ONE view-mode toggle call site remains: the player-panel button.
     let mut toggle_uses = src
         .match_indices("self.toggle_audio_view_mode()")
         .map(|(i, _)| i);
-    let toolbar_toggle_at = toggle_uses.next().expect("toolbar view toggle missing");
     let player_toggle_at = toggle_uses.next().expect("player-panel view toggle missing");
     assert!(
         toggle_uses.next().is_none(),
         "unexpected extra view-toggle call sites"
     );
 
-    let toolbar_at = src.find("TopBottomPanel::top(\"toolbar\")").expect("toolbar panel");
-    let side_at = src.find("SidePanel::left").expect("folder tree panel");
-    assert!(
-        toolbar_at < toolbar_toggle_at && toolbar_toggle_at < side_at,
-        "the first Waveform/Spectrogram toggle must be rendered on the top toolbar panel"
-    );
-
-    let player_at = src
-        .find("TopBottomPanel::bottom(\"player\")")
-        .expect("player panel");
-    let actions_at = src
-        .find("TopBottomPanel::bottom(\"actions\")")
-        .expect("actions panel");
+    let player_at = bottom_panel_src_find(&src, "player");
+    let actions_at = bottom_panel_src_find(&src, "actions");
     assert!(
         player_at < player_toggle_at && player_toggle_at < actions_at,
-        "the second Waveform/Spectrogram toggle must be rendered on the player panel"
+        "the only Waveform/Spectrogram view toggle must be rendered on the player panel"
     );
 
-    // Both toggles must reflect their live state via SelectableLabel so the
+    // The toggle must reflect its live state via SelectableLabel so the
     // current mode is visible (bug #3: "state of the switch code unknown").
     let selectable_count = src.matches("egui::SelectableLabel::new(").count();
     assert!(
-        selectable_count >= 3,
-        "expected at least three stateful toggle buttons (table preview + \
-         toolbar/player view toggles), found {}",
+        selectable_count >= 2,
+        "expected at least two stateful toggle buttons (table preview + \
+         player view toggle), found {}",
         selectable_count
     );
 
@@ -276,12 +286,11 @@ fn file_table_header_shares_one_grid_with_the_rows() {
     );
 }
 
-/// Regression guard for the Waveform/Spectrogram toggle pair: the
-/// visualization-area mode is flipped from exactly TWO controls — one on
-/// the top toolbar, one on the player panel (§3.5) — both driving the same
-/// live `AudioView::mode` state through identically-named widgets. The
-/// table-thumbnail toggle (preview_btn) is a separate control and must
-/// remain untouched.
+/// Regression guard for the Waveform/Spectrogram toggle: per §3.6 the
+/// visualization-area mode is flipped from exactly ONE control — the button
+/// on the player panel (§3.5). The duplicate that used to sit on the top
+/// toolbar is removed. The table-thumbnail toggle (preview_btn) is a separate
+/// control and must remain untouched.
 #[test]
 fn audio_view_mode_has_a_single_toggle_button() {
     let code: String = app_source()
@@ -302,14 +311,14 @@ fn audio_view_mode_has_a_single_toggle_button() {
 
     assert_eq!(
         code.matches("let view_btn = egui::SelectableLabel::new(").count(),
-        2,
-        "the waveform/spectrogram visualization toggle must exist exactly twice \
-         (top toolbar + player panel)"
+        1,
+        "the waveform/spectrogram visualization toggle must exist exactly once \
+         (player panel only)"
     );
     assert_eq!(
         code.matches("self.toggle_audio_view_mode()").count(),
-        2,
-        "exactly two controls may flip the audio-view display mode"
+        1,
+        "exactly one control may flip the audio-view display mode"
     );
     // The table-thumbnail toggle (preview_btn) is a different control and
     // must still be present.

@@ -2198,7 +2198,16 @@ impl eframe::App for AudioScoutApp {
                 // borrowed immutably inside).
                 let mut sort_request: Option<Column> = None;
 
-                egui::ScrollArea::vertical()
+                // BUGFIX (horizontal scrollbar): the list used to be hosted by
+                // `ScrollArea::vertical()`, which explicitly disables
+                // horizontal scrolling (`enable_hscrolling(false)`), so the
+                // bottom scrollbar strip never appeared even when the columns
+                // were wider than the panel. `ScrollArea::both()` enables both
+                // axes; with `auto_shrink([false, false])` the content keeps
+                // its natural (sum-of-columns) width, so whenever the table is
+                // wider than the available area a horizontal bar shows up at
+                // the bottom of the files window.
+                egui::ScrollArea::both()
                     .id_salt("file_list")
                     .auto_shrink([false, false])
                     .max_height(list_max_height)
