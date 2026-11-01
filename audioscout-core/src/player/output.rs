@@ -1282,15 +1282,18 @@ fn controller_thread(
                 shared.true_playhead_file_frame.store(0, Ordering::Release);
                 sink.stop();
                 shared.source_active.store(false, Ordering::Relaxed);
-                let start = shared.session_start_frame.load(Ordering::Relaxed);
                 let mut ctrl = controller.lock().unwrap_or_else(|p| p.into_inner());
+                // §3.5 stop: park at the RESUME point (file start or the
+                // place the user last clicked), NOT at the session start.
+                ctrl.stop_parked();
+                let start = ctrl.resume_frame();
+                shared.session_start_frame.store(start, Ordering::Relaxed);
                 // Seed the playhead clock in stream-sample units when a
                 // document is loaded; without one fall back to file units.
                 match &doc {
                     Some(d) => shared.consumed_samples.store(stream_sample_at(d, start, stream_format), Ordering::Relaxed),
                     None => shared.consumed_samples.store(start * channels_of(&doc) as u64, Ordering::Relaxed),
                 }
-                ctrl.stop_at_session_start(start);
             }
             Some(Cmd::Seek { frame, source }) => {
                 if let Some(d) = &doc {

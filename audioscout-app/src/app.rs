@@ -717,8 +717,16 @@ impl AudioScoutApp {
             self.status_message = "Unsupported file format".to_string();
             return;
         }
+        // BUGFIX (cursor parked somewhere else after a Stop of the previous
+        // file): a fresh load ALWAYS parks the playhead at the start of the
+        // file before anything can play (§3.5). transport_stop() below now
+        // parks at the OLD file's resume point, so reset the transport state
+        // machine AND the visible cursor explicitly to frame 0 right away.
+        {
+            let mut ctrl = self.player.lock().unwrap_or_else(|p| p.into_inner());
+            ctrl.reset();
+        }
         self.transport_stop();
-        self.player.lock().unwrap_or_else(|p| p.into_inner()).reset();
         match audioscout_core::audio_io::load_audio(path) {
             Ok((samples, sr, ch, st)) => {
                 // DEBUG (playback diagnostics): frames==0 here means the file
@@ -1034,14 +1042,27 @@ impl AudioScoutApp {
     fn transport_stop(&mut self) {
         if let Some(out) = &self.output { out.stop(); }
         // BUGFIX (cursor jump-ahead / snap-back): Stop rewinds the hardware
-        // clock to the session start; drop any live extrapolation so the next
+        // clock to the parked frame; drop any live extrapolation so the next
         // Play re-arms it from a consistent point.
         self.playhead_session = None;
         // BUGFIX (cursor races ahead of the audio): no queued samples remain
         // above the rewound clock — invalidate the cached fed-ceiling too.
         self.playhead_fed_ceiling = None;
-        let mut ctrl = self.player.lock().unwrap_or_else(|p| p.into_inner());
-        ctrl.stop();
+        let parked = {
+            let mut ctrl = self.player.lock().unwrap_or_else(|p| p.into_inner());
+            ctrl.stop();
+            ctrl.resume_frame()
+        };
+        // §3.5 stop: the cursor parks at the RESUME point — "начало файла или
+        // место, ранее указанное мышкой" — NOT at the last session's start.
+        // The output thread may still be draining its queue when we get here
+        // (Cmd::Stop is asynchronous), and poll_playhead mirrors that lagging
+        // hardware clock back into the controller — park the visible cursor
+        // synchronously so Stop feels instant and cannot be dragged away.
+        self.audio_view.set_cursor(parked);
+        self.audio_view.auto_scroll_to_cursor();
+        self.playhead_est_frame = parked;
+        self.playhead_est_at = std::time::Instant::now();
     }
 
     /// Reset the playhead to frame 0 (hotkey "gotoStart", §3.5). ABSOLUTE

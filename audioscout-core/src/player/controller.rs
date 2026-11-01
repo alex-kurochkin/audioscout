@@ -334,22 +334,30 @@ impl Controller {
         }
     }
 
-    /// Immediate silence + rewind the cursor to the start of the last
-    /// session (§3.5/§5.3 stop).
+    /// Immediate silence; the cursor parks at the RESUME point (§3.5 stop):
+    /// "начало файла или место, ранее указанное мышкой". The resume point is
+    /// 0 after a fresh load / `reset()` and becomes the user's click target
+    /// as soon as they seek while stopped — exactly the required semantics.
+    /// It must NOT be folded back into the last session's start: playing a
+    /// selection then pressing Stop used to leave the cursor at the
+    /// selection's left bound instead of where the user had put it.
+    /// A PAUSE before Stop freezes the resume point at the paused position —
+    /// that spot wins over the older user click (Stop returns the cursor to
+    /// where playback actually was when it ended). While Playing with no
+    /// pause in between, the live estimate is the current position.
     pub fn stop(&mut self) {
-        if self.state == TransportState::Playing {
-            // Snapshot the live position before rewinding so nothing else
-            // racing with Stop reads a mid-session frame.
-            self.current_frame = self.estimated_frame();
-        }
+        let parked = match self.state {
+            TransportState::Playing => self.estimated_frame(),
+            _ => self.resume_frame,
+        };
         self.state = TransportState::Stopped;
-        self.current_frame = self.start_frame;
-        self.resume_frame = self.start_frame;
+        self.current_frame = parked;
+        self.resume_frame = parked;
         self.clock_base_at = std::time::Instant::now();
         self.last_commit_at = std::time::Instant::now();
-        self.last_commit_frame = self.start_frame;
+        self.last_commit_frame = parked;
         self.repark_display_frontier(self.last_commit_at);
-        self.playhead.set_position_samples(self.current_frame);
+        self.playhead.set_position_samples(parked);
         self.playhead.set_playing(false);
     }
 
@@ -665,8 +673,32 @@ impl Controller {
         self.repark_display_frontier(self.last_commit_at);
         self.playhead.set_position_samples(frame);
     }
-    /// Stop with the playhead rewound to the session start point (§5.3).
-    pub fn stop_at_session_start(&mut self, start: u64) {
+    /// Output-thread hook for `Cmd::Stop`. §3.5 stop semantics: playback is
+    /// silenced and the cursor parks at the RESUME point — "начало файла или
+    /// место, ранее указанное мышкой" — NOT at the last session's start. The
+    /// caller (`output.rs`) re-seeds the hardware clock to this frame before
+    /// invoking us, so a later Play-after-Stop starts from exactly here.
+    /// A lagging hardware-clock snapshot must never drag the parked cursor
+    /// backwards, hence the clamp against the current display estimate.
+    pub fn stop_parked(&mut self) {
+        let parked = self.resume_frame.max(self.estimated_frame());
+        self.state = TransportState::Stopped;
+        self.current_frame = parked; self.resume_frame = parked;
+        self.session_clock_at = std::time::Instant::now();
+        self.clock_base_at = std::time::Instant::now();
+        self.last_commit_at = std::time::Instant::now();
+        self.last_commit_frame = self.current_frame;
+        self.last_tick_delta_frames = 0;
+        self.subframe_carry_secs = 0.0;
+        self.repark_display_frontier(self.last_commit_at);
+        self.playhead.set_position_samples(parked); self.playhead.set_playing(false);
+    }
+    /// Natural end of a non-loop session (§5.3): playback completed on its
+    /// own, silence and the cursor rewinds to the START OF THE SESSION that
+    /// just finished (loop restarts land there too). This is deliberately
+    /// different from the user-initiated Stop (`stop_parked`), which parks
+    /// at the resume point instead.
+    pub fn finish_session_at(&mut self, start: u64) {
         self.state = TransportState::Stopped;
         self.current_frame = start; self.resume_frame = start;
         self.session_clock_at = std::time::Instant::now();
@@ -677,10 +709,6 @@ impl Controller {
         self.subframe_carry_secs = 0.0;
         self.repark_display_frontier(self.last_commit_at);
         self.playhead.set_position_samples(start); self.playhead.set_playing(false);
-    }
-    /// Natural end of a non-loop session: stopped, car back at session start.
-    pub fn finish_session_at(&mut self, start: u64) {
-        self.stop_at_session_start(start);
     }
     /// Core position computation (§5.3). The audio clock is driven by the
     /// output thread / UI poll (`tick`, `sync_playback_position`,
@@ -1391,15 +1419,46 @@ mod tests {
         assert_eq!(c.state(), TransportState::Playing);
     }
 
+    /// §3.5 stop: silence and park the cursor at the RESUME point — "начало
+    /// файла или место, ранее указанное мышкой". Playing a selection does NOT
+    /// move the resume point (only user clicks / pause snapshots do), so
+    /// Stop after playing [200,800) from a fresh load returns to 0; a Stop
+    /// after Pause returns to the paused position.
     #[test]
-    fn stop_rewinds_to_session_start() {
+    fn stop_parks_at_resume_point_not_session_start() {
         let (mut c, doc) = controller_with_doc(1000, 1);
         c.play(&doc, Some((200, 800)));
         c.freeze_resume_at(500, 1000);
         c.stop();
         assert_eq!(c.state(), TransportState::Stopped);
-        assert_eq!(c.current_frame_in(&doc), 200);
-        assert_eq!(c.resume_frame(), 200);
+        // Fresh load ⇒ resume point is still 0; the session start (200) must
+        // NOT win (§3.5: Stop goes to file start or the user's click spot).
+        assert_eq!(c.current_frame_in(&doc), 0);
+        assert_eq!(c.resume_frame(), 0);
+    }
+
+    #[test]
+    fn stop_after_pause_parks_at_paused_position() {
+        let (mut c, doc) = controller_with_doc(1000, 1);
+        c.play(&doc, None);
+        c.freeze_resume_at(400, 1000);
+        c.pause();
+        c.stop();
+        assert_eq!(c.state(), TransportState::Stopped);
+        assert_eq!(c.resume_frame(), 400);
+        // Play-after-Stop continues from the parked spot.
+        c.play(&doc, None);
+        assert_eq!(c.start_frame(), 400);
+    }
+
+    #[test]
+    fn stop_after_user_click_parks_at_clicked_spot() {
+        let (mut c, doc) = controller_with_doc(1000, 1);
+        c.seek(300, &doc, CursorSource::User); // user clicked while Stopped
+        c.play(&doc, Some((600, 900)));
+        c.stop();
+        assert_eq!(c.resume_frame(), 300);
+        assert_eq!(c.current_frame_in(&doc), 300);
     }
 
     #[test]
