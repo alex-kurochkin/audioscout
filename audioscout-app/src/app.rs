@@ -2659,7 +2659,8 @@ impl eframe::App for AudioScoutApp {
             // -borrow pattern as `current_skip_seconds`).  The peak-hold flag
             // is live-applied on change; the red threshold is persisted only.
             let mut meter_hold_enabled = self.config_store.config().meter_hold_enabled;
-            let mut meter_red_abs = self.config_store.config().meter_red_db.abs();
+            // Signed value: the red level is negative dB up to 0.0 (tz §3.5.1).
+            let mut meter_red_db = self.config_store.config().meter_red_db.min(0.0);
             // Peak-hold release delay in ms (plain `Copy` field mirror).
             let mut meter_hold_ms = self.config_store.config().meter_hold_ms;
             // Local mirrors of the two `self` fields the closure may touch:
@@ -2838,24 +2839,25 @@ impl eframe::App for AudioScoutApp {
                         });
                         ui.horizontal(|ui| {
                             ui.label("Volumeter peak hold delay:");
-                            // Three digits in ms; default 200.  Time the held
-                            // peak is kept after the last new maximum, before
-                            // it snaps back to the live level.
+                            // Up to four digits in ms; default 200.  Time the
+                            // held peak is kept after the last new maximum,
+                            // before it snaps back to the live level.
                             ui.add(
                                 egui::DragValue::new(&mut meter_hold_ms)
-                                    .range(0..=999)
+                                    .range(0..=9999)
                                     .speed(10)
                                     .suffix(" ms"),
                             );
                         });
                         ui.horizontal(|ui| {
                             ui.label("Volumeter red value:");
-                            // Two digits + dot + one digit ("0.1") per spec;
-                            // stored as a negative dB level, shown as its
-                            // absolute magnitude with a "dB" suffix.
+                            // The red level is always *negative* dB (up to 0).
+                            // Editing happens directly on the signed value so
+                            // a positive number can never be entered; two
+                            // digits + dot + one digit ("-99.9") per spec.
                             ui.add(
-                                egui::DragValue::new(&mut meter_red_abs)
-                                    .range(0.0..=99.9)
+                                egui::DragValue::new(&mut meter_red_db)
+                                    .range(-99.9..=0.0)
                                     .speed(0.1)
                                     .max_decimals(1)
                                     .min_decimals(1)
@@ -3072,9 +3074,11 @@ impl eframe::App for AudioScoutApp {
                 changed = true;
             }
             // Volumeter red value: persisted to config.json as a negative dB
-            // level (the UI edits its absolute magnitude).  Not yet wired into
-            // the meter drawing — per task, this setting only saves.
-            let new_red_db = -meter_red_abs.clamp(0.0, 99.9);
+            // level.  The UI edits the signed value directly with a range of
+            // -99.9..=0.0, so positive input is impossible; clamp again here
+            // for safety.  Not yet wired into the meter drawing — per task,
+            // this setting only saves.
+            let new_red_db = meter_red_db.clamp(-99.9, 0.0);
             if (new_red_db - self.config_store.config().meter_red_db).abs() > f32::EPSILON {
                 self.config_store.config_mut().meter_red_db = new_red_db;
                 changed = true;
