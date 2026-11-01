@@ -1312,6 +1312,17 @@ fn controller_thread(
                     shared.pos_offset.store(target, Ordering::Relaxed);
                     {
                         let mut ctrl = controller.lock().unwrap_or_else(|p| p.into_inner());
+                        // BUGFIX (Stop forgot the click made just before it):
+                        // Cmd::Stop is asynchronous — a User click queued
+                        // right before Stop lands here FIRST, while the state
+                        // may still read Playing. mark_seek alone mirrors
+                        // only the position; any User click must also BECOME
+                        // the resume point (§3.5 "место, ранее указанное
+                        // мышкой"), so a later stop_parked() returns exactly
+                        // there instead of dropping the new spot.
+                        if source == CursorSource::User {
+                            ctrl.set_resume_point(target);
+                        }
                         ctrl.mark_seek(target);
                         // BUGFIX (playhead races ahead of the audio): the seek
                         // teleports the true clock; rewind the UI ceiling with

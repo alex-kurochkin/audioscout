@@ -247,6 +247,14 @@ impl Controller {
             Some((s, _)) if s < total && s != self.resume_frame => (s, total),
             _ => (self.resume_frame.min(total), total),
         };
+        // BUGFIX (Stop clobbered the user's click spot, §3.5): the resume
+        // point ("начало файла или место, ранее указанное мышкой") is owned
+        // ONLY by User clicks (seek/set_resume_point) and Pause snapshots.
+        // Starting a session — with or without a selection — must preserve
+        // it; the old blanket `resume_frame = pos` made Play overwrite the
+        // clicked spot with the session start, so Stop afterwards parked the
+        // cursor at the wrong place.
+        let resume_before_play = self.resume_frame;
         // Degenerate `end <= start` means "play from `start` to EOF" (§5.3) —
         // normalise it NOW so every downstream consumer (the pos snapshot
         // below, the output thread's `apply_play`, the session getters) sees
@@ -267,7 +275,7 @@ impl Controller {
             self.start_frame = pos;
         }
         self.current_frame = pos;
-        self.resume_frame = pos;
+        self.resume_frame = resume_before_play;
         self.last_sync_frame = u64::MAX;
         // Park the projection anchor at this exact instant: every getter
         // adds only honest wall time since (`stored + (now - anchor) x sr`).
@@ -341,15 +349,16 @@ impl Controller {
     /// It must NOT be folded back into the last session's start: playing a
     /// selection then pressing Stop used to leave the cursor at the
     /// selection's left bound instead of where the user had put it.
-    /// A PAUSE before Stop freezes the resume point at the paused position —
-    /// that spot wins over the older user click (Stop returns the cursor to
-    /// where playback actually was when it ended). While Playing with no
-    /// pause in between, the live estimate is the current position.
+    /// BUGFIX (Stop clobbered the user's click spot): Stop itself NEVER
+    /// snapshots the live playback position into the resume point. If the
+    /// user clicks a place and presses Stop without pausing first, the
+    /// cursor must return to that clicked spot (or file start), not to the
+    /// mid-session frame the audio happened to reach. Only an explicit
+    /// Pause freezes the resume point at the paused position — so
+    /// Play→Pause→Stop parks where playback was interrupted, while
+    /// Play→Stop falls back to the stored resume point.
     pub fn stop(&mut self) {
-        let parked = match self.state {
-            TransportState::Playing => self.estimated_frame(),
-            _ => self.resume_frame,
-        };
+        let parked = self.resume_frame;
         self.state = TransportState::Stopped;
         self.current_frame = parked;
         self.resume_frame = parked;
@@ -590,9 +599,14 @@ impl Controller {
             let displayed = self.position_at(u64::MAX);
             if frame >= displayed {
                 self.current_frame = frame;
-                // Keep the resume point following the live position (§5.3 pause
-                // resumes where playback actually is).
-                self.resume_frame = frame;
+                // BUGFIX (Stop clobbered the user's click spot, §3.5): the
+                // playback mirror must NOT move the resume point — only a
+                // Pause snapshot or a User click owns it (§5.3
+                // CursorSource::Playback). The old "keep resume following
+                // the live position" made Play→Stop park wherever the audio
+                // had drifted instead of returning to the clicked spot /
+                // file start. `pause()` snapshots the display estimate, so
+                // the paused position stays correct without this line.
                 self.session_clock_at = std::time::Instant::now();
                 self.clock_base_at = std::time::Instant::now();
                 self.last_commit_at = std::time::Instant::now();
@@ -647,7 +661,9 @@ impl Controller {
         let start = start.min(cap);
         let end = if end > cap { cap } else { end };
         self.start_frame = start; self.end_frame = end; self.current_frame = start;
-        self.resume_frame = start;
+        // BUGFIX (§3.5): the output thread re-marks the active session
+        // bounds; this is not a user action and must not move the resume
+        // point (Play already set it, or a User click owns it).
         self.session_clock_at = std::time::Instant::now();
         self.clock_base_at = std::time::Instant::now();
         self.last_commit_at = std::time::Instant::now();
@@ -663,7 +679,19 @@ impl Controller {
     /// wall-clock snapshot with the exact hardware-clock position (§5.3).
     pub fn freeze_resume_at(&mut self, frame: u64, sample_rate: u32) {
         self.played_sr = sample_rate.max(1);
-        self.current_frame = frame; self.resume_frame = frame;
+        // BUGFIX (Stop forgot the user's click): this is the audio-clock
+        // MIRROR used by the UI poll (UiEvent::PlayheadUpdate) and the
+        // output thread while a session runs. It must NEVER move the resume
+        // point on its own — §5.3 CursorSource::Playback semantics: only an
+        // explicit Pause snapshot or a User click parks the resume point.
+        // Overwriting it here meant Play→Stop returned to wherever playback
+        // had drifted instead of "начало файла или место, ранее указанное
+        // мышкой". The Paused branch keeps updating resume_frame via
+        // `pause()` / the Cmd::Pause measured-position call below.
+        if self.state == TransportState::Paused {
+            self.resume_frame = frame;
+        }
+        self.current_frame = frame;
         self.session_clock_at = std::time::Instant::now();
         self.clock_base_at = std::time::Instant::now();
         self.last_commit_at = std::time::Instant::now();
@@ -675,13 +703,13 @@ impl Controller {
     }
     /// Output-thread hook for `Cmd::Stop`. §3.5 stop semantics: playback is
     /// silenced and the cursor parks at the RESUME point — "начало файла или
-    /// место, ранее указанное мышкой" — NOT at the last session's start. The
-    /// caller (`output.rs`) re-seeds the hardware clock to this frame before
+    /// место, ранее указанное мышкой" — NOT at the last session's start and
+    /// NOT at the live playback position (Stop must never clobber a newer
+    /// user click; only Pause freezes the resume point). The caller
+    /// (`output.rs`) re-seeds the hardware clock to this frame before
     /// invoking us, so a later Play-after-Stop starts from exactly here.
-    /// A lagging hardware-clock snapshot must never drag the parked cursor
-    /// backwards, hence the clamp against the current display estimate.
     pub fn stop_parked(&mut self) {
-        let parked = self.resume_frame.max(self.estimated_frame());
+        let parked = self.resume_frame;
         self.state = TransportState::Stopped;
         self.current_frame = parked; self.resume_frame = parked;
         self.session_clock_at = std::time::Instant::now();
@@ -1233,7 +1261,8 @@ impl Controller {
                 let span_frames = end - self.start_frame;
                 let wrapped = self.start_frame + (next - self.start_frame) % span_frames;
                 self.current_frame = wrapped;
-                self.resume_frame = wrapped;
+                // BUGFIX (§3.5): the loop wrap is pure playback motion — it
+                // must not touch the resume point (see sync_playback_position).
                 self.playhead.set_position_samples(wrapped);
                 // Park BOTH anchors at the wrap's virtual end (`commit_end`,
                 // remainder-refunded) — see the note above; parking at NOW
@@ -1259,7 +1288,9 @@ impl Controller {
             }
         } else {
             self.current_frame = next;
-            self.resume_frame = next;
+            // BUGFIX (§3.5): ticking playback must not move the resume
+            // point — only Pause/User clicks own it (see
+            // sync_playback_position).
             self.session_clock_at = commit_end;
             self.clock_base_at = commit_end;
             self.last_commit_at = commit_end;
@@ -1286,6 +1317,13 @@ impl Controller {
 
     pub fn resume_frame(&self) -> u64 {
         self.resume_frame
+    }
+    /// Explicitly park the resume point (§3.5 "место, ранее указанное
+    /// мышкой"). Used by the output thread when a User click arrives while
+    /// Stopped — `mark_seek` alone mirrors only the position, and Stop must
+    /// later return the cursor to exactly this spot.
+    pub fn set_resume_point(&mut self, frame: u64) {
+        self.resume_frame = frame;
     }
     pub fn start_frame(&self) -> u64 {
         self.start_frame
@@ -1459,6 +1497,25 @@ mod tests {
         c.stop();
         assert_eq!(c.resume_frame(), 300);
         assert_eq!(c.current_frame_in(&doc), 300);
+    }
+
+    /// Regression: Stop must NEVER overwrite the resume point with the live
+    /// playback position. Click a spot → play from there → Stop without any
+    /// Pause in between → the cursor returns to the CLICKED spot (§3.5).
+    #[test]
+    fn stop_while_playing_keeps_the_user_click_as_resume_point() {
+        let (mut c, doc) = controller_with_doc(1000, 1);
+        c.seek(300, &doc, CursorSource::User); // click while Stopped
+        c.play(&doc, None);                    // plays FROM 300; clock moves
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        c.sync_playback_position(450);         // audio reached 450
+        c.stop();                              // Stop WITHOUT Pause first
+        assert_eq!(c.state(), TransportState::Stopped);
+        assert_eq!(c.resume_frame(), 300, "Stop clobbered the user's click spot");
+        assert_eq!(c.current_frame_in(&doc), 300);
+        // And Play-after-Stop continues from the clicked spot again.
+        c.play(&doc, None);
+        assert_eq!(c.start_frame(), 300);
     }
 
     #[test]
