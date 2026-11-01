@@ -49,17 +49,55 @@ const PLAYER_HEIGHT: f32 = 26.0;
 const ACTIONS_HEIGHT: f32 = 26.0;
 const STATUS_HEIGHT: f32 = 26.0;
 
-/// Build a stable-but-versioned panel id. Any change to the height constant
-/// yields a different id, which invalidates egui's cached `PanelState`.
+// Paired constants: top content inset of each panel — the distance from the
+// panel's top edge down to where its content (the inner horizontal row)
+// starts. Each value must stay <= the paired *_HEIGHT minus the content's
+// natural height, otherwise the content is clipped by the exact-height panel.
+const TOOLBAR_CONTENT_TOP_INSET: f32 = 4.0;
+const PLAYER_CONTENT_TOP_INSET: f32 = 4.0;
+const ACTIONS_CONTENT_TOP_INSET: f32 = 4.0;
+const STATUS_CONTENT_TOP_INSET: f32 = 2.0;
+
+/// Build a stable-but-versioned panel id. The version covers both the panel
+/// height constant and its paired top-inset constant: any change to either
+/// yields a different id, which invalidates egui's cached `PanelState` (see
+/// the comment above the height constants).
 fn panel_id_with_height(name: &str, h: f32) -> String {
     format!("{name}@{:#x}", h.to_bits())
 }
 
-/// Aggregate fingerprint of every panel height constant. Stored at startup;
-/// if a rebuilt binary has different constants, the fingerprint changes and
-/// the stale per-panel size caches get purged exactly once.
+/// Convenience wrapper pairing a panel's height with its top content inset.
+/// The version suffix mixes both constants so an edit to either one re-keys
+/// the panel id (see `panel_id_with_height`). NOTE: unlike the raw height,
+/// the mixed value is only used for identification — the actual layout still
+/// uses `*_HEIGHT` / `*_CONTENT_TOP_INSET` directly.
+#[inline]
+fn panel_id(name: &str, height: f32, top_inset: f32) -> String {
+    // Mix the two bit patterns (XOR of halves keeps every input bit present
+    // in the output; collisions across our small constant set are not
+    // possible because any changed constant changes at least one nibble pair).
+    let h = height.to_bits();
+    let i = top_inset.to_bits();
+    let mixed = ((h >> 16) ^ (i & 0xffff)) << 16 | ((h & 0xffff) ^ (i >> 16));
+    panel_id_with_height(name, f32::from_bits(mixed))
+}
+
+/// Offset the panel's top area so its content sits `inset` points below the
+/// panel's top edge (within the panel's exact height).
+#[inline]
+fn apply_content_top_inset(ui: &mut egui::Ui, inset: f32) {
+    if inset > 0.0 {
+        ui.add_space(inset);
+    }
+}
+
+/// Aggregate fingerprint of every panel height and paired top-inset constant.
+/// Stored at startup; if a rebuilt binary has different constants, the
+/// fingerprint changes and the stale per-panel size caches get purged exactly
+/// once.
 const PANEL_LAYOUT_ID: u64 = {
-    // deterministic mix of the five heights (bit patterns of f32 constants)
+    // deterministic mix of the five heights and four top insets (bit patterns
+    // of f32 constants)
     let mut hash: u64 = 0xcbf29ce484222325; // FNV-1a offset basis
     let vals = [
         TOOLBAR_HEIGHT.to_bits(),
@@ -67,6 +105,10 @@ const PANEL_LAYOUT_ID: u64 = {
         PLAYER_HEIGHT.to_bits(),
         ACTIONS_HEIGHT.to_bits(),
         STATUS_HEIGHT.to_bits(),
+        TOOLBAR_CONTENT_TOP_INSET.to_bits(),
+        PLAYER_CONTENT_TOP_INSET.to_bits(),
+        ACTIONS_CONTENT_TOP_INSET.to_bits(),
+        STATUS_CONTENT_TOP_INSET.to_bits(),
     ];
     let mut i = 0;
     while i < vals.len() {
@@ -1567,7 +1609,7 @@ impl eframe::App for AudioScoutApp {
         // below call it for toolbars, player transport, file rows and folder
         // tree items.
 
-        egui::TopBottomPanel::top(panel_id_with_height("toolbar", TOOLBAR_HEIGHT))
+        egui::TopBottomPanel::top(panel_id("toolbar", TOOLBAR_HEIGHT, TOOLBAR_CONTENT_TOP_INSET))
             .exact_height(TOOLBAR_HEIGHT)
             .show(ctx, |ui| {
             let ctx = ui.ctx().clone();
@@ -1586,6 +1628,9 @@ impl eframe::App for AudioScoutApp {
                 resp.clicked()
             };
             ui.horizontal(|ui| {
+                // Top content inset: push the row TOOLBAR_CONTENT_TOP_INSET
+                // points below the panel's top edge.
+                apply_content_top_inset(ui, TOOLBAR_CONTENT_TOP_INSET);
                 ui.label("Filter:");
                 ui.text_edit_singleline(&mut self.filter_text);
                 let r_x = ui.button("✕");
@@ -1945,7 +1990,7 @@ impl eframe::App for AudioScoutApp {
         // Player panel (transport controls) — declared after the audio view,
         // i.e. docked *above* it and directly under the file-actions panel
         // (bug #1: Play/Stop must sit above the audio-content view).
-        egui::TopBottomPanel::bottom(panel_id_with_height("player", PLAYER_HEIGHT))
+        egui::TopBottomPanel::bottom(panel_id("player", PLAYER_HEIGHT, PLAYER_CONTENT_TOP_INSET))
             .exact_height(PLAYER_HEIGHT)
             .show(ctx, |ui| {
             // §3.5.1: transport controls on the left, the volume meter is
@@ -1976,6 +2021,9 @@ impl eframe::App for AudioScoutApp {
                 resp.clicked()
             };
             ui.horizontal(|ui| {
+                // Top content inset: push the transport row PLAYER_CONTENT_TOP_INSET
+                // points below the panel's top edge.
+                apply_content_top_inset(ui, PLAYER_CONTENT_TOP_INSET);
                 if hand_cursor(&ui.button("|<")) { self.navigate_file(-1); }
                 let play_text = match self.player_state() { TransportState::Playing => "⏸", _ => "▶" };
                 if hand_cursor(&ui.button(play_text)) { self.transport_play_pause(); }
@@ -2028,7 +2076,7 @@ impl eframe::App for AudioScoutApp {
         // File-actions panel (Mute / Normalize / Apply …) — declared after
         // the player, i.e. docked *above* it: this is the panel the transport
         // controls must sit under (bug #1).
-        egui::TopBottomPanel::bottom(panel_id_with_height("actions", ACTIONS_HEIGHT))
+        egui::TopBottomPanel::bottom(panel_id("actions", ACTIONS_HEIGHT, ACTIONS_CONTENT_TOP_INSET))
             .exact_height(ACTIONS_HEIGHT)
             .show(ctx, |ui| {
             let ctx = ui.ctx().clone();
@@ -2047,6 +2095,9 @@ impl eframe::App for AudioScoutApp {
                 resp.clicked()
             };
             ui.horizontal(|ui| {
+                // Top content inset: push the actions row ACTIONS_CONTENT_TOP_INSET
+                // points below the panel's top edge.
+                apply_content_top_inset(ui, ACTIONS_CONTENT_TOP_INSET);
                 if hand_cursor(&ui.button("Mute")) { self.mute_selection(); }
                 ui.label("Normalize:");
                 {
@@ -2066,9 +2117,12 @@ impl eframe::App for AudioScoutApp {
 
         // Status bar — declared LAST among the bottom panels, which docks it
         // highest in the stack, right under the file-list area (§13).
-        egui::TopBottomPanel::bottom(panel_id_with_height("status", STATUS_HEIGHT))
+        egui::TopBottomPanel::bottom(panel_id("status", STATUS_HEIGHT, STATUS_CONTENT_TOP_INSET))
             .exact_height(STATUS_HEIGHT)
             .show(ctx, |ui| {
+            // Top content inset: push the status text STATUS_CONTENT_TOP_INSET
+            // points below the panel's top edge.
+            apply_content_top_inset(ui, STATUS_CONTENT_TOP_INSET);
             ui.label(&self.status_message);
         });
 

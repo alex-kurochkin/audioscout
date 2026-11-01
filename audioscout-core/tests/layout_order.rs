@@ -18,24 +18,29 @@ fn app_source() -> String {
 
 /// Extract the base name of every bottom-panel declaration, in source order.
 /// Panels may be declared either with a plain string id
-/// (`TopBottomPanel::bottom("player")`) or through the height-versioned id
-/// helper (`TopBottomPanel::bottom(panel_id_with_height("player", H))`) —
-/// both forms are recognized and normalized to the bare panel name.
+/// (`TopBottomPanel::bottom("player")`), through the height-versioned id
+/// helper (`TopBottomPanel::bottom(panel_id_with_height("player", H))`) or
+/// through the paired height+top-inset helper
+/// (`TopBottomPanel::bottom(panel_id("player", H, INSET))`) — all forms are
+/// recognized and normalized to the bare panel name.
 fn bottom_panel_ids(src: &str) -> Vec<String> {
     const PLAIN: &str = "TopBottomPanel::bottom(\"";
     const VERSIONED: &str = "TopBottomPanel::bottom(panel_id_with_height(\"";
+    const PAIRED: &str = "TopBottomPanel::bottom(panel_id(\"";
     let mut ids = Vec::new();
     for line in src.lines() {
-        let (needle, start) = match line.find(VERSIONED) {
-            // Versioned form is checked first; its prefix contains the plain
-            // one, so whichever matches wins exactly once per line.
-            Some(i) => (VERSIONED, i + VERSIONED.len()),
-            None => match line.find(PLAIN) {
-                Some(i) => (PLAIN, i + PLAIN.len()),
-                None => continue,
+        // Longest needle first: each versioned form's prefix contains the
+        // shorter ones, so whichever matches first wins exactly once/line.
+        let start = match line.find(PAIRED) {
+            Some(i) => i + PAIRED.len(),
+            None => match line.find(VERSIONED) {
+                Some(i) => i + VERSIONED.len(),
+                None => match line.find(PLAIN) {
+                    Some(i) => i + PLAIN.len(),
+                    None => continue,
+                },
             },
         };
-        let _ = needle;
         let rest = &line[start..];
         if let Some(end) = rest.find('"') {
             ids.push(rest[..end].to_string());
@@ -44,11 +49,12 @@ fn bottom_panel_ids(src: &str) -> Vec<String> {
     ids
 }
 
-/// Byte offset of a given bottom panel's declaration, accepting both the
-/// plain-string and the `panel_id_with_height` forms.
+/// Byte offset of a given bottom panel's declaration, accepting the
+/// plain-string, `panel_id_with_height` and paired `panel_id` forms.
 fn bottom_panel_src_find(src: &str, name: &str) -> usize {
     src.find(&format!("TopBottomPanel::bottom(\"{name}\""))
         .or_else(|| src.find(&format!("TopBottomPanel::bottom(panel_id_with_height(\"{name}\"")))
+        .or_else(|| src.find(&format!("TopBottomPanel::bottom(panel_id(\"{name}\"")))
         .unwrap_or_else(|| panic!("panel \"{name}\" missing"))
 }
 
@@ -72,11 +78,10 @@ fn all_bottom_panels_declared_before_central_panel() {
     // can change via resizing) if they are reserved *before* it is shown.
     let src = app_source();
     let central = src.find("CentralPanel::default().show").expect("central panel");
-    for name in ["\"status\"", "\"player\"", "\"audio_view\"", "\"actions\""] {
-        let pos = src
-            .find(&format!("TopBottomPanel::bottom(panel_id_with_height({name}"))
-            .or_else(|| src.find(&format!("TopBottomPanel::bottom({name}")))
-            .unwrap_or_else(|| panic!("panel {name} missing"));
+    for name in ["status", "player", "audio_view", "actions"] {
+        // Accepts the plain-string, `panel_id_with_height` and paired
+        // `panel_id` declaration forms.
+        let pos = bottom_panel_src_find(&src, name);
         assert!(pos < central, "panel {name} must be declared before CentralPanel");
     }
 }
