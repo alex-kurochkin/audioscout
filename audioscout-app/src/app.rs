@@ -1080,27 +1080,88 @@ impl AudioScoutApp {
         if source == audioscout_core::player::CursorSource::UserJump {
             let state = self.player_state();
             if state == TransportState::Playing || state == TransportState::Paused {
+                // BUGFIX (backward click STILL snapped back to the live
+                // position): the previous restart path raced the output
+                // thread's command queue — `Cmd::Pause` froze the resume
+                // point at the STALE hardware clock (~150 ms of buffered
+                // audio behind the display) AFTER the UI had parked it, and
+                // a queued `Cmd::Play` re-appended the OLD session range.
+                // The fix is fully SYNCHRONOUS: read the honest audible
+                // frame under the player lock, hand the controller an
+                // explicit Parked freeze (which ignores any later stale
+                // clock sample), then teleport via the plain `Cmd::Seek`
+                // arm — for a Playing controller it restarts the pump at
+                // [frame, end) inside the output thread before its next
+                // cpal callback pulls samples; for a Paused one it just
+                // parks the clock without touching the resume semantics.
+                let total = self.document.total_frames();
+                let sr = self.document.sample_rate.max(1);
+                // BUGFIX (backward click/drag STILL snapped back): the app
+                // keeps its own extrapolation anchor (`playhead_est_frame`)
+                // as the authoritative DISPLAY position — it is re-armed on
+                // every seek and advanced by wall time between polls, while
+                // the controller's internal estimate can lag. Read it here
+                // BEFORE leaving Playing so pause/stop snap exactly where
+                // the user sees the cursor.
+                let shown_display = self.playhead_est_frame.min(total);
+                let end = {
+                    let ctrl = self.player.lock().unwrap_or_else(|p| p.into_inner());
+                    ctrl.session_bounds()
+                        .map(|(_s, e)| e)
+                        .unwrap_or(total)
+                        .clamp(frame, total)
+                };
                 if state == TransportState::Playing {
-                    if let Some(out) = &self.output { out.play(frame, self.document.total_frames()); }
-                    let mut ctrl = self.player.lock().unwrap_or_else(|p| p.into_inner());
-                    if self.output.is_some() {
-                        ctrl.mark_playing(frame, self.document.total_frames(), self.document.sample_rate);
-                    } else {
-                        ctrl.play(&self.document, Some((frame, self.document.total_frames())));
+                    // Synchronous UI-side transition: freeze at the DISPLAY
+                    // frame first...
+                    {
+                        let mut ctrl = self.player.lock().unwrap_or_else(|p| p.into_inner());
+                        ctrl.pause_parked(shown_display);
                     }
-                    drop(ctrl);
+                    if let Some(out) = &self.output {
+                        // ...then silence the device; the output thread's
+                        // Cmd::Pause arm freezes at its own clock reading,
+                        // which we immediately correct below (same order as
+                        // transport_play_pause's normal Pause).
+                        out.pause();
+                        out.freeze_resume_at(shown_display, sr);
+                    }
+                    // Teleport: the Seek arm runs with the controller in
+                    // Paused state, so it parks the clock WITHOUT appending a
+                    // source; `mark_playing` below restarts playback from the
+                    // new frame through the Play path (identical bookkeeping
+                    // to pressing Play after such a jump).
+                    if let Some(out) = &self.output {
+                        out.seek(frame, audioscout_core::player::CursorSource::UserJump);
+                    }
+                    {
+                        let mut ctrl = self.player.lock().unwrap_or_else(|p| p.into_inner());
+                        ctrl.mark_playing(frame, end, sr);
+                    }
+                    if let Some(out) = &self.output {
+                        out.play(frame, end);
+                    }
                     // Re-arm the UI extrapolation exactly at the new session
                     // origin (same bookkeeping as transport_play_pause).
                     self.playhead_est_frame = frame;
                     self.playhead_est_at = std::time::Instant::now();
                     self.playhead_fed_ceiling = None;
-                    self.playhead_session = Some((frame, self.document.total_frames()));
+                    self.playhead_session = Some((frame, end));
                 } else {
-                    // Paused: move the frozen resume point together with the
-                    // cursor so Play continues from where the user parked it.
-                    let mut ctrl = self.player.lock().unwrap_or_else(|p| p.into_inner());
-                    ctrl.seek(frame, &self.document, audioscout_core::player::CursorSource::User);
-                    ctrl.freeze_resume_at(frame.min(self.document.total_frames()), self.document.sample_rate);
+                    // Paused: park cursor AND frozen resume point at the
+                    // clicked frame. Nothing plays, so no stale clock can
+                    // overwrite it afterwards.
+                    if let Some(out) = &self.output {
+                        out.seek(frame, audioscout_core::player::CursorSource::UserJump);
+                    }
+                    {
+                        let mut ctrl = self.player.lock().unwrap_or_else(|p| p.into_inner());
+                        ctrl.park_cursor(frame, &self.document);
+                    }
+                    self.playhead_est_frame = frame;
+                    self.playhead_est_at = std::time::Instant::now();
+                    self.playhead_fed_ceiling = None;
+                    self.playhead_session = None;
                 }
                 return;
             }
@@ -2098,7 +2159,29 @@ impl eframe::App for AudioScoutApp {
                     let x_ratio = (pos.x - rect.left()) / rect.width();
                     let frame = self.audio_view.x_to_frame(x_ratio * rect.width(), rect.width() as u32);
                     self.audio_view.set_cursor(frame);
-                    self.transport_seek(frame, audioscout_core::player::CursorSource::User);
+                    // BUGFIX (backward click impossible while playing/paused):
+                    // a waveform click is an explicit teleport OUT of the
+                    // running session (`UserJump`), not a plain User seek —
+                    // the transport arms clamp a User seek into [start,end]
+                    // and blocked every click left of the live cursor.
+                    self.transport_seek(frame, audioscout_core::player::CursorSource::UserJump);
+                }
+            }
+
+            // BUGFIX (no mouse scrubbing in the player): press-and-drag in
+            // the waveform now drags the cursor continuously. While the
+            // pointer is held down over the view, every frame re-maps the
+            // pointer X to a file frame and teleports the playhead there
+            // (`UserJump`: clamped-out-of-session restart while Playing,
+            // resume-point parking while Paused). The 50 ms poll cadence of
+            // `transport_seek`'s jump path keeps this cheap enough for
+            // per-frame handling.
+            if response.dragged() {
+                if let Some(pos) = response.interact_pointer_pos() {
+                    let x_ratio = ((pos.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
+                    let frame = self.audio_view.x_to_frame(x_ratio * rect.width(), rect.width() as u32);
+                    self.audio_view.set_cursor(frame);
+                    self.transport_seek(frame, audioscout_core::player::CursorSource::UserJump);
                 }
             }
 

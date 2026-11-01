@@ -1262,6 +1262,36 @@ impl Controller {
     pub fn start_frame(&self) -> u64 {
         self.start_frame
     }
+    /// Active session bounds `[start, end)` as stored by play/seek/reaim Ñ
+    /// used by the UI to restart a backward jump without inventing its own
+    /// fallback range.
+    pub fn session_bounds(&self) -> Option<(u64, u64)> {
+        if self.end_frame > self.start_frame {
+            Some((self.start_frame, self.end_frame))
+        } else {
+            None
+        }
+    }
+    /// Pause with an EXPLICIT frozen position (the value the user actually
+    /// sees on screen): same bookkeeping as `pause()`, but parks the clock
+    /// at `frame` instead of the controller's own wall-clock estimate. Used
+    /// by the backward-jump path so pause/stop snap exactly where the cursor
+    /// was displayed.
+    pub fn pause_parked(&mut self, frame: u64) {
+        if self.state == TransportState::Playing {
+            self.state = TransportState::Paused;
+            self.freeze_resume_at(frame, self.played_sr);
+        }
+    }
+    /// Park cursor AND resume point at an externally chosen frame while
+    /// Paused/Stopped (backward click/drag): unlike `sync_playback_position`
+    /// this never gets overwritten by the lagging hardware clock, because no
+    /// playback is running to feed it.
+    pub fn park_cursor(&mut self, frame: u64, doc: &Document) {
+        let target = frame.min(doc.total_frames());
+        self.seek(target, doc, CursorSource::UserJump);
+        self.freeze_resume_at(target, doc.sample_rate);
+    }
     pub fn end_frame(&self) -> u64 {
         self.end_frame
     }
