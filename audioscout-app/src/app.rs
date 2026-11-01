@@ -17,6 +17,62 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use image::GenericImageView;
 
+// ---------------------------------------------------------------------------
+// Panel layout constants (§ UI panels)
+// ---------------------------------------------------------------------------
+// Heights of the fixed docked panels. `default_height()` alone is NOT enough
+// to make a code change take effect: egui caches every panel's measured size
+// in `egui::Memory` keyed by the panel id, so the cached value keeps winning
+// over the newly compiled-in `default_height` (this is exactly why editing
+// `default_height(20.0)` -> `default_height(200.0)` did nothing at runtime).
+// To guarantee that editing a constant below and rebuilding actually changes
+// the rendered height, each panel id embeds its configured height
+// (`panel_id_with_height`). Changing a constant therefore produces a brand-new
+// id -> a fresh entry in `Memory` -> the new default is applied on first show.
+// `PANEL_LAYOUT_ID` additionally stamps the whole layout with the exact set of
+// heights; whenever that stamp differs from the one saved at app construction
+// time, ALL panel size caches are wiped once — belt-and-braces so even panels
+// whose id scheme ever changes are guaranteed to pick up the new constants.
+const TOOLBAR_HEIGHT: f32 = 40.0;
+const AUDIO_VIEW_HEIGHT: f32 = 200.0;
+const PLAYER_HEIGHT: f32 = 80.0;
+const ACTIONS_HEIGHT: f32 = 40.0;
+const STATUS_HEIGHT: f32 = 20.0;
+
+/// Build a stable-but-versioned panel id: `"player@80"` style. Any change to
+/// the height constant yields a different id, invalidating egui's cached size.
+fn panel_id_with_height(name: &str, h: f32) -> String {
+    format!("{name}@{h}")
+}
+
+/// Aggregate fingerprint of every panel height constant. Stored at startup;
+/// if a rebuilt binary has different constants, the fingerprint changes and
+/// the stale per-panel size caches get cleared exactly once.
+const PANEL_LAYOUT_ID: u64 = {
+    // deterministic mix of the five heights (bit patterns of f32 constants)
+    let mut hash: u64 = 0xcbf29ce484222325; // FNV-1a offset basis
+    let vals = [
+        TOOLBAR_HEIGHT.to_bits(),
+        AUDIO_VIEW_HEIGHT.to_bits(),
+        PLAYER_HEIGHT.to_bits(),
+        ACTIONS_HEIGHT.to_bits(),
+        STATUS_HEIGHT.to_bits(),
+    ];
+    let mut i = 0;
+    while i < vals.len() {
+        let mut v = vals[i];
+        let mut b = 0;
+        while b < 4 {
+            hash ^= (v & 0xff) as u64;
+            hash = hash.wrapping_mul(0x100000001b3); // FNV-1a prime
+            v >>= 8;
+            b += 1;
+        }
+        i += 1;
+    }
+    hash
+};
+
 /// Main application state
 pub struct AudioScoutApp {
     config_store: ConfigStore,
@@ -162,6 +218,11 @@ pub struct AudioScoutApp {
     /// consuming the snapshot we stamp the time of the last applied gesture
     /// here and drop any duplicate that arrives within this short window.
     last_wheel_apply: f64,
+    /// Fingerprint of the panel-height constants compiled into *this* binary
+    /// (see `PANEL_LAYOUT_ID`). If it ever differs from the value egui's
+    /// `Memory` was built with, all cached panel sizes are wiped once so the
+    /// new `default_height`s take effect — guarantees rebuild -> visible change.
+    panel_layout_id: u64,
 }
 
 impl AudioScoutApp {
@@ -270,6 +331,7 @@ impl AudioScoutApp {
             raw_wheel_ctrl: false,
             audio_view_rect: None,
             last_wheel_apply: 0.0,
+            panel_layout_id: PANEL_LAYOUT_ID,
         };
 
         // Restore the two independent Waveform/Spectrogram toggles from the
@@ -1319,6 +1381,16 @@ impl AudioScoutApp {
 
 impl eframe::App for AudioScoutApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Panel-height constants changed since this Memory was populated
+        // (e.g. a rebuilt binary after editing TOOLBAR_HEIGHT/...): wipe all
+        // cached per-panel sizes once so the new `default_height`s apply.
+        // Normally redundant with the height-versioned panel ids below, but
+        // makes the guarantee independent of the id scheme.
+        if self.panel_layout_id != PANEL_LAYOUT_ID {
+            self.panel_layout_id = PANEL_LAYOUT_ID;
+            ctx.memory_mut(|m| m.clear());
+        }
+
         // Meter decay when nothing new arrives (pause/stop): exponential-ish
         // fade to zero over ~300 ms (§3.5.1). While playing, fresh
         // VolumeMeterUpdate events overwrite these values every poll tick.
@@ -1463,7 +1535,9 @@ impl eframe::App for AudioScoutApp {
         // below call it for toolbars, player transport, file rows and folder
         // tree items.
 
-        egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
+        egui::TopBottomPanel::top(panel_id_with_height("toolbar", TOOLBAR_HEIGHT))
+            .exact_height(TOOLBAR_HEIGHT)
+            .show(ctx, |ui| {
             let ctx = ui.ctx().clone();
             let hand_cursor = |resp: &egui::Response| -> bool {
                 // UX: pointing-hand cursor on hover. `hovered()` alone is
@@ -1637,7 +1711,10 @@ impl eframe::App for AudioScoutApp {
         // the player controls are placed *above* it, and the file-actions
         // panel above those (bug #1: Play/Stop must sit under the
         // file-actions panel and above the audio-content view).
-        egui::TopBottomPanel::bottom("audio_view").default_height(200.0).resizable(true).show(ctx, |ui| {
+        egui::TopBottomPanel::bottom(panel_id_with_height("audio_view", AUDIO_VIEW_HEIGHT))
+            .default_height(AUDIO_VIEW_HEIGHT)
+            .resizable(true)
+            .show(ctx, |ui| {
             let (rect, response) = ui.allocate_exact_size(ui.available_size(), egui::Sense::click_and_drag());
             // Publish this panel's exact content rect for the wheel-delta
             // ownership test at the top of `update()` (see BUGFIX note on
@@ -1843,7 +1920,9 @@ impl eframe::App for AudioScoutApp {
         // Player panel (transport controls) — declared after the audio view,
         // i.e. docked *above* it and directly under the file-actions panel
         // (bug #1: Play/Stop must sit above the audio-content view).
-        egui::TopBottomPanel::bottom("player").default_height(80.0).show(ctx, |ui| {
+        egui::TopBottomPanel::bottom(panel_id_with_height("player", PLAYER_HEIGHT))
+            .exact_height(PLAYER_HEIGHT)
+            .show(ctx, |ui| {
             // §3.5.1: transport controls on the left, the volume meter is
             // docked to the right edge of the same window (controls are laid
             // out inside the reduced rect so nothing overlaps).
@@ -1924,7 +2003,9 @@ impl eframe::App for AudioScoutApp {
         // File-actions panel (Mute / Normalize / Apply …) — declared after
         // the player, i.e. docked *above* it: this is the panel the transport
         // controls must sit under (bug #1).
-        egui::TopBottomPanel::bottom("actions").default_height(40.0).show(ctx, |ui| {
+        egui::TopBottomPanel::bottom(panel_id_with_height("actions", ACTIONS_HEIGHT))
+            .exact_height(ACTIONS_HEIGHT)
+            .show(ctx, |ui| {
             let ctx = ui.ctx().clone();
             let hand_cursor = |resp: &egui::Response| -> bool {
                 // UX: pointing-hand cursor on hover. `hovered()` alone is
@@ -1960,7 +2041,9 @@ impl eframe::App for AudioScoutApp {
 
         // Status bar — declared LAST among the bottom panels, which docks it
         // highest in the stack, right under the file-list area (§13).
-        egui::TopBottomPanel::bottom("status").default_height(20.0).show(ctx, |ui| {
+        egui::TopBottomPanel::bottom(panel_id_with_height("status", STATUS_HEIGHT))
+            .exact_height(STATUS_HEIGHT)
+            .show(ctx, |ui| {
             ui.label(&self.status_message);
         });
 
