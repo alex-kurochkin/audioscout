@@ -211,6 +211,9 @@ pub struct AudioScoutApp {
     audio_view: AudioView,
     undo_stack: UndoStack,
     show_settings: bool,
+    /// Transient state of the Settings modal (hotkey capture + status line).
+    settings_hotkey_capture: Option<String>,
+    settings_status: String,
     show_columns_dialog: bool,
     status_message: String,
     normalize_dbfs: f32,
@@ -417,7 +420,8 @@ impl AudioScoutApp {
             preview_cache_wave: HashMap::new(),
             preview_cache_spectro: HashMap::new(),
             preview_inflight: HashSet::new(), preview_retry: HashSet::new(),
-            show_settings: false, show_columns_dialog: false, status_message: String::new(),
+            show_settings: false, settings_hotkey_capture: None, settings_status: String::new(),
+            show_columns_dialog: false, status_message: String::new(),
             normalize_dbfs: -1.0, expanded_dirs: HashMap::new(),
             disks: Vec::new(),
             cached_channels: Vec::new(),
@@ -2572,40 +2576,270 @@ impl eframe::App for AudioScoutApp {
                 DeleteMarkers,
                 DeletePreviews,
                 CleanOrphans,
+                ResetHotkeys,
             }
 
             let mut skip_seconds_changed: Option<u32> = None;
             let mut action = SettingsAction::None;
-
-            // Read-only copies of the settings values (plain `Copy` fields).
-            // Reading them through `&self.*` inside the closure would conflict
-            // with the `&mut self.show_settings` borrow passed to `open()`.
+            // Live-edited config fields collected during the frame and applied
+            // after the window closes (same disjoint-borrow pattern).
+            let mut undo_depth: usize = self.config_store.config().undo_depth;
+            let mut undo_disk_limit_mb: usize = self.config_store.config().undo_disk_limit_mb;
+            let mut undo_dir_text: String = self
+                .config_store
+                .config()
+                .undo_dir
+                .clone()
+                .unwrap_or_else(audioscout_core::config::default_undo_dir);
+            let mut preview_prefetch: usize = self.config_store.config().preview_prefetch;
+            let mut space_stop = self.config_store.config().space_behavior_stop;
+            let mut preview_mode_idx: usize =
+                if self.config_store.config().preview_mode == "spectro" { 1 } else { 0 };
+            let mut player_mode_idx: usize =
+                if self.config_store.config().audio_view_mode == "spectro" { 1 } else { 0 };
+            // Hotkey table snapshot + edit result (rebinding / capture state).
+            let hotkey_rows: Vec<(String, audioscout_core::config::HotkeyBinding)> =
+                audioscout_core::config::HOTKEY_ACTIONS
+                    .iter()
+                    .map(|a| {
+                        (
+                            a.to_string(),
+                            self.config_store
+                                .config()
+                                .hotkeys
+                                .get(*a)
+                                .cloned()
+                                .unwrap_or_else(|| audioscout_core::config::hotkey_defaults().remove(*a).unwrap()),
+                        )
+                    })
+                    .collect();
+            let mut hotkey_rebind: Option<(String, audioscout_core::config::HotkeyBinding)> = None;
+            let capture_action = self.settings_hotkey_capture.clone();
+            let settings_status = self.settings_status.clone();
+            // Read-only copy of the skip-seconds value (plain `Copy` field).
+            // Reading it through `&self.*` inside the closure would conflict
+            // with the mutable captures passed to `open()`/the UI closure.
             let current_skip_seconds = self.config_store.config().skip_seconds;
+            // Local mirrors of the two `self` fields the closure may touch:
+            // the window-open flag (`Window::open`) and the hotkey-capture
+            // toggle — both are written back after the frame.
+            let mut show_settings = true;
+            let mut capture_toggle = self.settings_hotkey_capture.clone();
 
-            egui::Window::new("Settings").open(&mut self.show_settings).show(ctx, |ui| {
-                ui.label("AudioScout Settings");
-                ui.separator();
-                ui.horizontal(|ui| {
-                    ui.label("Skip seconds:");
-                    let mut skip = current_skip_seconds;
-                    if ui.add(egui::DragValue::new(&mut skip).range(1..=60)).changed() {
-                        skip_seconds_changed = Some(skip);
+            egui::Window::new("Settings")
+                .collapsible(false)
+                .resizable(true)
+                .default_width(520.0)
+                .open(&mut show_settings)
+                .show(ctx, |ui| {
+                    // ---- Storage maintenance --------------------------------
+                    ui.group(|ui| {
+                        ui.label("Storage maintenance:");
+                        ui.horizontal(|ui| {
+                            if ui.button("Delete all markers").clicked() { action = SettingsAction::DeleteMarkers; }
+                            if ui.button("Clean orphaned previews").clicked() { action = SettingsAction::CleanOrphans; }
+                            if ui.button("Delete all markers previews").clicked() { action = SettingsAction::DeletePreviews; }
+                        });
+                    });
+
+                    // ---- Undo history ----------------------------------------
+                    ui.group(|ui| {
+                        ui.label("Undo history");
+                        ui.horizontal(|ui| {
+                            ui.label("History depth (steps):");
+                            // Two-digit box per spec (1..=99).
+                            ui.add(egui::DragValue::new(&mut undo_depth).range(1..=99));
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Disk limit:");
+                            ui.add(egui::DragValue::new(&mut undo_disk_limit_mb).range(1..=1_048_576).suffix(" MB"));
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Undo data directory:");
+                            ui.add(egui::TextEdit::singleline(&mut undo_dir_text).desired_width(ui.available_width()));
+                        });
+                    });
+
+                    // ---- Behaviour and appearance ----------------------------
+                    ui.group(|ui| {
+                        ui.label("Behaviour and appearance");
+                        ui.horizontal(|ui| {
+                            ui.label("Preview prefetch count:");
+                            // Two-digit box per spec (0..=99).
+                            ui.add(egui::DragValue::new(&mut preview_prefetch).range(0..=99));
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Space key behaviour:");
+                            egui::ComboBox::from_id_salt("space_key_behaviour")
+                                .selected_text(if space_stop { "Start/Stop" } else { "Start/Pause" })
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(&mut space_stop, false, "Start/Pause");
+                                    ui.selectable_value(&mut space_stop, true, "Start/Stop");
+                                });
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Table previews mode:");
+                            egui::ComboBox::from_id_salt("table_previews_mode")
+                                .selected_text(if preview_mode_idx == 1 { "Spectrogram" } else { "Waveform" })
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(&mut preview_mode_idx, 0, "Waveform");
+                                    ui.selectable_value(&mut preview_mode_idx, 1, "Spectrogram");
+                                });
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Player display mode:");
+                            egui::ComboBox::from_id_salt("player_display_mode")
+                                .selected_text(if player_mode_idx == 1 { "Spectrogram" } else { "Waveform" })
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(&mut player_mode_idx, 0, "Waveform");
+                                    ui.selectable_value(&mut player_mode_idx, 1, "Spectrogram");
+                                });
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Skip seconds:");
+                            let mut skip = current_skip_seconds;
+                            if ui.add(egui::DragValue::new(&mut skip).range(1..=60)).changed() {
+                                skip_seconds_changed = Some(skip);
+                            }
+                        });
+                    });
+
+                    // ---- Hotkeys ----------------------------------------------
+                    ui.group(|ui| {
+                        ui.label("Hotkeys (click a shortcut to reassign)");
+                        // Column headers of the Action | Shortcut table.
+                        let col_w = (ui.available_width() - 16.0) * 0.6;
+                        ui.horizontal(|ui| {
+                            ui.add_sized([col_w, 18.0], egui::Label::new(egui::RichText::strong("Action")));
+                            ui.label(egui::RichText::strong("Shortcut"));
+                        });
+                        ui.separator();
+                        // Vertical scroll through the action list — the mouse
+                        // wheel and the slider on the right both work here.
+                        egui::ScrollArea::vertical()
+                            .id_salt("hotkey_list")
+                            .max_height(240.0)
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                for (action_name, binding) in &hotkey_rows {
+                                    ui.horizontal(|ui| {
+                                        ui.add_sized([col_w, 18.0], egui::Label::new(audioscout_core::config::hotkey_label(action_name)));
+                                        let label = if capture_action.as_deref() == Some(action_name.as_str()) {
+                                            "Press keys…".to_string()
+                                        } else {
+                                            audioscout_core::config::format_hotkey(binding)
+                                        };
+                                        let resp = ui.add_sized(
+                                            [ui.available_width(), 18.0],
+                                            egui::Button::new(egui::RichText::new(label).monospace()),
+                                        );
+                                        if resp.clicked() {
+                                            // Click a shortcut -> start capturing; click again cancels.
+                                            *capture_toggle =
+                                                if capture_action.as_deref() == Some(action_name.as_str()) { None } else { Some(action_name.clone()) };
+                                        }
+                                    });
+                                }
+                            });
+                        if ui.add(egui::Button::new("Reset all to defaults").min_size(ui.available_size())).clicked() {
+                            action = SettingsAction::ResetHotkeys;
+                        }
+                        if !settings_status.is_empty() {
+                            ui.label(egui::RichText::new(settings_status.clone()).weak());
+                        }
+                    });
+
+                    ui.separator();
+                    // ---- Close -------------------------------------------------
+                    if ui.add(egui::Button::new("Close").min_size(ui.available_size())).clicked() {
+                        show_settings = false;
                     }
                 });
-                ui.separator();
-                if ui.button("Delete all markers").clicked() { action = SettingsAction::DeleteMarkers; }
-                if ui.button("Delete all previews").clicked() { action = SettingsAction::DeletePreviews; }
-                if ui.button("Clean orphaned previews").clicked() { action = SettingsAction::CleanOrphans; }
-            });
 
+            // Write back the local mirrors + apply every edited field to the
+            // config store (all settings persist to ~/.config/audioscout/
+            // config.json via `ConfigStore::save`).
+            self.show_settings = show_settings;
+            self.settings_hotkey_capture = capture_toggle.clone();
+            if let Some((a, b)) = hotkey_rebind {
+                self.config_store.config_mut().hotkeys.insert(a, b);
+            }
+
+            let mut changed = false;
+            // Skip seconds (Behaviour): keep the pre-existing apply path.
             if let Some(skip) = skip_seconds_changed {
                 self.config_store.config_mut().skip_seconds = skip;
                 self.player.lock().unwrap_or_else(|p| p.into_inner()).set_skip_seconds(skip);
+                changed = true;
+            }
+            if undo_depth != self.config_store.config().undo_depth {
+                self.config_store.config_mut().undo_depth = undo_depth;
+                self.undo_stack.set_max_depth(undo_depth);
+                changed = true;
+            }
+            if undo_disk_limit_mb != self.config_store.config().undo_disk_limit_mb {
+                self.config_store.config_mut().undo_disk_limit_mb = undo_disk_limit_mb;
+                self.undo_stack.set_disk_limit_mb(undo_disk_limit_mb);
+                changed = true;
+            }
+            // Undo dir: save the text as typed; the live stack keeps its
+            // original directory until restart (dumps already written there).
+            let trimmed_dir = undo_dir_text.trim().to_string();
+            let new_undo_dir = if trimmed_dir == audioscout_core::config::default_undo_dir() { None } else { Some(trimmed_dir) };
+            if new_undo_dir != self.config_store.config().undo_dir {
+                self.config_store.config_mut().undo_dir = new_undo_dir;
+                changed = true;
+            }
+            if preview_prefetch != self.config_store.config().preview_prefetch {
+                self.config_store.config_mut().preview_prefetch = preview_prefetch;
+                changed = true;
+            }
+            if space_stop != self.config_store.config().space_behavior_stop {
+                self.config_store.config_mut().space_behavior_stop = space_stop;
+                changed = true;
+            }
+            if preview_mode_idx != if self.config_store.config().preview_mode == "spectro" { 1 } else { 0 } {
+                let name = if preview_mode_idx == 1 { "spectro" } else { "wave" };
+                self.config_store.config_mut().preview_mode = name.to_string();
+                let mode = PreviewMode::from_str_name(name);
+                *self.preview_mode.lock().unwrap() = mode;
+                self.scanner.set_preview_mode(mode);
+                changed = true;
+                if self.show_settings {
+                    if let Some(dir) = self.current_dir.clone() {
+                        self.scanner.scan(dir, self.event_tx.clone());
+                    } else {
+                        self.request_previews();
+                    }
+                }
+            }
+            if player_mode_idx != if self.config_store.config().audio_view_mode == "spectro" { 1 } else { 0 } {
+                let name = if player_mode_idx == 1 { "spectro" } else { "wave" };
+                self.config_store.config_mut().audio_view_mode = name.to_string();
+                self.audio_view.mode = match name {
+                    "spectro" => AudioViewMode::Spectrogram,
+                    _ => AudioViewMode::Waveform,
+                };
+                changed = true;
+            }
+            if changed || hotkey_rebind.is_some() || action != SettingsAction::None {
                 let _ = self.config_store.save();
+            }
+
+            // Status line inside the dialog: reset message (set in the match
+            // below) or clear it once a rebind consumed the previous notice.
+            if action != SettingsAction::ResetHotkeys && hotkey_rebind.is_some() {
+                self.settings_status = String::new();
             }
 
             match action {
                 SettingsAction::None => {}
+                SettingsAction::ResetHotkeys => {
+                    self.config_store.config_mut().hotkeys = audioscout_core::config::hotkey_defaults();
+                    self.settings_hotkey_capture = None;
+                    self.settings_status = "Hotkeys reset to defaults".to_string();
+                    let _ = self.config_store.save();
+                }
                 SettingsAction::DeleteMarkers => {
                     let _ = self.db.delete_all_markers();
                     self.status_message = "All markers deleted".to_string();

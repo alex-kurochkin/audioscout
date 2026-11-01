@@ -194,7 +194,14 @@ impl ConfigStore {
     /// both callers share one entry point.
     pub fn clean_orphaned_previews() -> std::io::Result<usize> {
         crate::preview_worker::cleanup_previews()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
     }
+}
+
+/// Default undo-data directory shown in Settings→Undo history when the user
+/// has not overridden `AppConfig::undo_dir`: `~/.config/audioscout/undo/`.
+pub fn default_undo_dir() -> String {
+    format!("{}/undo/", config_dir().display())
 }
 
 pub fn config_dir() -> PathBuf {

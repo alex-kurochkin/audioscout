@@ -48,6 +48,26 @@ impl Stack {
     }
     pub fn can_undo(&self) -> bool { !self.undo_stack.is_empty() }
     pub fn can_redo(&self) -> bool { !self.redo_stack.is_empty() }
+    /// Runtime update of the history depth (Settings→Undo history "History
+    /// depth"). Shrinking evicts oldest entries (and their dump files) the
+    /// same way `push` does.
+    pub fn set_max_depth(&mut self, max_depth: usize) {
+        self.max_depth = max_depth.max(1);
+        while self.undo_stack.len() > self.max_depth {
+            if let Some(old) = self.undo_stack.pop_front() { Self::delete_entry_files_static(&old); }
+        }
+    }
+    /// Runtime update of the disk budget in MB (Settings→Undo history "Disk
+    /// limit"); evicts oldest entries until usage fits, mirroring `push`.
+    pub fn set_disk_limit_mb(&mut self, disk_limit_mb: usize) {
+        self.disk_limit_bytes = disk_limit_mb as u64 * 1024 * 1024;
+        while self.current_disk_usage > self.disk_limit_bytes && !self.undo_stack.is_empty() {
+            if let Some(old) = self.undo_stack.pop_front() {
+                if let Some(size) = Self::dump_size(&old) { self.current_disk_usage -= size; }
+                Self::delete_entry_files_static(&old);
+            }
+        }
+    }
     pub fn clear(&mut self) {
         let undo_entries: Vec<UndoEntry> = self.undo_stack.drain(..).collect();
         let redo_entries: Vec<UndoEntry> = self.redo_stack.drain(..).collect();
