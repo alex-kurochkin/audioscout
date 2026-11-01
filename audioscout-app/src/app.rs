@@ -82,12 +82,22 @@ fn panel_id(name: &str, height: f32, top_inset: f32) -> String {
     panel_id_with_height(name, f32::from_bits(mixed))
 }
 
-/// Offset the panel's top area so its content sits `inset` points below the
-/// panel's top edge (within the panel's exact height).
+/// Push the panel's content `inset` points below the panel's top edge
+/// (within the panel's exact height).
+///
+/// NOTE: this must NOT be implemented as `ui.add_space()` inside a
+/// `ui.horizontal(...)` row — in a horizontal layout `add_space` advances
+/// the *horizontal* cursor and is silently ignored for the vertical axis,
+/// so it has zero effect on the UI. The correct approach here is to consume
+/// an invisible strip of `inset` points at the top of the panel body via
+/// `allocate_exact_size`; egui lays it out in the vertical axis, so every
+/// following widget starts `inset` points lower. The panel keeps its exact
+/// outer height — only the content origin moves down.
 #[inline]
 fn apply_content_top_inset(ui: &mut egui::Ui, inset: f32) {
     if inset > 0.0 {
-        ui.add_space(inset);
+        let w = ui.available_width();
+        ui.allocate_exact_size(egui::vec2(w, inset), egui::Sense::hover());
     }
 }
 
@@ -1627,10 +1637,11 @@ impl eframe::App for AudioScoutApp {
                 }
                 resp.clicked()
             };
+            // Top content inset: push the toolbar row TOOLBAR_CONTENT_TOP_INSET
+            // points below the panel's top edge (applied to the panel body —
+            // inside `horizontal` a vertical offset would be ignored).
+            apply_content_top_inset(ui, TOOLBAR_CONTENT_TOP_INSET);
             ui.horizontal(|ui| {
-                // Top content inset: push the row TOOLBAR_CONTENT_TOP_INSET
-                // points below the panel's top edge.
-                apply_content_top_inset(ui, TOOLBAR_CONTENT_TOP_INSET);
                 ui.label("Filter:");
                 ui.text_edit_singleline(&mut self.filter_text);
                 let r_x = ui.button("✕");
@@ -2020,10 +2031,12 @@ impl eframe::App for AudioScoutApp {
                 }
                 resp.clicked()
             };
+            // Top content inset: push the transport row PLAYER_CONTENT_TOP_INSET
+            // points below the panel's top edge (applied to the child UI that
+            // fills the panel body — inside `horizontal` a vertical offset
+            // would be ignored).
+            apply_content_top_inset(ui, PLAYER_CONTENT_TOP_INSET);
             ui.horizontal(|ui| {
-                // Top content inset: push the transport row PLAYER_CONTENT_TOP_INSET
-                // points below the panel's top edge.
-                apply_content_top_inset(ui, PLAYER_CONTENT_TOP_INSET);
                 if hand_cursor(&ui.button("|<")) { self.navigate_file(-1); }
                 let play_text = match self.player_state() { TransportState::Playing => "⏸", _ => "▶" };
                 if hand_cursor(&ui.button(play_text)) { self.transport_play_pause(); }
@@ -2094,10 +2107,11 @@ impl eframe::App for AudioScoutApp {
                 }
                 resp.clicked()
             };
+            // Top content inset: push the actions row ACTIONS_CONTENT_TOP_INSET
+            // points below the panel's top edge (applied to the panel body —
+            // inside `horizontal` a vertical offset would be ignored).
+            apply_content_top_inset(ui, ACTIONS_CONTENT_TOP_INSET);
             ui.horizontal(|ui| {
-                // Top content inset: push the actions row ACTIONS_CONTENT_TOP_INSET
-                // points below the panel's top edge.
-                apply_content_top_inset(ui, ACTIONS_CONTENT_TOP_INSET);
                 if hand_cursor(&ui.button("Mute")) { self.mute_selection(); }
                 ui.label("Normalize:");
                 {
