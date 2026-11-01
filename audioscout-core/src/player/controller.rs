@@ -247,14 +247,18 @@ impl Controller {
             Some((s, _)) if s < total && s != self.resume_frame => (s, total),
             _ => (self.resume_frame.min(total), total),
         };
-        // BUGFIX (Stop clobbered the user's click spot, §3.5): the resume
-        // point ("начало файла или место, ранее указанное мышкой") is owned
-        // ONLY by User clicks (seek/set_resume_point) and Pause snapshots.
-        // Starting a session — with or without a selection — must preserve
-        // it; the old blanket `resume_frame = pos` made Play overwrite the
-        // clicked spot with the session start, so Stop afterwards parked the
-        // cursor at the wrong place.
-        let resume_before_play = self.resume_frame;
+        // §3.5 transport model: "Start начинает с начала файла или с места,
+        // ранее указанного мышкой" — starting playback ADOPTS its own start
+        // as the resume point, so a later Stop parks exactly where Start
+        // began from (file start after a fresh load, the clicked spot after
+        // a click, the paused position after Pause→Play). The previous
+        // blanket preservation of the pre-Play resume point broke that:
+        // click 300 → play [600,900) → Stop jumped back to 300 instead of
+        // staying at 600, and a fresh-load Stop after playing a selection
+        // rewound to 0 mid-session. Degenerate selections normalise to
+        // (s, total) below, so the adopted value always equals the real
+        // session start.
+        let mut resume_after_start = start;
         // Degenerate `end <= start` means "play from `start` to EOF" (§5.3) —
         // normalise it NOW so every downstream consumer (the pos snapshot
         // below, the output thread's `apply_play`, the session getters) sees
@@ -275,7 +279,12 @@ impl Controller {
             self.start_frame = pos;
         }
         self.current_frame = pos;
-        self.resume_frame = resume_before_play;
+        if selection.is_some() || self.state != TransportState::Playing {
+            // Fresh start: adopt the session start as the resume point.
+            self.resume_frame = resume_after_start.min(total);
+        }
+        // Re-Play while already Playing keeps the live position and must NOT
+        // clobber the stored resume point (restart-from-cursor semantics).
         self.last_sync_frame = u64::MAX;
         // Park the projection anchor at this exact instant: every getter
         // adds only honest wall time since (`stored + (now - anchor) x sr`).
@@ -1457,22 +1466,30 @@ mod tests {
         assert_eq!(c.state(), TransportState::Playing);
     }
 
-    /// §3.5 stop: silence and park the cursor at the RESUME point — "начало
-    /// файла или место, ранее указанное мышкой". Playing a selection does NOT
-    /// move the resume point (only user clicks / pause snapshots do), so
-    /// Stop after playing [200,800) from a fresh load returns to 0; a Stop
-    /// after Pause returns to the paused position.
+    /// §3.5 stop: silence and park the cursor where START began from —
+    /// "начало файла или место, ранее указанное мышкой". A fresh load parks
+    /// at 0; a click parks at the clicked spot; an explicit selection wins
+    /// for Start (§5.3) and its left bound becomes the anchor. The live
+    /// playback drift (freeze_resume_at / sync mirrors) must NEVER move it.
     #[test]
-    fn stop_parks_at_resume_point_not_session_start() {
+    fn stop_parks_at_session_start_not_live_playback_position() {
         let (mut c, doc) = controller_with_doc(1000, 1);
         c.play(&doc, Some((200, 800)));
-        c.freeze_resume_at(500, 1000);
+        c.freeze_resume_at(500, 1000); // audio clock drifted to 500
         c.stop();
         assert_eq!(c.state(), TransportState::Stopped);
-        // Fresh load ⇒ resume point is still 0; the session start (200) must
-        // NOT win (§3.5: Stop goes to file start or the user's click spot).
-        assert_eq!(c.current_frame_in(&doc), 0);
-        assert_eq!(c.resume_frame(), 0);
+        // Stop returns to where Start began (the selection's left bound),
+        // NOT to the mid-session frame the audio reached (500).
+        assert_eq!(c.current_frame_in(&doc), 200);
+        assert_eq!(c.resume_frame(), 200);
+        // Fresh load, no user click ⇒ Start began at the file start (0);
+        // Stop must park there, not at the drifted position.
+        let (mut c2, doc2) = controller_with_doc(1000, 1);
+        c2.play(&doc2, None);
+        c2.freeze_resume_at(700, 1000);
+        c2.stop();
+        assert_eq!(c2.current_frame_in(&doc2), 0);
+        assert_eq!(c2.resume_frame(), 0);
     }
 
     #[test]
@@ -1492,11 +1509,36 @@ mod tests {
     #[test]
     fn stop_after_user_click_parks_at_clicked_spot() {
         let (mut c, doc) = controller_with_doc(1000, 1);
-        c.seek(300, &doc, CursorSource::User); // user clicked while Stopped
-        c.play(&doc, Some((600, 900)));
+        // Click a spot while Stopped — the click IS the resume point (§3.5).
+        c.seek(300, &doc, CursorSource::User);
+        // Start begins from the clicked spot (no selection) and adopts it as
+        // the session start; Stop returns the cursor to exactly that spot.
+        c.play(&doc, None);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        c.sync_playback_position(450); // audio drifted past the start
         c.stop();
+        assert_eq!(c.state(), TransportState::Stopped);
         assert_eq!(c.resume_frame(), 300);
         assert_eq!(c.current_frame_in(&doc), 300);
+    }
+
+    /// §3.5: an explicit selection wins over the resume point for START
+    /// ("selection plays first"), and the started session becomes the new
+    /// resume anchor — so Stop parks at the place Start began from, not at
+    /// some older click position.
+    #[test]
+    fn stop_after_playing_selection_parks_at_session_start() {
+        let (mut c, doc) = controller_with_doc(1000, 1);
+        c.seek(300, &doc, CursorSource::User); // older click
+        c.play(&doc, Some((600, 900)));        // selection wins: starts @600
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        c.sync_playback_position(700);         // clock moved mid-session
+        c.stop();
+        assert_eq!(c.resume_frame(), 600);
+        assert_eq!(c.current_frame_in(&doc), 600);
+        // Play-after-Stop continues from the parked session start.
+        c.play(&doc, None);
+        assert_eq!(c.start_frame(), 600);
     }
 
     /// Regression: Stop must NEVER overwrite the resume point with the live

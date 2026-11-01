@@ -972,6 +972,19 @@ impl AudioScoutApp {
     /// available; without a device it degrades to state-machine-only mode so
     /// the UI never hangs on missing audio (§1.2 "раньше времени не падают").
     fn transport_play_pause(&mut self) {
+        // BUGFIX: honor the "Space key behavior" setting (config.json,
+        // `space_behavior_stop`, §3.6/Settings dialog). Previously Space was
+        // hard-wired to Start/Pause and the config value had no effect on the
+        // player. In Start/Stop mode a second press behaves exactly like the
+        // Stop button: playback stops AND the cursor parks at the resume
+        // point (file start or the place previously set with the mouse).
+        if self.config_store.config().space_behavior_stop
+            && self.player_state() == TransportState::Playing
+        {
+            tracing::debug!("[play] space pressed in Start/Stop mode -> stop");
+            self.transport_stop();
+            return;
+        }
         let sel = self.audio_view.selection_range();
         let state = self.player_state();
         if state == TransportState::Playing {
