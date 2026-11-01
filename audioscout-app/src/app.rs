@@ -1338,8 +1338,16 @@ impl AudioScoutApp {
             }
             let peak_y = base - h * live_peak.clamp(0.0, 1.0);
             let rms_y = base - h * live_rms.clamp(0.0, 1.0);
-            // instantaneous scale (green→red by level)
-            let peak_col = if live_peak > 0.95 { egui::Color32::RED } else { egui::Color32::from_rgb(80, 220, 80) };
+            // instantaneous scale (green→red by level).
+            // The red threshold comes from the "Volumeter red value" setting
+            // (dBFS, signed, <= 0). Linear clipping is 1.0 == 0 dBFS, so we
+            // convert the configured dB value to a linear amplitude and paint
+            // red when the live peak is >= that value (i.e. at or above the
+            // configured threshold; with the default -0.1 dB this means only
+            // near/true clipping turns red — no hardcoded 0.95 anymore).
+            let red_db = self.config_store.config().meter_red_db.clamp(-99.9, 0.0);
+            let red_lin = (10f32.powf(red_db / 20.0)).clamp(0.0, 1.0);
+            let peak_col = if live_peak >= red_lin { egui::Color32::RED } else { egui::Color32::from_rgb(80, 220, 80) };
             painter.rect_filled(egui::Rect::from_min_max(egui::pos2(x, peak_y), egui::pos2(x + bar_w, base)), 1.0, peak_col);
             // RMS scale (blue)
             painter.rect_filled(egui::Rect::from_min_max(egui::pos2(x + bar_w + 2.0, rms_y), egui::pos2(x + 2.0 * bar_w + 2.0, base)), 1.0, egui::Color32::LIGHT_BLUE);
