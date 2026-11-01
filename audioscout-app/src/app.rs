@@ -2913,6 +2913,31 @@ impl eframe::App for AudioScoutApp {
                 }))
                 .open(&mut show_settings)
                 .show(ctx, |ui| {
+                    // The settings content outgrew the main window height as
+                    // more sections were added (Storage / Undo history /
+                    // Behaviour / Hotkeys table), so the whole body is now
+                    // wrapped in a vertical ScrollArea: when the dialog is
+                    // taller than the viewport it can be scrolled top↔bottom
+                    // (wheel or the right-side slider).  `max_height` pins the
+                    // scroll area to the space actually available inside the
+                    // window (viewport minus the window's current top), leaving
+                    // room for the fixed Close button rendered below it;
+                    // `auto_shrink` keeps the width filling the window as
+                    // before.  Horizontal scrolling stays off — every section
+                    // fits the window width by design.
+                    let win_top = ui.cursor().min.y;
+                    let vp_h = ctx.input(|i| i.viewport().inner_rect.map_or(800.0, |r| r.height()));
+                    let close_btn_reserve = ui.spacing().button_padding.y * 2.0
+                        + ui.text_style_height(&egui::TextStyle::Button)
+                        + ui.spacing().item_spacing.y
+                        + 16.0; // separator + frame margins slack
+                    let scroll_max_h = (vp_h - win_top - close_btn_reserve).max(160.0);
+
+                    let scroll = egui::ScrollArea::vertical()
+                        .id_salt("settings_body")
+                        .auto_shrink([false, true])
+                        .max_height(scroll_max_h);
+                    scroll.show(ui, |ui| {
                     // Layout follows the Settings-window.avif mock-up in the
                     // repo root: bold section headers on their own line, one
                     // horizontal row per control, framed hotkey table with a
@@ -2954,7 +2979,7 @@ impl eframe::App for AudioScoutApp {
                         ui.horizontal(|ui| {
                             // Plain text labels only — no icons (per review).
                             if ui.button("Delete all markers").clicked() { action = SettingsAction::DeleteMarkers; }
-                            if ui.button("Scan markers").clicked() { action = SettingsAction::CleanOrphans; }
+                            if ui.button("Clean orphaned previews").clicked() { action = SettingsAction::CleanOrphans; }
                             if ui.button("Delete all previews").clicked() { action = SettingsAction::DeletePreviews; }
                         });
                     });
@@ -3216,7 +3241,12 @@ impl eframe::App for AudioScoutApp {
                             ui.label(egui::RichText::new(settings_status.clone()).weak());
                         }
                     });
+                    }); // ---- end of the scrollable settings body ----------
 
+                    // The separator + Close button live OUTSIDE the
+                    // ScrollArea, so they stay pinned at the bottom of the
+                    // dialog while the sections above scroll (per request:
+                    // "проматываемое окно", Close — "в самом низу").
                     ui.separator();
                     // ---- Close -------------------------------------------------
                     // Full width, normal button height (same fix as the
