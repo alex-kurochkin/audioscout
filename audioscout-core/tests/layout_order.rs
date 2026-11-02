@@ -241,9 +241,13 @@ fn file_table_header_shares_one_grid_with_the_rows() {
         "there must be no separate \"file_table_body\" grid anymore"
     );
 
-    // That single grid lives INSIDE the file-list ScrollArea…
+    // That single grid lives INSIDE the file-list ScrollArea… The area id
+    // may be spelled as a literal (`.id_salt("file_list")`) or referenced
+    // through the shared constant (`FILE_LIST_ID_SALT`, used by the app so
+    // the same salt can also address the scroll state from `update()`).
     let scroll_pos = code
         .find(".id_salt(\"file_list\")")
+        .or_else(|| code.find(".id_salt(FILE_LIST_ID_SALT)"))
         .expect("the table must live in the file-list ScrollArea");
     let grid_pos = code.find(body_grid_id).unwrap();
     assert!(
