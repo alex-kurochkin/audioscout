@@ -155,14 +155,3 @@ fn widths_survive_with_order() {
     assert_eq!(restored.visible, layout.visible);
 }
 
-#[test]
-fn debug_hide_show_dump() {
-    let mut layout = ColumnLayout::new();
-    layout.move_column(&Column::Size, &Column::Name, false);
-    layout.toggle_visibility(&Column::Duration);
-    let mut cc = cfg_with(&[], &[], None);
-    layout.store_into(&mut cc);
-    let mut restored = ColumnLayout::from_config(&cc);
-    restored.toggle_visibility(&Column::Duration);
-    panic!("restored.visible={:?}", restored.visible.iter().map(|c| c.key()).collect::<Vec<_>>());
-}
