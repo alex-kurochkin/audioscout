@@ -1631,12 +1631,25 @@ impl AudioScoutApp {
     fn handle_column_drag(&mut self, ctx: &egui::Context) {
         const DRAG_THRESHOLD: f32 = 4.0;
 
-        // --- Primary-button transition + live position for this frame.
-        let mut transition: Option<(egui::Pos2, bool)> = None; // (pos, pressed)
-        let cur = ctx.input(|i| {
+        // --- Raw primary-button transition + live position for this frame.
+        // Press/release transitions come from THIS frame's event list
+        // (`i.events`): egui consumes them with `PointerEvent::take()` while
+        // panels lay out, so by the time widgets run, `pointer.button(...)`
+        // may already report stale values. The event list itself is not
+        // taken, so it stays readable here at the start of the frame.
+        let mut pressed_at: Option<egui::Pos2> = None;
+        let mut released_at: Option<egui::Pos2> = None;
+        let (down_now, cur_pos) = ctx.input(|i| {
+            // Newest first: the last PointerButton event of this frame is
+            // the current button state (pressed=true → down now).
             for e in i.events.iter().rev() {
                 if let egui::Event::PointerButton { pos, button, pressed, .. } = e {
                     if *button == egui::PointerButton::Primary {
+                        if *pressed {
+                            pressed_at = Some(*pos);
+                        } else {
+                            released_at = Some(*pos);
+                        }
                         return (*pressed, Some(*pos));
                     }
                 }
@@ -1646,37 +1659,34 @@ impl AudioScoutApp {
                 i.pointer.interact_pos(),
             )
         });
-        let (down_now, cur_pos) = cur;
-        if let Some(p) = cur_pos {
-            transition = Some((p, down_now));
-        }
-        let pressed_now = matches!(transition, Some((_, true)));
-        let released_now = down_now == false && self.col_drag.is_some();
         let frame_id = self.col_frame_counter;
 
-        // --- Arm a live drag from the press recorded last frame. Doing this
-        // at the start of the next frame guarantees the header geometry the
-        // press happened against has been fully laid out and reported.
-        if pressed_now && self.col_press_frame == frame_id - 1 && !self.col_press_key.is_empty() {
+        // --- Arm a live drag from the press recorded LAST frame by the
+        // header-cell widgets. Doing this at the start of the next frame
+        // guarantees the header geometry the press happened against has
+        // been fully laid out and reported (`header_cells_snapshot`).
+        if !self.col_press_key.is_empty() && self.col_press_frame == frame_id - 1 {
             let cells = self.header_cells_snapshot(ctx);
             if !cells.is_empty() {
+                let start = pressed_at
+                    .or(cur_pos)
+                    .unwrap_or_else(|| cells.first().map(|(_, x0, _)| egui::pos2(*x0, 0.0)).unwrap_or_default());
                 self.col_drag = Some(ColDrag {
                     src: std::mem::take(&mut self.col_press_key),
-                    start: transition.map(|(p, _)| p).unwrap_or_else(|| cur_pos.unwrap_or_default()),
+                    start,
                     cells,
                     active: false,
                 });
                 ctx.request_repaint();
             }
         }
-        if !pressed_now {
-            self.col_press_key.clear();
-        }
 
-        // --- Mid-drag: promote the pending press into an active drag once
-        // the pointer has moved far enough from the press position.
+        // --- Mid-drag bookkeeping while the button is held.
         if let Some(drag) = self.col_drag.as_mut() {
-            if !drag.active {
+            if !down_now && released_at.is_none() {
+                // Button went down somewhere else / stale state: cancel.
+                self.col_drag = None;
+            } else if !drag.active {
                 if let Some(pos) = cur_pos {
                     if (pos - drag.start).length() > DRAG_THRESHOLD {
                         drag.active = true;
@@ -1687,25 +1697,19 @@ impl AudioScoutApp {
         }
 
         // --- Release: resolve the drop or cancel the drag.
-        if !released_now {
+        let Some(release_pos) = released_at else {
             if !down_now {
-                self.col_drag = None; // safety: stale drag without button
+                self.col_drag = None;
+                self.col_press_key.clear();
             }
             return;
-        }
+        };
         let Some(drag) = self.col_drag.take() else { return };
         if !drag.active {
             // Press + release without movement: a plain click. Sorting is
             // handled by egui's `clicked()` response — nothing to do here.
             return;
         }
-        let pos = match transition {
-            Some((p, _)) => p,
-            None => match cur_pos {
-                Some(p) => p,
-                None => return,
-            },
-        };
 
         // Find the target column under the release point.
         let mut target: Option<(String, bool)> = None;
@@ -1713,8 +1717,8 @@ impl AudioScoutApp {
             if key == &drag.src {
                 continue;
             }
-            if pos.x >= *x0 && pos.x <= *x1 {
-                target = Some((key.clone(), pos.x > (x0 + x1) / 2.0));
+            if release_pos.x >= *x0 && release_pos.x <= *x1 {
+                target = Some((key.clone(), release_pos.x > (x0 + x1) / 2.0));
                 break;
             }
         }
@@ -1725,14 +1729,14 @@ impl AudioScoutApp {
                 if key == &drag.src {
                     continue;
                 }
-                let d = if pos.x < *x0 {
-                    x0 - pos.x
-                } else if pos.x > *x1 {
-                    pos.x - x1
+                let d = if release_pos.x < *x0 {
+                    x0 - release_pos.x
+                } else if release_pos.x > *x1 {
+                    release_pos.x - x1
                 } else {
                     0.0
                 };
-                let a = pos.x > (x0 + x1) / 2.0;
+                let a = release_pos.x > (x0 + x1) / 2.0;
                 if best.as_ref().map_or(true, |(bd, _, _)| d < *bd) {
                     best = Some((d, key.clone(), a));
                 }
@@ -2736,7 +2740,22 @@ impl eframe::App for AudioScoutApp {
 
             // Borrow the pieces the row loop needs *before* opening the
             // table closure, so `self` is not captured mutably inside.
+            // SAFETY (raw pointer below): drag-arming writes ONLY plain
+            // column-drag state fields (`col_press_frame`/`col_press_key`).
+            // Taking a raw pointer to `self` here — while disjoint field
+            // borrows (preview caches, selected_row) are alive — avoids the
+            // E0499 that a full `&mut self` reborrow would raise; the pointer
+            // is used single-threaded during widget layout only, never
+            // escapes `update()`, and no other mutable borrow of the drag
+            // fields exists at that moment.
             {
+                let self_raw = self as *mut AudioScoutApp;
+                let cur_frame = self.col_frame_counter;
+                let col_press_cb = |key: &str, frame_id: u64| {
+                    // SAFETY: see note above — eframe runs update() on one
+                    // thread; the callback touches only the two drag fields.
+                    unsafe { (*self_raw).begin_col_press(key, frame_id) };
+                };
                 let column_layout = &self.column_layout;
                 // Per-mode texture caches: pick the one matching the active
                 // thumbnail style so switching modes never re-uploads or mixes
@@ -2803,22 +2822,8 @@ impl eframe::App for AudioScoutApp {
 
                 // Column drag-and-drop is resolved by `handle_column_drag`,
                 // run at the START of the next `update()` frame on raw
-                // pointer state — the header cells only arm a press here.
-                // The arming cannot call `self.begin_col_press(..)` directly:
-                // the table closure below borrows `self` immutably (for
-                // `file_rows`, widths, layout). A raw pointer to `self`
-                // bridges that: valid ONLY for this update() invocation, used
-                // single-threaded while every real borrow is alive or dead in
-                // program order, never escapes the function.
-                let self_raw = self as *mut AudioScoutApp;
-                let col_press_cb = |key: &str, frame_id: u64| {
-                    // SAFETY: eframe calls update() on one thread; no other
-                    // mutable borrow of `self` exists at the moment widgets
-                    // run (all live borrows cover different fields and the
-                    // callback writes only plain drag-state fields), and the
-                    // pointer is dropped when `update()` returns.
-                    unsafe { (*self_raw).begin_col_press(key, frame_id) };
-                };
+                // pointer state — the header cells only arm a press here
+                // (via `col_press_cb`, set up above this block).
 
                 // --- The files table: ONE grid whose FIRST ROW is the header
                 // and all following rows are data rows (scrollable). Because
@@ -2910,24 +2915,36 @@ impl eframe::App for AudioScoutApp {
                                     // Every header cell reports its exact rect
                                     // each frame (the drag resolver freezes the
                                     // full header geometry from these when it
-                                    // arms the live drag on the next frame),
-                                    // and a fresh press inside the cell arms
-                                    // the column-drag candidate.
+                                    // arms the live drag on the next frame).
+                                    let rect = response.rect;
                                     ctx.data_mut(|d| {
-                                        d.insert_temp(hdr_cell_id(ci), response.rect)
+                                        d.insert_temp(hdr_cell_id(ci), rect)
                                     });
-                                    let fresh_press = ui.input(|i| {
-                                        i.pointer.any_pressed()
-                                            && i.pointer.button_down(egui::PointerButton::Primary)
+
+                                    // Arm the column-drag candidate on a FRESH
+                                    // primary-button press inside this cell.
+                                    // NOTE: egui's own `is_pointer_button_down_on`
+                                    // only becomes true while the button is
+                                    // HELD (after interaction-id registration),
+                                    // which is one frame late for the resolver —
+                                    // so arming uses raw pointer input directly:
+                                    // pressed-this-frame + position within rect.
+                                    let armed = ui.input(|i| {
+                                        i.pointer.button_down(egui::PointerButton::Primary)
+                                            && i.pointer.any_pressed()
+                                            && i
+                                                .pointer
+                                                .hover_pos()
+                                                .map_or(false, |p| rect.contains(p))
                                     });
-                                    if fresh_press && response.is_pointer_button_down_on() {
-                                        col_press_cb(col_key, self_frame);
+                                    if armed {
+                                        col_press_cb(col_key, cur_frame);
                                     }
 
                                     // A completed drag-release must not also
                                     // re-sort the column it dropped through.
                                     let click_suppressed =
-                                        self_frame == self.col_suppress_click_frame;
+                                        cur_frame == self.col_suppress_click_frame;
                                     if sortable && response.clicked() && !click_suppressed {
                                         sort_request = Some(col_copy);
                                     }
