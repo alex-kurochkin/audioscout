@@ -144,7 +144,8 @@ mod tests {
         assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
         let err2 = load_directory_to_vlc(Path::new("/tmp")).unwrap_err();
         assert_eq!(err2.kind(), std::io::ErrorKind::NotFound);
-        drop(old_path); // restore below
+        // restore PATH below (no `drop(old_path)` here — it would move the
+        // value out and make the subsequent `if let` an E0382 use-after-move)
         if let Some(p) = old_path {
             std::env::set_var("PATH", p);
         } else {
