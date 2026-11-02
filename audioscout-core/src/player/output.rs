@@ -1661,6 +1661,11 @@ fn controller_thread(
 thread_local! {
     static LAST_SESSION_START: std::cell::Cell<u64> = const { std::cell::Cell::new(u64::MAX) };
     static LAST_FED_CURSOR: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    // BUGFIX (audio stayed stale after an edit while playing): generation of
+    // the document buffer this pump last sliced chunks from. When it differs
+    // from `PumpState::doc_generation`, the queued sources are pre-edit audio
+    // and must be dropped before refilling from the current cursor.
+    static LAST_DOC_GENERATION: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 fn pump_thread(pump: Arc<PumpState>, stream_format: (u32, u16)) {

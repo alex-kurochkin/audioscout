@@ -895,14 +895,32 @@ impl AudioScoutApp {
     /// owns its own immutable copy of the PCM buffer (`Arc<Document>` handed
     /// over via `Cmd::Load`). Mute/normalize/undo/redo mutate
     /// `self.document.samples` and repaint the waveform view, but without a
-    /// fresh `load_document` the audible stream kept playing the pre-edit
-    /// buffer. This helper re-publishes the current document to the output
-    /// thread and parks the transport at frame 0 so the very next Play
-    /// streams the edited samples from the start (the same contract a plain
-    /// file load has — see `load_file`).
+    /// fresh document publish the audible stream kept playing the pre-edit
+    /// buffer.
+    ///
+    /// Two flavours, matching what the user hears:
+    /// * **Playing** — swap the buffer IN PLACE via `Output::update_document`
+    ///   (`Cmd::UpdateDoc`): the controller drops every Sink chunk sliced
+    ///   from the old buffer and the pump refills from the current cursor,
+    ///   so playback continues seamlessly with the EDITED samples. Stopping
+    ///   here instead would kill the sound entirely — the exact symptom this
+    ///   fix targets ("picture changes, sound doesn't").
+    /// * **Stopped/paused** — full `load_document` semantics: republish and
+    ///   park the transport at frame 0, the same contract a plain file load
+    ///   has (see `load_file`), so the next Play streams edited samples.
     fn reload_player_audio(&mut self) {
         if self.active_file.is_none() || self.document.source_path.as_os_str().is_empty() {
             return;
+        }
+        if self.player_state() == TransportState::Playing {
+            if let Some(out) = &self.output {
+                if out.update_document(Arc::new(self.document.clone())) {
+                    return;
+                }
+                // Channel gone — fall through to the hard-reload path below.
+            } else {
+                return;
+            }
         }
         // Stop first: `Cmd::Load` on the output thread also stops the sink,
         // but doing it here keeps the UI-side state machine consistent even
