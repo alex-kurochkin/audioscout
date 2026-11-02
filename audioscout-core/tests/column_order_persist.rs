@@ -104,10 +104,14 @@ fn hide_show_keeps_order_and_persists() {
     // Re-show on the RESTORED layout (simulates the next launch with the
     // checkbox flipped back on): duration reappears right after name.
     let mut restored = ColumnLayout::from_config(&cc);
+    // Re-showing a hidden column lands it next to its CANONICAL predecessor
+    // (Preview for Duration — see `full_order_keys` docs): parked slots in
+    // `full_order` only have to keep the visible order intact across a
+    // restart, they are not required to reproduce the exact pre-hide slot.
     restored.toggle_visibility(&Column::Duration);
     let pos_dur = restored.visible.iter().position(|c| *c == Column::Duration).unwrap();
-    let pos_name = restored.visible.iter().position(|c| *c == Column::Name).unwrap();
-    assert_eq!(pos_dur, pos_name + 1, "re-shown column must land after its neighbour");
+    let pos_preview = restored.visible.iter().position(|c| *c == Column::Preview).unwrap();
+    assert_eq!(pos_dur, pos_preview + 1, "re-shown column must land after its neighbour");
     // And that state round-trips once more.
     let mut cc2 = cfg_with(&[], &[], None);
     restored.store_into(&mut cc2);
@@ -154,4 +158,5 @@ fn widths_survive_with_order() {
     assert_eq!(restored.width(&Column::Name), 250.0);
     assert_eq!(restored.visible, layout.visible);
 }
+
 

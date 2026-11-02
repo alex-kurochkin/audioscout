@@ -120,7 +120,15 @@ impl ColumnLayout {
             }
             cols
         };
-        let vis_snapshot = layout.visible.clone();
+        // When the visibility set is persisted alongside `full_order`, it is
+        // authoritative: a hidden column's parked slot must NOT be resurrected
+        // just because the key also appears in `columns/order` (older builds
+        // kept `order` as a full list that still contained hidden columns —
+        // filtering `full_order` through it would silently re-show them).
+        let vis_snapshot = visible_set
+            .clone()
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| Column::all().to_vec());
         let ordered = if !full.is_empty() {
             derived(&full, &vis_snapshot)
         } else if !order.is_empty() {
@@ -241,91 +249,34 @@ impl ColumnLayout {
             .collect();
     }
 
-    /// Freeze the currently-visible display order into `full_order`, keeping
-    /// every already-hidden column in the slot it occupies there (its last
-    /// known position). Used by the hide path so the disappearing column
-    /// stays parked exactly where it sat on screen — NOT re-parked into its
-    /// canonical gap, which would make a later re-show land it next to a
-    /// different neighbour than the one it had before being hidden.
-    fn freeze_full_order_for_hide(&mut self) {
+    /// Re-anchor every parked (hidden) column of `full_order` so it sits
+    /// directly after its last visible predecessor in the CURRENT live
+    /// display order, preserving the relative order of columns sharing an
+    /// anchor. The visible part of the arrangement is rewritten to match
+    /// `visible` exactly. Keeps the invariant relied on by `store_into`,
+    /// `from_config` and the re-show path: filtering `full_order` through
+    /// the visibility set reproduces the live display order, and each hidden
+    /// slot encodes a real "right after X" position (X visible).
+    fn reanchor_full_order(&mut self) {
         if self.full_order.is_empty() || self.full_order.len() != Column::all().len() {
-            // No complete arrangement yet: derive one from the live order.
-            // (Nothing has been removed at this point, so "hidden" columns
-            // are placed by the canonical-predecessor rule as a baseline.)
             self.ensure_full_order();
             return;
         }
-        let derived_visible: Vec<Column> = self
-            .full_order
-            .iter()
-            .filter(|c| self.visible.contains(c))
-            .cloned()
-            .collect();
-        if derived_visible == self.visible {
-            // Already consistent with the live display order — keep it.
-            return;
-        }
-        // Rebuild: walk the NEW live display order and re-attach each hidden
-        // column right after its last visible predecessor in the old
-        // arrangement (its anchor), preserving relative order among anchors.
-        let mut new_order: Vec<Column> = Vec::with_capacity(self.full_order.len());
-        for &vis in &self.visible {
-            new_order.push(vis);
-            let fp_vis = self.full_order.iter().position(|c| *c == vis);
-            if let Some(fpv) = fp_vis {
-                // Hidden columns that sat directly after `vis` in the old
-                // arrangement (before the next visible column) move with it.
-                for h in &self.full_order[fpv + 1..] {
-                    if self.visible.contains(h) {
-                        break;
-                    }
-                    if !new_order.contains(h) {
-                        new_order.push(*h);
-                    }
-                }
+        // Anchor of each hidden column: its last visible predecessor in the
+        // OLD arrangement (its pre-change parking spot), or None → end.
+        let mut anchors: Vec<(Column, Option<Column>)> = Vec::new();
+        for i in 0..self.full_order.len() {
+            let c = self.full_order[i];
+            if self.visible.contains(&c) {
+                continue;
             }
+            let anchor = self.full_order[..i]
+                .iter()
+                .rev()
+                .find(|c| self.visible.contains(c))
+                .copied();
+            anchors.push((c, anchor));
         }
-        // Anything still unplaced goes to the very end.
-        for c in self.full_order.iter().filter(|c| !new_order.contains(c)) {
-            new_order.push(*c);
-        }
-        self.full_order = new_order;
-    }
-
-    /// Keep the explicitly carried full arrangement in sync after the LIVE
-    /// display order changed (header drag). The slots of the still-hidden
-    /// columns are preserved: each parked column moves only as far as needed
-    /// to stay right after its last visible predecessor *in the arrangement*
-    /// — exactly the place it would occupy when re-shown. This is what makes
-    /// hide → drag → store → restore → re-show land the hidden column back at
-    /// its pre-hide slot rather than its canonical one. When no arrangement
-    /// exists yet (or it is stale), derive one from the live order instead.
-    fn resync_full_order_after_drag(&mut self) {
-        if self.full_order.is_empty() || self.full_order.len() != Column::all().len() {
-            self.ensure_full_order();
-            return;
-        }
-        // Remember, for every hidden column, its last visible predecessor in
-        // the stored arrangement (its anchor) before we rebuild anything.
-        let anchors: Vec<(Column, Option<Column>)> = self
-            .full_order
-            .iter()
-            .copied()
-            .filter(|c| !self.visible.contains(c))
-            .map(|h| {
-                let fp = self.full_order.iter().position(|c| *c == h).unwrap_or(0);
-                let anchor = self.full_order[..fp]
-                    .iter()
-                    .rev()
-                    .find(|c| self.visible.contains(c))
-                    .copied();
-                (h, anchor)
-            })
-            .collect();
-        // Rebuild: walk the NEW live display order and re-attach each hidden
-        // column right after its anchor (anchors keep their relative order
-        // from the old arrangement). Hidden columns whose anchor vanished go
-        // to the very end so nothing is lost.
         let mut new_order: Vec<Column> = Vec::with_capacity(self.full_order.len());
         for &vis in &self.visible {
             new_order.push(vis);
@@ -357,7 +308,24 @@ impl ColumnLayout {
         // Persist the FULL arrangement (with hidden columns parked in their
         // stable slots), not just the visible order — otherwise a hide →
         // restart → re-show cycle loses the pre-hide slot of the column.
-        cfg.full_order = self.full_order_keys();
+        // The explicitly carried arrangement is authoritative whenever it is
+        // complete and agrees with the live display order (the hide/re-show
+        // paths keep it exactly in that shape); only stale or missing ones
+        // fall back to deriving from the canonical rules.
+        let derived_visible: Vec<Column> = self
+            .full_order
+            .iter()
+            .filter(|c| self.visible.contains(c))
+            .cloned()
+            .collect();
+        if !self.full_order.is_empty()
+            && self.full_order.len() == Column::all().len()
+            && derived_visible == self.visible
+        {
+            cfg.full_order = self.full_order.iter().map(|c| c.key().to_string()).collect();
+        } else {
+            cfg.full_order = self.full_order_keys();
+        }
         cfg.widths = self.widths.clone();
     }
 
@@ -367,7 +335,17 @@ impl ColumnLayout {
             // from `visible`, so the hidden column keeps its live display
             // slot — a later re-show puts it back exactly there (see below).
             self.ensure_full_order();
-            if self.visible.len() > 1 { self.visible.remove(pos); }
+            if self.visible.len() > 1 {
+                self.visible.remove(pos);
+                // Re-anchor the arrangement AFTER the removal: every parked
+                // hidden column must sit directly after its last visible
+                // predecessor in the NEW live order. Without this, columns
+                // that had been parked behind the just-hidden one would be
+                // left stranded before it (e.g. [name, preview, duration]
+                // hiding Preview → [name, preview, duration] again), and the
+                // restore/re-show path could not recover their slots.
+                self.reanchor_full_order();
+            }
         } else {
             // Re-show rule (in priority order):
             // 1. If the layout carries an explicit FULL arrangement that has
@@ -407,18 +385,29 @@ impl ColumnLayout {
                 });
             let insert_at = match full_slot {
                 Some(fp) => {
-                    // The column keeps the slot it had before it was hidden:
-                    // in the stored full arrangement all visible columns
-                    // preceding it form exactly the live display prefix, so
-                    // re-inserting right after the last of them reproduces
-                    // its pre-hide position (and works even when a drag moved
-                    // some following visible column into the parked column's
-                    // canonical gap).
-                    let before_count = self.full_order[..fp]
-                        .iter()
-                        .filter(|c| self.visible.contains(c))
-                        .count();
-                    before_count
+                    // The column keeps the slot it had before it was hidden.
+                    // When the parked column sits DIRECTLY after a visible
+                    // neighbour in the arrangement (the normal case: hide
+                    // parks it exactly at its live display slot), that slot
+                    // is the insertion point — counting only the visible
+                    // columns before it would skip over visible neighbours
+                    // that follow the parked column in the arrangement but
+                    // precede it on screen, and land the re-shown column one
+                    // position too late (off-by-one). Otherwise (stale
+                    // canonical gap left over from an older config), all
+                    // visible columns preceding the slot form the live
+                    // display prefix, so inserting right after the last of
+                    // them reproduces the pre-hide position.
+                    let prev_visible_adjacent = fp > 0 && self.visible.contains(&self.full_order[fp - 1]);
+                    if prev_visible_adjacent {
+                        self.visible.iter().position(|v| *v == self.full_order[fp - 1]).unwrap() + 1
+                    } else {
+                        let before_count = self.full_order[..fp]
+                            .iter()
+                            .filter(|c| self.visible.contains(c))
+                            .count();
+                        before_count
+                    }
                 }
                 None => {
                     // No trustworthy parked slot (legacy config, or the
