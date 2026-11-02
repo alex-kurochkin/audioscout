@@ -187,41 +187,29 @@ impl ColumnLayout {
         // through the visibility set reproduces `visible` exactly.
         let mut out: Vec<String> = Vec::with_capacity(all.len());
         let mut emitted: Vec<Column> = Vec::with_capacity(all.len());
-        // Canonical index of each visible column, keyed by display position.
-        let vis_canon: Vec<usize> =
-            self.visible.iter().map(|c| canon_pos(c)).collect();
         for vi in 0..self.visible.len() {
             let vis = &self.visible[vi];
             out.push(vis.key().to_string());
             emitted.push(*vis);
-            // Park the still-hidden columns whose canonical home sits in the
-            // gap opened up by this visible column: between the canonical
-            // positions of its DISPLAY-order neighbours (the previous/next
-            // visible columns), not their own canonical positions. When a
-            // column is hidden, `toggle_visibility` will later re-insert it
-            // right after its nearest canonical predecessor among the visible
-            // ones — mirroring that rule here keeps `full_order` consistent
-            // with the live insertion behaviour, so hide → store → restore →
-            // re-show lands the column exactly next to that neighbour.
-            let lo = if vi > 0 { vis_canon[vi - 1] } else { usize::MAX };
-            let hi = vis_canon.get(vi + 1).copied().unwrap_or(usize::MAX);
-            for hi_idx in 0..all.len() {
+            // Park the still-hidden columns that `toggle_visibility` would
+            // re-insert right after this column: every hidden column whose
+            // LAST visible canonical predecessor is exactly `vis`. This
+            // mirrors the live insertion rule here, so hide → store →
+            // restore → re-show lands the column back at this very slot on
+            // the next launch — independent of where a user drag moved the
+            // visible neighbours around.
+            let idx = canon_pos(vis);
+            for hi_idx in (idx + 1)..all.len() {
                 let h = all[hi_idx];
                 if self.visible.contains(&h) || emitted.contains(&h) {
                     continue;
                 }
-                let hp = canon_pos(&h);
-                let fits = if lo == usize::MAX {
-                    // First display slot: only columns canonically BEFORE the
-                    // second visible column have nowhere better to go; the
-                    // rest wait for a later gap (see the tail fallback below).
-                    hi != usize::MAX && hp < hi
-                } else if hi == usize::MAX {
-                    hp > lo
-                } else {
-                    hp > lo && hp < hi
-                };
-                if fits {
+                // Nearest visible canonical predecessor of `h`.
+                let pred_visible = all[..hi_idx]
+                    .iter()
+                    .rev()
+                    .find(|c| self.visible.contains(c));
+                if pred_visible == Some(vis) {
                     out.push(h.key().to_string());
                     emitted.push(h);
                 }
@@ -320,24 +308,18 @@ impl ColumnLayout {
                 });
             let insert_at = match full_slot {
                 Some(fp) => {
-                    let last_before = self.full_order[..fp]
+                    // The column keeps the slot it had before it was hidden:
+                    // in the stored full arrangement all visible columns
+                    // preceding it form exactly the live display prefix, so
+                    // re-inserting right after the last of them reproduces
+                    // its pre-hide position (and works even when a drag moved
+                    // some following visible column into the parked column's
+                    // canonical gap).
+                    let before_count = self.full_order[..fp]
                         .iter()
-                        .rev()
-                        .find_map(|c| {
-                            if self.visible.contains(c) {
-                                self.visible.iter().position(|v| v == c)
-                            } else {
-                                None
-                            }
-                        });
-                    match last_before {
-                        // A visible neighbour precedes the parked slot in the
-                        // full arrangement: land right after it.
-                        Some(p) => p + 1,
-                        // The column is parked at the very front of the full
-                        // arrangement — mirror rule 2 and put it first.
-                        None => 0,
-                    }
+                        .filter(|c| self.visible.contains(c))
+                        .count();
+                    before_count
                 }
                 None => {
                     let idx = Column::all().iter().position(|c| c == col).unwrap_or(0);

@@ -492,6 +492,14 @@ impl AudioScoutApp {
         let event_tx = channel.sender.clone();
         let event_rx = channel.receiver;
         let player = Arc::new(Mutex::new(Controller::new(Arc::new(PlayheadState::new()))));
+        // Restore the persisted transport settings (tz §1.4: config.json is
+        // the source of truth on launch). Without this the slider writes the
+        // volume to disk but every start begins at the built-in 0.8 default.
+        {
+            let mut ctrl = player.lock().unwrap_or_else(|p| p.into_inner());
+            ctrl.set_volume(config_store.config().volume);
+            ctrl.set_skip_seconds(config_store.config().skip_seconds);
+        }
         // Single application-wide OutputStream, created once at startup and
         // kept alive for the whole session (tz §5.2). Without an audio device
         // RodioOutput::new returns None and playback is silently unavailable.
@@ -1343,8 +1351,18 @@ impl AudioScoutApp {
 
     fn transport_set_volume(&mut self, vol: f32) {
         if let Some(out) = &self.output { out.set_volume(vol); }
-        let mut ctrl = self.player.lock().unwrap_or_else(|p| p.into_inner());
-        ctrl.set_volume(vol);
+        {
+            let mut ctrl = self.player.lock().unwrap_or_else(|p| p.into_inner());
+            ctrl.set_volume(vol);
+        }
+        // Write-on-change persistence (tz §1.4): the volume slider must land
+        // in config.json immediately, so the new gain survives the next
+        // launch. The controller clamps to 0..=1, mirror that here.
+        let clamped = vol.clamp(0.0, 1.0);
+        if (self.config_store.config().volume - clamped).abs() > f32::EPSILON {
+            self.config_store.config_mut().volume = clamped;
+            let _ = self.config_store.save();
+        }
     }
 
     fn player_state(&self) -> TransportState {
