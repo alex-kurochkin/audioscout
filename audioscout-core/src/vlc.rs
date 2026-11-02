@@ -25,7 +25,7 @@ pub fn find_vlc() -> Option<PathBuf> {
             return Some(p);
         }
     }
-    VLC_CANDIDATES.iter().find_map(lookup_in_path)
+    VLC_CANDIDATES.iter().copied().find_map(lookup_in_path)
 }
 
 /// Resolve one executable name against the system PATH using the platform's

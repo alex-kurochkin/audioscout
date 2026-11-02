@@ -291,6 +291,12 @@ fn central_ui_child_id(ctx: &egui::Context, salt: &'static str) -> egui::Id {
     panel_id.with(&salt)
 }
 
+/// Per-file popup-menu id used by the files-list right-click menu
+/// (§ "Open with VLC"). The menu machinery (`context_menu`) keys its state
+/// off this id, so one shared constant is enough: the actual widget id is
+/// derived from it together with the file path at the call site.
+const FILE_VLC_MENU_ID: egui::Id = egui::Id::from_u64(0x564C_4346_696C_6500);
+
 pub struct AudioScoutApp {
     config_store: ConfigStore,
     db: Database,
@@ -2085,6 +2091,45 @@ impl AudioScoutApp {
         ctx.input(|i| i.pointer.button_down(egui::PointerButton::Primary))
     }
 
+    /// Spawn VLC for `path` — the shared back-end of both context-menu
+    /// entries (§ "Open with VLC" on a file, § "Load to VLC" on a folder).
+    /// VLC is assumed installed; when the binary cannot be located (or the
+    /// spawn itself fails) the reason surfaces in the status bar instead of
+    /// crashing or silently doing nothing.
+    fn open_in_vlc(&mut self, path: &Path, as_directory: bool) {
+        let result = if as_directory {
+            audioscout_core::vlc::load_directory_to_vlc(path)
+        } else {
+            audioscout_core::vlc::open_file_with_vlc(path)
+        };
+        self.status_message = match result {
+            Ok(()) => {
+                if as_directory {
+                    format!("Loaded {} into VLC", path.display())
+                } else {
+                    format!("Opening {} with VLC", path.display())
+                }
+            }
+            Err(e) => {
+                tracing::error!("[vlc] failed to launch for {path:?}: {e}");
+                format!("VLC launch failed: {e}")
+            }
+        };
+    }
+
+    /// True while ANY pointer button is held down anywhere. Used by the
+    /// files-list right-click menu: column-drag grabs only ever use the
+    /// primary button, but a menu must also stay closed while the user drags
+    /// with the secondary button elsewhere (e.g. panning another ScrollArea),
+    /// so it claims its popup only from a fully idle pointer.
+    fn any_pointer_button_down(&self, ctx: &egui::Context) -> bool {
+        ctx.input(|i| {
+            i.pointer.button_down(egui::PointerButton::Primary)
+                || i.pointer.button_down(egui::PointerButton::Secondary)
+                || i.pointer.button_down(egui::PointerButton::Middle)
+        })
+    }
+
     /// Exact x-ranges of all visible header cells, collected by the table
     /// header widgets DURING the previous frame's layout pass (each cell
     /// reports its rect under a stable id). Falls back to widths computed
@@ -3259,6 +3304,12 @@ impl eframe::App for AudioScoutApp {
                 // after the whole CentralPanel closure (the layout is only
                 // borrowed immutably inside).
                 let mut sort_request: Option<Column> = None;
+                // "Open with VLC" picked from a file row's right-click menu
+                // (§ context menu). Spawned AFTER the CentralPanel closure —
+                // like every other deferred action — because `open_in_vlc`
+                // needs `&mut self`, which is not available while the grid
+                // borrows `file_rows`/`preview_cache`/`selected_row`.
+                let mut file_to_vlc: Option<PathBuf> = None;
 
                 // BUGFIX (horizontal scrollbar): the list used to be hosted by
                 // `ScrollArea::vertical()`, which explicitly disables
@@ -3280,6 +3331,11 @@ impl eframe::App for AudioScoutApp {
                     // this area). Disable it for the whole duration of a
                     // header capture; wheel/trackpad hscroll stays available
                     // (it is swallowed separately in `update()`).
+                    // The "Open with VLC" popup does NOT need this switch:
+                    // it is opened by a right-click (drag-scroll only tracks
+                    // the primary button), and its menu paints in a
+                    // Foreground-ordered Area that wins hit-testing over the
+                    // drag background anyway.
                     .drag_to_scroll(!header_grab_now)
                     .auto_shrink([false, false])
                     .max_height(list_max_height)
@@ -3292,6 +3348,11 @@ impl eframe::App for AudioScoutApp {
                         // cell this frame; checked after the grid closure to
                         // switch the cursor icon to a pointing hand.
                         let mut any_row_hovered = false;
+                        // Row that was right-clicked THIS frame: (path, menu
+                        // position). Captured inside the grid loop; the popup
+                        // itself is painted after `grid.show` so it appears
+                        // exactly once per frame above all rows.
+                        let mut row_vlc_menu: Option<(PathBuf, egui::Pos2)> = None;
 
                         let grid = egui::Grid::new("file_table")
                             .num_columns(visible_cols.len())
@@ -3402,6 +3463,13 @@ impl eframe::App for AudioScoutApp {
                                 // Track if this row was clicked
                                 let mut row_clicked = false;
                                 let mut row_double_clicked = false;
+                                // Set once any cell of this row reports a
+                                // fresh RIGHT-click (the opener for the
+                                // "Open with VLC" popup). The menu itself is
+                                // painted after the whole row loop, so it
+                                // shows exactly once per frame on top of the
+                                // grid.
+                                let mut row_secondary_clicked = false;
 
                                 for (ci, col) in visible_cols.iter().enumerate() {
                                     let width = column_widths[ci];
@@ -3519,6 +3587,13 @@ impl eframe::App for AudioScoutApp {
                                     if cell_response.double_clicked() {
                                         row_double_clicked = true;
                                     }
+                                    // Right-click anywhere on the row opens
+                                    // the per-file context menu (§ "Open with
+                                    // VLC"). `secondary_clicked` is a fresh
+                                    // press event, so it fires exactly once.
+                                    if cell_response.secondary_clicked() {
+                                        row_secondary_clicked = true;
+                                    }
                                 }
 
                                 // Handle row selection
@@ -3531,9 +3606,81 @@ impl eframe::App for AudioScoutApp {
                                     local_paths_to_load.push(row.path.clone());
                                 }
 
+                                // Per-row right-click opener for the popup:
+                                // remember the path + the pointer position so
+                                // the menu can be painted once, after the grid
+                                // closure (see `row_vlc_menu` below). The id
+                                // is shared across all rows (`FILE_VLC_MENU_ID`
+                                // — one menu at a time), but keyed by the path
+                                // so re-clicking another row re-claims it.
+                                if row_secondary_clicked {
+                                    row_vlc_menu = Some((
+                                        row.path.clone(),
+                                        ui.input(|i| i.pointer.hover_pos())
+                                            .unwrap_or(cell_rect.left_top()),
+                                    ));
+                                }
+
                                 ui.end_row();
                             }
                         });
+
+                        // --- Per-file right-click popup (§ "Open with VLC") ---
+                        // Painted AFTER the grid so it sits on top of every
+                        // row. The opener is a synthetic response that only
+                        // reports this frame's fresh secondary click — the
+                        // generic `context_menu` machinery then claims the
+                        // shared popup id and keeps it open across frames.
+                        let menu_claim = FILE_VLC_MENU_ID.with("claim");
+                        if let Some((path, pos)) = row_vlc_menu {
+                            let opener_id = ui.id().with(("vlc_file_opener", path.clone()));
+                            let opener_rect = egui::Rect::from_min_size(pos, egui::vec2(1.0, 1.0));
+                            let opener = ui.interact(
+                                opener_rect,
+                                opener_id,
+                                egui::Sense::click(),
+                            );
+                            // Only claim the popup from an IDLE pointer: a
+                            // column-drag grab never reaches here (its press
+                            // arms the header capture), but any held button
+                            // means a gesture is in flight and must not be
+                            // interrupted by a menu stealing input focus.
+                            if opener.secondary_clicked()
+                                && !header_grab_now
+                                && !self.any_pointer_button_down(ctx)
+                            {
+                                ctx.data_mut(|d| d.insert_temp(menu_claim, FILE_VLC_MENU_ID));
+                                ctx.request_repaint();
+                            }
+                        }
+                        if ctx.data(|d| d.get_temp::<egui::Id>(menu_claim)) == Some(FILE_VLC_MENU_ID)
+                        {
+                            let dummy_id = ui.id().with("vlc_file_dummy");
+                            let dummy_rect =
+                                ui.input(|i| i.pointer.hover_pos()).map_or(ui.min_rect(), |p| {
+                                    egui::Rect::from_min_size(p, egui::vec2(1.0, 1.0))
+                                });
+                            let dummy = ui.interact(dummy_rect, dummy_id, egui::Sense::click());
+                            if let Some(item) =
+                                context_menu(ui, &dummy, FILE_VLC_MENU_ID, dummy_rect.left_bottom(), &["Open with VLC"])
+                            {
+                                if item == "Open with VLC" {
+                                    if let Some((path, _)) = &row_vlc_menu {
+                                        file_to_vlc = Some(path.clone());
+                                    } else {
+                                        // Menu was open from a previous frame;
+                                        // resolve the target from the current
+                                        // selection so the action always has
+                                        // a well-defined subject.
+                                        if let Some(idx) = *selected_row {
+                                            if let Some(r) = file_rows.get(idx) {
+                                                file_to_vlc = Some(r.path.clone());
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
 
                         // Hand the collected double-click paths over to the
                         // outer `paths_to_load` (loaded after CentralPanel).
