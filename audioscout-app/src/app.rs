@@ -83,13 +83,17 @@ fn panel_id_with_height(name: &str, h: f32) -> String {
 /// popup is driven by an explicit per-widget id stored in `ctx.data`:
 /// the widget that was right-clicked claims the popup, and every other
 /// primary press outside the menu rect dismisses it.
-pub fn context_menu(
+///
+/// The returned `&str` borrows from `items` (the caller owns the labels —
+/// static string literals at every call site), which is why the lifetime is
+/// tied to the input slice rather than `'static`.
+pub fn context_menu<'a>(
     ui: &egui::Ui,
     opener: &egui::Response,
     id: egui::Id,
     pos: egui::Pos2,
-    items: &[&str],
-) -> Option<&'static str> {
+    items: &'a [&'a str],
+) -> Option<&'a str> {
     let ctx = ui.ctx();
     let claimed = ctx.data(|d| d.get_temp::<egui::Id>(id)) == Some(id);
     if !claimed && opener.secondary_clicked() {
@@ -100,7 +104,7 @@ pub fn context_menu(
         return None;
     }
 
-    let mut chosen: Option<&'static str> = None;
+    let mut chosen: Option<&'a str> = None;
     let frame = egui::Frame::menu(&ctx.style());
     egui::Area::new(id.with("menu"))
         .fixed_pos(pos)
@@ -293,9 +297,12 @@ fn central_ui_child_id(ctx: &egui::Context, salt: &'static str) -> egui::Id {
 
 /// Per-file popup-menu id used by the files-list right-click menu
 /// (§ "Open with VLC"). The menu machinery (`context_menu`) keys its state
-/// off this id, so one shared constant is enough: the actual widget id is
-/// derived from it together with the file path at the call site.
-const FILE_VLC_MENU_ID: egui::Id = egui::Id::from_u64(0x564C_4346_696C_6500);
+/// off this id, so one shared constant is enough: only one file menu is ever
+/// open at a time. `egui::Id::new` is not const in 0.29, hence `fn` instead
+/// of `const`.
+fn file_vlc_menu_id() -> egui::Id {
+    egui::Id::new("vlc_file_menu")
+}
 
 pub struct AudioScoutApp {
     config_store: ConfigStore,
@@ -2122,7 +2129,11 @@ impl AudioScoutApp {
     /// primary button, but a menu must also stay closed while the user drags
     /// with the secondary button elsewhere (e.g. panning another ScrollArea),
     /// so it claims its popup only from a fully idle pointer.
-    fn any_pointer_button_down(&self, ctx: &egui::Context) -> bool {
+    ///
+    /// Associated function (no `&self`): the check runs inside the file-list
+    /// grid closure, which already mutably borrows several `self` fields —
+    /// an instance method would need yet another immutable borrow of `*self`.
+    fn any_pointer_button_down(ctx: &egui::Context) -> bool {
         ctx.input(|i| {
             i.pointer.button_down(egui::PointerButton::Primary)
                 || i.pointer.button_down(egui::PointerButton::Secondary)
@@ -3610,14 +3621,19 @@ impl eframe::App for AudioScoutApp {
                                 // remember the path + the pointer position so
                                 // the menu can be painted once, after the grid
                                 // closure (see `row_vlc_menu` below). The id
-                                // is shared across all rows (`FILE_VLC_MENU_ID`
+                                // is shared across all rows (`file_vlc_menu_id()`
                                 // — one menu at a time), but keyed by the path
                                 // so re-clicking another row re-claims it.
                                 if row_secondary_clicked {
+                                    // Fallback position: the top-left of the
+                                    // whole row rect (the last cell's rect is
+                                    // out of scope here, and the pointer is
+                                    // always available in practice — this arm
+                                    // only guards headless/edge frames).
+                                    let fallback = ui.min_rect().left_top();
                                     row_vlc_menu = Some((
                                         row.path.clone(),
-                                        ui.input(|i| i.pointer.hover_pos())
-                                            .unwrap_or(cell_rect.left_top()),
+                                        ui.input(|i| i.pointer.hover_pos()).unwrap_or(fallback),
                                     ));
                                 }
 
@@ -3631,8 +3647,12 @@ impl eframe::App for AudioScoutApp {
                         // reports this frame's fresh secondary click — the
                         // generic `context_menu` machinery then claims the
                         // shared popup id and keeps it open across frames.
-                        let menu_claim = FILE_VLC_MENU_ID.with("claim");
-                        if let Some((path, pos)) = row_vlc_menu {
+                        let menu_claim = file_vlc_menu_id().with("claim");
+                        // Clone the path out of the option so the value is
+                        // not partially moved when it is re-borrowed below
+                        // (the "previous frame" fallback arm).
+                        let clicked_path: Option<PathBuf> = row_vlc_menu.as_ref().map(|(p, _)| p.clone());
+                        if let Some((path, pos)) = row_vlc_menu.take() {
                             let opener_id = ui.id().with(("vlc_file_opener", path.clone()));
                             let opener_rect = egui::Rect::from_min_size(pos, egui::vec2(1.0, 1.0));
                             let opener = ui.interact(
@@ -3647,13 +3667,13 @@ impl eframe::App for AudioScoutApp {
                             // interrupted by a menu stealing input focus.
                             if opener.secondary_clicked()
                                 && !header_grab_now
-                                && !self.any_pointer_button_down(ctx)
+                                && !Self::any_pointer_button_down(ctx)
                             {
-                                ctx.data_mut(|d| d.insert_temp(menu_claim, FILE_VLC_MENU_ID));
+                                ctx.data_mut(|d| d.insert_temp(menu_claim, file_vlc_menu_id()));
                                 ctx.request_repaint();
                             }
                         }
-                        if ctx.data(|d| d.get_temp::<egui::Id>(menu_claim)) == Some(FILE_VLC_MENU_ID)
+                        if ctx.data(|d| d.get_temp::<egui::Id>(menu_claim)) == Some(file_vlc_menu_id())
                         {
                             let dummy_id = ui.id().with("vlc_file_dummy");
                             let dummy_rect =
@@ -3662,11 +3682,11 @@ impl eframe::App for AudioScoutApp {
                                 });
                             let dummy = ui.interact(dummy_rect, dummy_id, egui::Sense::click());
                             if let Some(item) =
-                                context_menu(ui, &dummy, FILE_VLC_MENU_ID, dummy_rect.left_bottom(), &["Open with VLC"])
+                                context_menu(ui, &dummy, file_vlc_menu_id(), dummy_rect.left_bottom(), &["Open with VLC"])
                             {
                                 if item == "Open with VLC" {
-                                    if let Some((path, _)) = &row_vlc_menu {
-                                        file_to_vlc = Some(path.clone());
+                                    if let Some(path) = clicked_path {
+                                        file_to_vlc = Some(path);
                                     } else {
                                         // Menu was open from a previous frame;
                                         // resolve the target from the current
@@ -3712,6 +3732,13 @@ impl eframe::App for AudioScoutApp {
         // Load files AFTER the CentralPanel closure (no borrow conflict)
         for path in paths_to_load {
             self.load_file(&path);
+        }
+
+        // "Open with VLC" picked from a file row's right-click menu — spawned
+        // here, outside the panel closures, because `open_in_vlc` needs
+        // `&mut self` (§ context menu).
+        if let Some(file) = file_to_vlc {
+            self.open_in_vlc(&file, false);
         }
 
 
