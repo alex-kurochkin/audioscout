@@ -390,6 +390,9 @@ pub struct AudioScoutApp {
     /// `handle_column_drag`.
     col_presses: HashMap<egui::Id, ColPress>,
     col_drag: Option<ColDrag>,
+    /// Own frame counter (egui 0.29 `Context` has no `frame_index()`);
+    /// bumped once per processed frame inside `handle_column_drag`.
+    col_frame_counter: u64,
     /// Frame index of the release that ended a column drag; clicks reported
     /// by header widgets on that frame are ignored (reorder ≠ re-sort).
     col_suppress_click_frame: u64,
@@ -505,6 +508,7 @@ impl AudioScoutApp {
             panel_layout_id: PANEL_LAYOUT_ID,
             col_presses: HashMap::new(),
             col_drag: None,
+            col_frame_counter: 0,
             col_suppress_click_frame: 0,
         };
 
@@ -1654,7 +1658,11 @@ impl AudioScoutApp {
         }
         let pressed_now = matches!(transition, Some((_, true)));
         let released_now = matches!(transition, Some((_, false)));
-        let frame_id = ctx.frame_index() as u64;
+        // egui 0.29's Context has no `frame_index()` — keep our own counter,
+        // bumped once per processed frame below (used only to tag the frame
+        // whose release ended a drag, so its click can be suppressed).
+        self.col_frame_counter += 1;
+        let frame_id = self.col_frame_counter;
 
         // --- Drag candidates armed by the header widgets this frame. A
         // candidate lives exactly one frame; stale ones must never start a
@@ -2908,7 +2916,7 @@ impl eframe::App for AudioScoutApp {
                                     // A completed drag-release must not also
                                     // re-sort the column it dropped through.
                                     let click_suppressed =
-                                        ctx.frame_index() as u64 == self.col_suppress_click_frame;
+                                        self.col_frame_counter == self.col_suppress_click_frame;
                                     if sortable && response.clicked() && !click_suppressed {
                                         sort_request = Some(col_copy);
                                     }
@@ -3730,6 +3738,13 @@ impl eframe::App for AudioScoutApp {
         }
 
         if let Some(dir) = &self.current_dir { let _ = self.db.save_session("lastDir", &dir.to_string_lossy()); }
+
+        // --- Column drag-and-drop resolution (manual pointer state machine).
+        // Must run AFTER all panels were laid out this frame: header widgets
+        // armed press candidates and reported their exact rects during the
+        // pass above; here presses are promoted to drags and releases are
+        // resolved into reorder requests.
+        self.handle_column_drag(ctx);
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
