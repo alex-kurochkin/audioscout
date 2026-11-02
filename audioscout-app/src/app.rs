@@ -2236,10 +2236,32 @@ impl AudioScoutApp {
         // of this folder into one VLC session. The popup claims its own id
         // (see `context_menu`), so it survives outside the folder button's
         // interaction scope and only one menu is ever open at a time.
+        // NOTE: the anchor position is taken from the row's OWN rect
+        // (`response.rect`), not from the live pointer position — a
+        // pointer-based anchor made the menu chase the mouse between frames
+        // ("убегает от мышки"). Claimed on a fresh secondary press; while
+        // any button is still held the claim waits, so an in-flight drag or
+        // selection gesture never gets interrupted by the popup.
         let menu_id = egui::Id::new(("vlc_dir_menu", path));
-        let menu_pos = ui.input(|i| i.pointer.hover_pos()).unwrap_or_else(|| response.rect.right_bottom());
-        if context_menu(ui, &response, menu_id, menu_pos, &["Load to VLC"]).is_some() {
-            *dir_to_vlc = Some(path.to_path_buf());
+        let menu_claim = menu_id.with("claim");
+        if response.secondary_clicked() && !Self::any_pointer_button_down(ui.ctx()) {
+            ui.ctx().data_mut(|d| d.insert_temp(menu_claim, menu_id));
+            ui.ctx().request_repaint();
+        }
+        if ui.ctx().data(|d| d.get_temp::<egui::Id>(menu_claim)) == Some(menu_id) {
+            // Anchor at the folder row's own rect (see the note above): the
+            // popup stays glued to the directory entry instead of chasing
+            // the pointer from frame to frame.
+            let menu_pos = response.rect.right_bottom();
+            if context_menu(ui, &response, menu_id, menu_pos, &["Load to VLC"]).is_some() {
+                ui.ctx().data_mut(|d| d.remove::<egui::Id>(menu_claim));
+                *dir_to_vlc = Some(path.to_path_buf());
+            } else if response.clicked() {
+                // A plain left-click on the folder (select/expand) also
+                // resolves the popup — `context_menu` closes itself on any
+                // outside primary press, so just drop our claim here.
+                ui.ctx().data_mut(|d| d.remove::<egui::Id>(menu_claim));
+            }
         }
 
         // Render children if expanded
