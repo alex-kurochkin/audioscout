@@ -208,6 +208,25 @@ fn hdr_cell_id(ci: usize) -> egui::Id {
     egui::Id::new(("hdr_cell", ci))
 }
 
+/// Stable `id_salt` of the files-list `ScrollArea` (see `.id_salt(...)` on the
+/// area itself). The post-release hscroll cleanup needs the area's persistent
+/// Memory id to reset its cached horizontal offset; egui derives that id as
+/// `CentralPanel ui id .with(id_salt)`, so the salt is pinned here and both
+/// call sites reference this constant.
+const FILE_LIST_ID_SALT: &str = "file_list";
+
+/// Persistent-memory [`egui::Id`] of a widget inside the CentralPanel whose
+/// `id_salt` is `salt`. egui computes the ScrollArea id as
+/// `panel_ui.id().with(&id_salt)` where the CentralPanel's own Ui id is
+/// `Id::new((ctx.viewport_id(), "central_panel"))` (see egui-0.29
+/// `containers/panel.rs::CentralPanel::show_dyn` and `Ui::make_persistent_id`
+/// in `ui.rs`) — reproduced exactly here so post-release cleanup can reset
+/// the files list's cached horizontal offset in Memory.
+fn central_ui_child_id(ctx: &egui::Context, salt: &'static str) -> egui::Id {
+    let panel_id = egui::Id::new((ctx.viewport_id(), "central_panel"));
+    panel_id.with(&salt)
+}
+
 pub struct AudioScoutApp {
     config_store: ConfigStore,
     db: Database,
@@ -539,6 +558,9 @@ impl AudioScoutApp {
             col_drag: None,
             col_capture_blocks_hscroll: false,
             col_pointer_delta: egui::Vec2::ZERO,
+            col_capture_press_frame: 0,
+            col_capture_release_frame: 0,
+            col_hscroll_offset_at_press: 0.0,
             col_frame_counter: 0,
             col_suppress_click_frame: 0,
         };
@@ -1738,7 +1760,13 @@ impl AudioScoutApp {
             if !down_now && released_at.is_none() {
                 // Button went down somewhere else / stale state: cancel.
                 self.col_drag = None;
-                self.col_capture_blocks_hscroll = false;
+                // The borrow checker needs this branch to keep `drag` alive,
+                // so the capture is ended through a raw-pointer call — same
+                // safety argument as the header-cell press callback (single
+                // thread, plain state fields only).
+                let self_raw = self as *mut AudioScoutApp;
+                // SAFETY: see note above.
+                unsafe { (*self_raw).end_col_capture_block() };
             } else if !drag.active {
                 if let Some(pos) = cur_pos {
                     if (pos - drag.start).length() > DRAG_THRESHOLD {
@@ -1844,6 +1872,7 @@ impl AudioScoutApp {
     /// Called from the header-cell widgets during the layout pass when the
     /// primary button went down inside their rect on a fresh-press frame.
     fn begin_col_press(&mut self, key: &str, frame_id: u64) {
+        let already_grabbing = self.col_header_grab_pending(frame_id);
         self.col_press_frame = frame_id;
         self.col_press_key = key.to_string();
         // BUGFIX (horizontal scroll while grabbing a header): the blocking
@@ -1852,6 +1881,32 @@ impl AudioScoutApp {
         // button during that single unblocked frame (see `col_capture_press_frame`).
         self.col_capture_press_frame = frame_id;
         self.col_capture_blocks_hscroll = true;
+        if !already_grabbing {
+            // Remember where the table was scrolled horizontally so the
+            // post-release cleanup can restore it (`update()`, see
+            // `col_capture_release_frame`). Read via the widget-report map
+            // filled by the ScrollArea's own `.show()` closure right above.
+            self.col_hscroll_offset_at_press = self.file_list_hscroll_offset();
+        }
+    }
+
+    /// True while a press→arm transition or live drag owns the horizontal
+    /// gesture on/just after `frame_id` (same rule as `col_header_grab_active`
+    /// but evaluated against the layout-pass frame). Used to keep
+    /// `begin_col_press` idempotent across the several header cells of one
+    /// press and to snapshot the h-scroll offset only once per grab.
+    fn col_header_grab_pending(&self, frame_id: u64) -> bool {
+        self.col_capture_blocks_hscroll
+            || (self.col_capture_press_frame != 0
+                && frame_id.saturating_sub(self.col_capture_press_frame) <= 1)
+    }
+
+    /// Current horizontal scroll offset of the files list, read from the
+    /// [`egui::Id`] the list's ScrollArea reports into Memory each frame
+    /// (widget-report mechanism, see the `.show()` call site). `None` until
+    /// the area has been shown at least once.
+    fn file_list_hscroll_offset(&self) -> Option<f32> {
+        self.widget_report_f32(central_ui_child_id_stable(), "hscroll_offset")
     }
 
     /// True while a header grab owns the horizontal gesture: either the
