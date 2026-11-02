@@ -161,8 +161,15 @@ where S: serde::Serializer {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ColumnConfig {
+    /// Order of the VISIBLE columns (display order), matching
+    /// `ColumnLayout::visible_keys()` — updated on every header drag.
+    #[serde(default)]
     pub order: Vec<String>,
+    /// Order of ALL known columns; visible ones first (in display order),
+    /// hidden ones appended. Restoring filters it through `visible`.
+    #[serde(default)]
     pub full_order: Vec<String>,
+    #[serde(default)]
     pub widths: HashMap<String, f32>,
     /// Subset of columns the user chose to display in the Columns dialog.
     /// Persisted so the selection survives an app restart; previously only
