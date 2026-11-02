@@ -378,16 +378,18 @@ pub struct AudioScoutApp {
     /// egui treats "held primary button + pointer moved" as ordinary drag
     /// scrolling for any ScrollArea whose content is wider than the viewport
     /// (`ScrollArea::both()` here; see `scroll_area.rs`: with
-    /// `enable_drag_scroll` the area allocates a `Sense::drag()` background
-    /// interaction and shifts its offset by `pointer.delta` every frame),
-    /// and the header row lives INSIDE that area. A header capture now owns
-    /// the gesture from the press until the release:
-    ///  * the files-list ScrollArea switches `enable_drag_scroll(false)`
-    ///    while `col_capture_blocks_hscroll` is set (kills mouse-drag
-    ///    panning of the table);
+    /// `drag_to_scroll` enabled the area allocates a `Sense::drag()`
+    /// background interaction and shifts its offset by `pointer.delta` every
+    /// frame), and the header row lives INSIDE that area. A header capture
+    /// now owns the gesture from the press until the release:
+    ///  * the files-list ScrollArea switches `.drag_to_scroll(false)` while
+    ///    the capture is active (kills mouse-drag panning of the table);
     ///  * every horizontal wheel / trackpad-hscroll delta of this frame is
     ///    swallowed in `update()` before the panels lay out (kills two-finger
     ///    horizontal panning under the dragged title).
+    /// The flag covers the whole window including the single frame between
+    /// the raw press and the moment `handle_column_drag` arms the live drag
+    /// (see `col_capture_press_frame`).
     col_capture_blocks_hscroll: bool,
     /// Last raw pointer motion delta (window points) of the primary button,
     /// captured at the START of `update()` each frame — before panel layout
@@ -395,12 +397,15 @@ pub struct AudioScoutApp {
     /// it to tell an intentional horizontal reorder drag apart from a purely
     /// vertical one (see `handle_column_drag`).
     col_pointer_delta: egui::Vec2,
-    /// Frame on which a header capture ended (release) or was cancelled;
-    /// until the NEXT frame is fully laid out the files-list ScrollArea may
-    /// still hold an unconsumed horizontal offset from the blocked gesture
-    /// (see `end_col_capture_block`). Recorded here so `update()` can drop it
-    /// before the panels render.
-    col_capture_release_frame: u64,
+    /// Frame on which a header cell FIRST reported the primary-button press
+    /// (`begin_col_press`). The live drag is only armed one frame later by
+    /// `handle_column_drag`, but the blocking window must start right at the
+    /// press: between those two frames egui's files-list ScrollArea would
+    /// otherwise already pan sideways under the held button. While
+    /// `col_frame_counter - col_capture_press_frame <= 1` and the button is
+    /// still down, `update()` keeps treating the gesture as captured (see
+    /// `col_capture_blocks_hscroll`).
+    col_capture_press_frame: u64,
     /// Own frame counter (egui 0.29 `Context` has no `frame_index()`);
     /// bumped once per processed frame at the START of `update()`, so both
     /// the layout pass and the end-of-frame drag resolver see the same id.
