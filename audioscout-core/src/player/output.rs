@@ -1467,10 +1467,20 @@ fn controller_thread(
                     ctrl.state() == TransportState::Playing
                 };
                 if !was_playing {
-                    // Stopped/paused: nothing is audible right now, so the
-                    // full-load semantics apply (same path as Cmd::Load) to
-                    // keep every resume/clock invariant consistent.
-                    let deferred = pending_play.take();
+                    // BUGFIX (audio stayed stale after Apply while PAUSED —
+                    // second report of the same symptom): this arm used to run
+                    // the FULL `Cmd::Load` semantics, i.e. `ctrl.reset()` +
+                    // playhead parked at frame 0. While Paused that silently
+                    // threw the user's position away AND left the transport
+                    // Stopped, so pressing Play after an edit replayed the
+                    // file from the beginning — which made it *sound* like the
+                    // audio had not been refreshed at all (the picture in the
+                    // player had moved on, the buffer was re-fed from frame 0).
+                    // Nothing is audible in this state, so the swap can simply
+                    // publish the edited buffer and KEEP the frozen resume
+                    // point / transport state: the next unpause slices EDITED
+                    // samples from exactly where the user paused.
+                    pending_play = None;
                     sink.stop();
                     *pump.session.lock().unwrap_or_else(|p| p.into_inner()) = None;
                     shared.pumped_to_frame.store(0, Ordering::Release);
@@ -1479,18 +1489,24 @@ fn controller_thread(
                     *pump.doc.lock().unwrap_or_else(|p| p.into_inner()) = Some(new_doc);
                     sel_start = 0;
                     sel_end = 0;
-                    shared.session_start_frame.store(0, Ordering::Relaxed);
                     shared.source_active.store(false, Ordering::Relaxed);
                     pump.doc_generation.fetch_add(1, Ordering::Release);
-                    {
-                        let mut ctrl = controller.lock().unwrap_or_else(|p| p.into_inner());
-                        ctrl.reset();
-                        sink.set_volume(ctrl.volume());
-                        loop_enabled = ctrl.is_looping();
+                    let resume = {
+                        let ctrl = controller.lock().unwrap_or_else(|p| p.into_inner());
+                        ctrl.resume_frame()
+                    };
+                    // Seed the hardware clock at the frozen resume point so a
+                    // later unpause starts audibly from there (same seeding as
+                    // the Cmd::Stop / UpdateDocPaused arms).
+                    match &doc {
+                        Some(d) => {
+                            shared.pos_offset.store(resume, Ordering::Relaxed);
+                            shared.session_start_frame.store(resume, Ordering::Relaxed);
+                            shared.consumed_samples.store(stream_sample_at(d, resume, stream_format), Ordering::Relaxed);
+                        }
+                        None => {}
                     }
-                    if let Some((ps, pe)) = deferred {
-                        apply_play!(ps, pe);
-                    }
+                    tracing::info!("[output] UpdateDoc applied while not playing: buffer swapped, resume point kept at {resume} frames");
                 } else {
                     doc = Some(new_doc.clone());
                     *pump.doc.lock().unwrap_or_else(|p| p.into_inner()) = Some(new_doc);
@@ -1534,8 +1550,28 @@ fn controller_thread(
                     // Raced with unpause between the app's state check and
                     // command delivery — apply the live mid-session swap
                     // instead so the edit reaches the speakers immediately.
+                    // (Same sequence as the `Cmd::UpdateDoc` playing arm:
+                    // swap the pump's doc slot, drop every Sink chunk that
+                    // was sliced from the OLD buffer, bump the generation so
+                    // the pump treats the refill as a fresh session, rewind
+                    // the hardware clock to the true feed position, and give
+                    // the stall detector a new grace period.)
                     tracing::debug!("[output] UpdateDocPaused raced into Playing — applying live swap");
-                    self_apply_update_doc_live(&controller, &pump, &shared, &sink, &mut doc, new_doc, stream_format, &mut sel_start, &mut sel_end);
+                    pending_play = None;
+                    doc = Some(new_doc.clone());
+                    *pump.doc.lock().unwrap_or_else(|p| p.into_inner()) = Some(new_doc);
+                    let total = doc.as_ref().map(|d| d.total_frames()).unwrap_or(0);
+                    sel_end = sel_end.min(total);
+                    sink.clear();
+                    pump.doc_generation.fetch_add(1, Ordering::Release);
+                    let cur = pump.cursor_frame.load(Ordering::Relaxed).min(total.saturating_sub(1));
+                    shared.pos_offset.store(cur, Ordering::Relaxed);
+                    let sr = doc.as_ref().map(|d| d.sample_rate).unwrap_or(44100);
+                    shared.consumed_samples.store(frame_to_stream_samples(cur, sr, stream_format), Ordering::Relaxed);
+                    shared.pumped_to_frame.store(cur, Ordering::Release);
+                    shared.true_playhead_file_frame.store(cur, Ordering::Release);
+                    shared.session_epoch.fetch_add(1, Ordering::Release);
+                    tracing::info!("[output] UpdateDocPaused(live) applied: refill from frame {cur} of [{sel_start},{sel_end})");
                 } else {
                     pending_play = None;
                     sink.stop();
