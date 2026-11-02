@@ -10,6 +10,7 @@ pub mod render;
 pub mod scanner;
 pub mod table;
 pub mod undo;
+pub mod vlc;
 
 use crossbeam_channel::{Receiver, Sender};
 use std::path::PathBuf;

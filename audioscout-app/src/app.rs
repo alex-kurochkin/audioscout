@@ -76,6 +76,70 @@ fn panel_id_with_height(name: &str, h: f32) -> String {
     format!("{name}@{:#x}", h.to_bits())
 }
 
+/// Draw a small context menu (a popup with flat text items) anchored at
+/// `pos`, opened by a right-click on `opener`. Returns the label of the
+/// clicked item. egui 0.29's public `MenuRoot` machinery keys its state off
+/// `Response::id` and would only ever show one shared menu instance, so the
+/// popup is driven by an explicit per-widget id stored in `ctx.data`:
+/// the widget that was right-clicked claims the popup, and every other
+/// primary press outside the menu rect dismisses it.
+pub fn context_menu(
+    ui: &egui::Ui,
+    opener: &egui::Response,
+    id: egui::Id,
+    pos: egui::Pos2,
+    items: &[&str],
+) -> Option<&'static str> {
+    let ctx = ui.ctx();
+    let claimed = ctx.data(|d| d.get_temp::<egui::Id>(id)) == Some(id);
+    if !claimed && opener.secondary_clicked() {
+        ctx.data_mut(|d| d.insert_temp(id, id));
+        ctx.request_repaint();
+    }
+    if ctx.data(|d| d.get_temp::<egui::Id>(id)) != Some(id) {
+        return None;
+    }
+
+    let mut chosen: Option<&'static str> = None;
+    let frame = egui::Frame::menu(&ctx.style());
+    egui::Area::new(id.with("menu"))
+        .fixed_pos(pos)
+        .order(egui::Order::Foreground)
+        .show(ctx, |ui| {
+            frame.show(ui, |ui| {
+                // Deterministic vertical layout: inside a Popup the default
+                // layout may be horizontal, which would place items side by
+                // side instead of as a list.
+                ui.vertical(|ui| {
+                    for item in items {
+                        let resp = ui.add(
+                            egui::Label::new(
+                                egui::WidgetText::from(*item).color(ui.visuals().text_color()),
+                            )
+                            .selectable(false),
+                        );
+                        if resp.clicked() {
+                            chosen = Some(*item);
+                        }
+                    }
+                });
+            });
+        });
+
+    let close = ctx.input(|i| {
+        i.key_pressed(egui::Key::Escape)
+            || (i.pointer.any_pressed()
+                && i.pointer.primary_down()
+                && i.pointer
+                    .interact_pos()
+                    .map_or(true, |p| !ui.min_rect().contains(p)))
+    });
+    if close || chosen.is_some() {
+        ctx.data_mut(|d| d.remove::<egui::Id>(id));
+    }
+    chosen
+}
+
 /// Convenience wrapper pairing a panel's height with its two content insets
 /// (left and top). The version suffix mixes all three constants so an edit
 /// to any one of them re-keys the panel id (see `panel_id_with_height`).
@@ -2069,6 +2133,7 @@ impl AudioScoutApp {
         dir_to_select: &mut Option<PathBuf>,
         dir_to_expand: &mut Option<PathBuf>,
         dir_to_collapse: &mut Option<PathBuf>,
+        dir_to_vlc: &mut Option<PathBuf>,
     ) {
         let is_current = self.current_dir.as_ref() == Some(&path.to_path_buf());
         let is_expanded = self.expanded_dirs.contains_key(path);
@@ -2111,6 +2176,16 @@ impl AudioScoutApp {
             }
         }
 
+        // Right-click context menu (§ "Load to VLC"): queue every audio file
+        // of this folder into one VLC session. The popup claims its own id
+        // (see `context_menu`), so it survives outside the folder button's
+        // interaction scope and only one menu is ever open at a time.
+        let menu_id = egui::Id::new(("vlc_dir_menu", path));
+        let menu_pos = ui.input(|i| i.pointer.hover_pos()).unwrap_or_else(|| response.rect.right_bottom());
+        if context_menu(ui, &response, menu_id, menu_pos, &["Load to VLC"]).is_some() {
+            *dir_to_vlc = Some(path.to_path_buf());
+        }
+
         // Render children if expanded
         if is_expanded {
             ui.indent(egui::Id::new(path), |ui| {
@@ -2135,6 +2210,7 @@ impl AudioScoutApp {
                             dir_to_select,
                             dir_to_expand,
                             dir_to_collapse,
+                            dir_to_vlc,
                         );
                     }
                 }
@@ -2533,6 +2609,9 @@ impl eframe::App for AudioScoutApp {
         let mut dir_to_select: Option<PathBuf> = None;
         let mut dir_to_expand: Option<PathBuf> = None;
         let mut dir_to_collapse: Option<PathBuf> = None;
+        // "Load to VLC" picked from a folder's right-click menu — spawned
+        // after the panel closure, like every other deferred action.
+        let mut dir_to_vlc: Option<PathBuf> = None;
 
         egui::SidePanel::left("folder_tree")
             .default_width(200.0)
@@ -2552,6 +2631,7 @@ impl eframe::App for AudioScoutApp {
                             &mut dir_to_select,
                             &mut dir_to_expand,
                             &mut dir_to_collapse,
+                            &mut dir_to_vlc,
                         );
                     }
 
@@ -2565,6 +2645,7 @@ impl eframe::App for AudioScoutApp {
                         &mut dir_to_select,
                         &mut dir_to_expand,
                         &mut dir_to_collapse,
+                        &mut dir_to_vlc,
                     );
 
                     // Show connected disks (excluding Home and /)
@@ -2592,12 +2673,19 @@ impl eframe::App for AudioScoutApp {
                             &mut dir_to_select,
                             &mut dir_to_expand,
                             &mut dir_to_collapse,
+                            &mut dir_to_vlc,
                         );
                     }
                 });
             });
 
         // Apply actions after closure
+        if let Some(dir) = dir_to_vlc {
+            // "Load to VLC": queue all audio files of the folder into one
+            // detached VLC session (VLC is assumed installed; a missing
+            // binary surfaces as an error in the status bar).
+            self.open_in_vlc(&dir, true);
+        }
         if let Some(dir) = dir_to_select {
             self.current_dir = Some(dir.clone());
             self.scanner.scan(dir, self.event_tx.clone());
