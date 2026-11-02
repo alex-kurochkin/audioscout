@@ -309,6 +309,7 @@ fn file_vlc_menu_id() -> egui::Id {
 /// shared menu id so the popup survives across frames even though the click
 /// event itself is consumed within the same frame by the cell's response —
 /// this was the reason right-click on a file row never showed the menu.
+#[derive(Clone)]
 struct FileMenuState {
     path: PathBuf,
     /// Bottom-left corner of the clicked row's Name cell — the popup is
