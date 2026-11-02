@@ -410,12 +410,6 @@ pub struct AudioScoutApp {
     /// the raw press and the moment `handle_column_drag` arms the live drag
     /// (see `col_capture_press_frame`).
     col_capture_blocks_hscroll: bool,
-    /// Last raw pointer motion delta (window points) of the primary button,
-    /// captured at the START of `update()` each frame — before panel layout
-    /// can take/consume the pointer events. The header-capture resolver uses
-    /// it to tell an intentional horizontal reorder drag apart from a purely
-    /// vertical one (see `handle_column_drag`).
-    col_pointer_delta: egui::Vec2,
     /// Frame on which a header cell FIRST reported the primary-button press
     /// (`begin_col_press`). The live drag is only armed one frame later by
     /// `handle_column_drag`, but the blocking window must start right at the
@@ -435,7 +429,8 @@ pub struct AudioScoutApp {
     col_capture_release_frame: u64,
     /// Horizontal offset of the files-list ScrollArea at the moment the
     /// header grab started — the value the post-release cleanup restores.
-    col_hscroll_offset_at_press: f32,
+    /// `None` when the area had not been shown yet (nothing to restore).
+    col_hscroll_offset_at_press: Option<f32>,
     /// Own frame counter (egui 0.29 `Context` has no `frame_index()`);
     /// bumped once per processed frame at the START of `update()`, so both
     /// the layout pass and the end-of-frame drag resolver see the same id.
@@ -557,10 +552,9 @@ impl AudioScoutApp {
             col_press_key: String::new(),
             col_drag: None,
             col_capture_blocks_hscroll: false,
-            col_pointer_delta: egui::Vec2::ZERO,
             col_capture_press_frame: 0,
             col_capture_release_frame: 0,
-            col_hscroll_offset_at_press: 0.0,
+            col_hscroll_offset_at_press: None,
             col_frame_counter: 0,
             col_suppress_click_frame: 0,
         };
@@ -1749,7 +1743,8 @@ impl AudioScoutApp {
                 // now on until the matching release this capture OWNS the
                 // horizontal gesture — `update()` swallows the files list's
                 // hscroll deltas so the table cannot pan sideways under the
-                // dragged title (see `col_capture_blocks_hscroll`).
+                // dragged title (see `col_capture_blocks_hscroll`). Kept in
+                // sync with the press-time flag set by `begin_col_press`.
                 self.col_capture_blocks_hscroll = true;
                 ctx.request_repaint();
             }
@@ -1782,13 +1777,13 @@ impl AudioScoutApp {
             if !down_now {
                 self.col_drag = None;
                 self.col_press_key.clear();
-                self.col_capture_blocks_hscroll = false;
+                self.end_col_capture_block();
             }
             return;
         };
         // Any primary-button release ends the header capture — the blocking
         // window lasts exactly from the header press to its release.
-        self.col_capture_blocks_hscroll = false;
+        self.end_col_capture_block();
         let Some(drag) = self.col_drag.take() else { return };
         if !drag.active {
             // Press + release without movement: a plain click. Sorting is
@@ -1871,7 +1866,7 @@ impl AudioScoutApp {
 
     /// Called from the header-cell widgets during the layout pass when the
     /// primary button went down inside their rect on a fresh-press frame.
-    fn begin_col_press(&mut self, key: &str, frame_id: u64) {
+    fn begin_col_press(&mut self, key: &str, frame_id: u64, ctx: &egui::Context) {
         let already_grabbing = self.col_header_grab_pending(frame_id);
         self.col_press_frame = frame_id;
         self.col_press_key = key.to_string();
@@ -1884,9 +1879,9 @@ impl AudioScoutApp {
         if !already_grabbing {
             // Remember where the table was scrolled horizontally so the
             // post-release cleanup can restore it (`update()`, see
-            // `col_capture_release_frame`). Read via the widget-report map
-            // filled by the ScrollArea's own `.show()` closure right above.
-            self.col_hscroll_offset_at_press = self.file_list_hscroll_offset();
+            // `col_capture_release_frame`). Read straight from the area's
+            // per-frame state in egui Memory.
+            self.col_hscroll_offset_at_press = self.file_list_hscroll_offset(ctx);
         }
     }
 
@@ -1901,12 +1896,15 @@ impl AudioScoutApp {
                 && frame_id.saturating_sub(self.col_capture_press_frame) <= 1)
     }
 
-    /// Current horizontal scroll offset of the files list, read from the
-    /// [`egui::Id`] the list's ScrollArea reports into Memory each frame
-    /// (widget-report mechanism, see the `.show()` call site). `None` until
-    /// the area has been shown at least once.
-    fn file_list_hscroll_offset(&self) -> Option<f32> {
-        self.widget_report_f32(central_ui_child_id_stable(), "hscroll_offset")
+    /// Current horizontal scroll offset of the files-list ScrollArea, read
+    /// straight from egui's per-area `scroll_area::State` in Memory. The
+    /// area's id is deterministic (`central_ui_child_id`, mirroring how egui
+    /// derives it from the CentralPanel ui id + the pinned `id_salt`), so no
+    /// widget-report side channel is needed. `None` until the area has been
+    /// shown at least once (state stored on its first frame).
+    fn file_list_hscroll_offset(&self, ctx: &egui::Context) -> Option<f32> {
+        let id = central_ui_child_id(ctx, FILE_LIST_ID_SALT);
+        egui::scroll_area::State::load(ctx, id).map(|st| st.offset.x)
     }
 
     /// True while a header grab owns the horizontal gesture: either the
@@ -2166,10 +2164,12 @@ impl eframe::App for AudioScoutApp {
                 // into the aggregated vectors before `update()` ran.
                 i.smooth_scroll_delta.x = 0.0;
                 i.raw_scroll_delta.x = 0.0;
-                // No panning under the held button either: ScrollArea reads
-                // `pointer.delta` for drag-to-scroll (disabled via the flag
-                // above, but any other drag-sense widget would see it too).
-                i.pointer.delta = egui::Vec2::ZERO;
+                // NOTE: egui also keeps a PRIVATE pending-smoothing buffer
+                // (`unprocessed_scroll_delta`) fed by coarse wheel notches;
+                // it is drained into `smooth_scroll_delta` on later frames —
+                // which is exactly why the x parts are re-zeroed every frame
+                // above AND for a few frames after the release (below), and
+                // why the area's stored offset gets restored on release.
             });
         }
 
@@ -2187,15 +2187,18 @@ impl eframe::App for AudioScoutApp {
                 });
                 // Reset the horizontal offset the files-list ScrollArea keeps
                 // in Memory back to where it was when the grab started.
-                let id = ui_id_of_file_list(ctx);
-                if let Some(mut st) = egui::scroll_area::State::load(ctx, id) {
-                    if st.offset.x != self.col_hscroll_offset_at_press {
-                        st.offset.x = self.col_hscroll_offset_at_press;
-                        st.store(ctx, id);
+                if let Some(x) = self.col_hscroll_offset_at_press {
+                    let id = central_ui_child_id(ctx, FILE_LIST_ID_SALT);
+                    if let Some(mut st) = egui::scroll_area::State::load(ctx, id) {
+                        if st.offset.x != x {
+                            st.offset.x = x;
+                            st.store(ctx, id);
+                        }
                     }
                 }
             } else {
                 self.col_capture_release_frame = 0;
+                self.col_hscroll_offset_at_press = None;
             }
         }
 
@@ -2918,6 +2921,13 @@ impl eframe::App for AudioScoutApp {
             ui.label(&self.status_message);
         });
 
+        // Same grab state as the delta-swallowing block above, recomputed
+        // here for the layout pass: `handle_column_drag` (run at the start of
+        // this frame) may have armed/ended a capture since. Used to switch
+        // `.drag_to_scroll(...)` off on the files-list ScrollArea while a
+        // column title is grabbed (see the call site below).
+        let header_grab_now = self.col_header_grab_active(ctx);
+
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.label(format!("{} files", self.file_rows.len()));
@@ -2977,8 +2987,8 @@ impl eframe::App for AudioScoutApp {
                 let cur_frame = self.col_frame_counter;
                 let col_press_cb = |key: &str, frame_id: u64| {
                     // SAFETY: see note above — eframe runs update() on one
-                    // thread; the callback touches only the two drag fields.
-                    unsafe { (*self_raw).begin_col_press(key, frame_id) };
+                    // thread; the callback touches only the drag-state fields.
+                    unsafe { (*self_raw).begin_col_press(key, frame_id, ctx) };
                 };
                 let column_layout = &self.column_layout;
                 // Per-mode texture caches: pick the one matching the active
@@ -3074,7 +3084,17 @@ impl eframe::App for AudioScoutApp {
                 // wider than the available area a horizontal bar shows up at
                 // the bottom of the files window.
                 egui::ScrollArea::both()
-                    .id_salt("file_list")
+                    .id_salt(FILE_LIST_ID_SALT)
+                    // BUGFIX (horizontal scroll while grabbing a header):
+                    // with `drag_to_scroll` on, egui's ScrollArea allocates a
+                    // `Sense::drag()` background and pans itself by
+                    // `pointer.delta` whenever the primary button is held and
+                    // the pointer moves — which is exactly what happens while
+                    // dragging a column title (the header row lives inside
+                    // this area). Disable it for the whole duration of a
+                    // header capture; wheel/trackpad hscroll stays available
+                    // (it is swallowed separately in `update()`).
+                    .drag_to_scroll(!header_grab_now)
                     .auto_shrink([false, false])
                     .max_height(list_max_height)
                     .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)

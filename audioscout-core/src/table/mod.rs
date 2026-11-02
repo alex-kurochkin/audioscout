@@ -150,21 +150,29 @@ impl ColumnLayout {
         // through the visibility set reproduces `visible` exactly.
         let mut out: Vec<String> = Vec::with_capacity(all.len());
         let mut emitted: Vec<bool> = vec![false; all.len()];
-        for (vi, vis) in self.visible.iter().enumerate() {
+        for vi in 0..self.visible.len() {
+            let vis = &self.visible[vi];
             out.push(vis.key().to_string());
             emitted[canon_pos(vis)] = true;
             // Hidden neighbours that belong "after" this visible column:
-            // everything sitting between it and the NEXT visible column in
-            // canonical terms — i.e. hidden columns not claimed earlier.
-            let prev_canon = if vi == 0 { 0 } else { canon_pos(&self.visible[vi - 1]) + 1 };
-            let next_canon = self
+            // everything sitting strictly between it and the NEXT *visible*
+            // column in CANONICAL terms — i.e. hidden columns not claimed
+            // earlier. NOTE: the window bounds are the canonical positions of
+            // the neighbouring VISIBLE columns themselves (`vi`/`vi+1`), not
+            // of their display-order predecessors/successors — with a dragged
+            // layout those may sit far away on the canonical scale and would
+            // claim hidden columns into the wrong gap (e.g. hiding Duration
+            // from [Size, Name, …] must park it after Name, its canonical
+            // neighbour, so re-showing lands it right where it used to sit).
+            let lo = canon_pos(vis);
+            let hi = self
                 .visible
                 .get(vi + 1)
                 .map(|c| canon_pos(c))
                 .unwrap_or(all.len());
             for h in all.iter().filter(|c| !self.visible.contains(c)) {
                 let hp = canon_pos(h);
-                if !emitted[hp] && hp >= prev_canon && hp < next_canon {
+                if !emitted[hp] && hp > lo && hp < hi {
                     out.push(h.key().to_string());
                     emitted[hp] = true;
                 }
