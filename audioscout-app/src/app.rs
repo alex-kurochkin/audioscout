@@ -373,6 +373,28 @@ pub struct AudioScoutApp {
     col_press_frame: u64,
     col_press_key: String,
     col_drag: Option<ColDrag>,
+    /// BUGFIX (horizontal scroll while dragging a header): pressing and
+    /// moving inside a column title used to pan the file list sideways —
+    /// egui treats "held primary button + pointer moved" as ordinary drag
+    /// scrolling for any ScrollArea whose content is wider than the viewport
+    /// (`ScrollArea::both()` here; see `scroll_area.rs`: with
+    /// `enable_drag_scroll` the area allocates a `Sense::drag()` background
+    /// interaction and shifts its offset by `pointer.delta` every frame),
+    /// and the header row lives INSIDE that area. A header capture now owns
+    /// the gesture from the press until the release:
+    ///  * the files-list ScrollArea switches `enable_drag_scroll(false)`
+    ///    while `col_capture_blocks_hscroll` is set (kills mouse-drag
+    ///    panning of the table);
+    ///  * every horizontal wheel / trackpad-hscroll delta of this frame is
+    ///    swallowed in `update()` before the panels lay out (kills two-finger
+    ///    horizontal panning under the dragged title).
+    col_capture_blocks_hscroll: bool,
+    /// Last raw pointer motion delta (window points) of the primary button,
+    /// captured at the START of `update()` each frame — before panel layout
+    /// can take/consume the pointer events. The header-capture resolver uses
+    /// it to tell an intentional horizontal reorder drag apart from a purely
+    /// vertical one (see `handle_column_drag`).
+    col_pointer_delta: egui::Vec2,
     /// Own frame counter (egui 0.29 `Context` has no `frame_index()`);
     /// bumped once per processed frame at the START of `update()`, so both
     /// the layout pass and the end-of-frame drag resolver see the same id.
@@ -493,6 +515,8 @@ impl AudioScoutApp {
             col_press_frame: 0,
             col_press_key: String::new(),
             col_drag: None,
+            col_capture_blocks_hscroll: false,
+            col_pointer_delta: egui::Vec2::ZERO,
             col_frame_counter: 0,
             col_suppress_click_frame: 0,
         };
@@ -1677,6 +1701,12 @@ impl AudioScoutApp {
                     cells,
                     active: false,
                 });
+                // BUGFIX (horizontal scroll while dragging a header): from
+                // now on until the matching release this capture OWNS the
+                // horizontal gesture — `update()` swallows the files list's
+                // hscroll deltas so the table cannot pan sideways under the
+                // dragged title (see `col_capture_blocks_hscroll`).
+                self.col_capture_blocks_hscroll = true;
                 ctx.request_repaint();
             }
         }
@@ -1686,6 +1716,7 @@ impl AudioScoutApp {
             if !down_now && released_at.is_none() {
                 // Button went down somewhere else / stale state: cancel.
                 self.col_drag = None;
+                self.col_capture_blocks_hscroll = false;
             } else if !drag.active {
                 if let Some(pos) = cur_pos {
                     if (pos - drag.start).length() > DRAG_THRESHOLD {
@@ -1701,9 +1732,13 @@ impl AudioScoutApp {
             if !down_now {
                 self.col_drag = None;
                 self.col_press_key.clear();
+                self.col_capture_blocks_hscroll = false;
             }
             return;
         };
+        // Any primary-button release ends the header capture — the blocking
+        // window lasts exactly from the header press to its release.
+        self.col_capture_blocks_hscroll = false;
         let Some(drag) = self.col_drag.take() else { return };
         if !drag.active {
             // Press + release without movement: a plain click. Sorting is
@@ -1975,6 +2010,46 @@ impl eframe::App for AudioScoutApp {
         // list here. Turns the press into a live drag and freezes the header
         // geometry reported during the previous layout pass.
         self.handle_column_drag(ctx);
+
+        // BUGFIX (horizontal scroll while dragging a column header): while a
+        // header capture owns the mouse gesture (press inside a title cell →
+        // release), the files list must not pan sideways. egui turns *both*
+        // horizontal input sources of its `ScrollArea::both()` into scrolling
+        // during such a gesture:
+        //  * drag-scrolling: "held primary button + pointer moved" pans a
+        //    wide ScrollArea directly (no prior wheel event needed);
+        //  * trackpad two-finger hscroll: `MouseWheel{shift}` /
+        //    `hscroll_units` deltas are consumed by the hovered area.
+        // The header row lives INSIDE the list's ScrollArea, so both used to
+        // fight the reorder drag. Swallow every horizontal component of this
+        // frame's wheel events BEFORE any panel lays out (vertical scrolling
+        // and plain wheel zoom elsewhere keep working untouched).
+        if self.col_capture_blocks_hscroll {
+            ctx.input_mut(|i| {
+                for e in i.events.iter_mut() {
+                    if let egui::Event::MouseWheel { unit, delta, modifiers } = e {
+                        match unit {
+                            egui::MouseUnit::Wheel => {
+                                // Mouse wheel: only Ctrl+wheel carries a
+                                // horizontal intent (standard hscroll
+                                // modifier) — drop exactly that part.
+                                if modifiers.ctrl {
+                                    *delta = Vec2::ZERO;
+                                }
+                            }
+                            egui::MouseUnit::Other => {
+                                // Trackpad: full 2D pixel delta — keep the
+                                // vertical component, kill the horizontal.
+                                *delta = Vec2::new(0.0, delta.y);
+                            }
+                        }
+                    }
+                }
+                // Also clear the aggregated smooth-scroll vector in case the
+                // platform backend already folded this frame's motion into it.
+                i.smooth_scroll_delta.x = 0.0;
+            });
+        }
 
         // Window title: "AudioScout - <loaded file name>". The title follows
         // the file currently loaded into the player (document.source_path);

@@ -133,69 +133,55 @@ impl ColumnLayout {
     }
 
     /// Order of ALL known columns (`Column::all`) consistent with the current
-    /// display arrangement: every visible column keeps its slot from the
-    /// last-known full order (so a dragged layout is stored exactly), hidden
-    /// columns fill the remaining slots near their old canonical neighbours.
+    /// display arrangement: the visible columns appear in exactly their live
+    /// display order, and every hidden column is parked right after its
+    /// nearest visible predecessor (canonical order breaks ties).
     /// `from_config` filters this list through the visibility set, so the
     /// visible slots alone determine the restored display order on the next
     /// launch — and a column re-shown later lands right where it used to sit.
     pub fn full_order_keys(&self) -> Vec<String> {
-        self.full_order_keys_against(&Column::all().iter().map(|c| c.key().to_string()).collect::<Vec<_>>())
-    }
-
-    /// Slot-interleave helper behind [`full_order_keys`](Self::full_order_keys):
-    /// `anchor` is the previous full order (canonical on a fresh layout).
-    /// Visible columns keep their anchor slots when they still fit the new
-    /// display order, otherwise they take the earliest free slots; hidden
-    /// columns return to their anchor gaps. The result is always a
-    /// permutation of all known columns.
-    fn full_order_keys_against(&self, anchor: &[String]) -> Vec<String> {
         let all = Column::all();
-        let n = all.len();
-        // Canonical fallback for columns missing from a stale anchor list.
         let canon_pos = |c: &Column| all.iter().position(|x| x == c).unwrap_or(0);
-        let anchor_pos = |key: &str, c: &Column| -> usize {
-            anchor.iter().position(|k| k == key).unwrap_or(canon_pos(c))
-        };
 
-        // Pass 1: assign each visible column a target slot inside the
-        // anchor ordering. Start at its anchor slot; if the previous visible
-        // column already occupies a later-or-equal slot (the user dragged
-        // past it), slide forward until the placement stays monotone.
-        let mut placed_slots: Vec<usize> = Vec::with_capacity(self.visible.len());
-        let mut out: Vec<Option<Column>> = vec![None; n];
-        for col in &self.visible {
-            let mut slot = anchor_pos(col.key(), col);
-            while slot < n && (out[slot].is_some() || placed_slots.last().map_or(false, |p| slot <= *p)) {
-                slot += 1;
-            }
-            if slot >= n {
-                slot = (0..n).find(|s| out[*s].is_none()).unwrap_or(n - 1);
-            }
-            out[slot] = Some(*col);
-            placed_slots.push(slot);
-        }
-
-        // Pass 2: hidden columns back into the remaining gaps, closest to
-        // their own anchor position first — stable across hide/show cycles.
-        let mut hidden: Vec<Column> = all.iter().cloned().filter(|c| !self.visible.contains(c)).collect();
-        while !hidden.is_empty() {
-            let mut best: Option<(usize, usize)> = None; // (gap index, hidden index)
-            for (hi, h) in hidden.iter().enumerate() {
-                let want = anchor_pos(h.key(), h);
-                let gap = (want..n).find(|g| out[*g].is_none())
-                    .or_else(|| (0..n).find(|g| out[*g].is_none()))
-                    .unwrap_or(0);
-                if best.as_ref().map_or(true, |(bg, _)| gap < *bg) {
-                    best = Some((gap, hi));
+        // Walk the visible columns in DISPLAY order, emitting each one
+        // followed by the hidden columns whose canonical home sits between
+        // it and the next visible column (in canonical order). A dragged
+        // arrangement therefore round-trips losslessly: filtering the result
+        // through the visibility set reproduces `visible` exactly.
+        let mut out: Vec<String> = Vec::with_capacity(all.len());
+        let mut emitted: Vec<bool> = vec![false; all.len()];
+        for (vi, vis) in self.visible.iter().enumerate() {
+            out.push(vis.key().to_string());
+            emitted[canon_pos(vis)] = true;
+            // Hidden neighbours that belong "after" this visible column:
+            // everything sitting between it and the NEXT visible column in
+            // canonical terms — i.e. hidden columns not claimed earlier.
+            let prev_canon = if vi == 0 { 0 } else { canon_pos(&self.visible[vi - 1]) + 1 };
+            let next_canon = self
+                .visible
+                .get(vi + 1)
+                .map(|c| canon_pos(c))
+                .unwrap_or(all.len());
+            for h in all.iter().filter(|c| !self.visible.contains(c)) {
+                let hp = canon_pos(h);
+                if !emitted[hp] && hp >= prev_canon && hp < next_canon {
+                    out.push(h.key().to_string());
+                    emitted[hp] = true;
                 }
             }
-            if let Some((gap, hi)) = best {
-                out[gap] = Some(hidden.remove(hi));
-            }
         }
-
-        out.into_iter().flatten().map(|c| c.key().to_string()).collect()
+        // Hidden columns outside every gap above (e.g. canonically before
+        // the first visible column) go to the very front, keeping their
+        // canonical relative order so hide/show cycles stay stable.
+        let leftovers: Vec<String> = all
+            .iter()
+            .filter(|c| !emitted[canon_pos(c)])
+            .map(|c| c.key().to_string())
+            .collect();
+        let mut final_out: Vec<String> = Vec::with_capacity(all.len());
+        final_out.extend(leftovers);
+        final_out.extend(out);
+        final_out
     }
 
     pub fn width(&self, col: &Column) -> f32 { self.widths.get(col.key()).copied().unwrap_or(col.default_width()) }
