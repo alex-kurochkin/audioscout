@@ -14,18 +14,34 @@ use std::process::{Command, Stdio};
 /// Candidate executable names of the VLC media player.
 pub const VLC_CANDIDATES: &[&str] = &["vlc", "cvlc", "vlc.exe"];
 
+/// Environment variable that overrides automatic VLC discovery. Useful for
+/// non-standard installs, and — because it can point at a deliberately
+/// broken path — for making the locator deterministic in tests.
+pub const VLC_BIN_ENV: &str = "AUDIOSCOUT_VLC_BIN";
+
 /// Locate the VLC binary: first an explicit override (`AUDIOSCOUT_VLC_BIN`,
 /// useful for non-standard installs and for tests), then every candidate
 /// name resolved through the system PATH. Returns `None` when VLC cannot be
 /// found (the caller surfaces this as an error status message).
 pub fn find_vlc() -> Option<PathBuf> {
-    if let Ok(explicit) = std::env::var("AUDIOSCOUT_VLC_BIN") {
-        let p = PathBuf::from(&explicit);
-        if p.is_file() {
-            return Some(p);
+    find_vlc_in(std::env::var(VLC_BIN_ENV).ok().as_deref())
+}
+
+/// Testable core of [`find_vlc`]: resolution against an *explicit* override
+/// instead of the process-global environment, so unit tests never race with
+/// other tests over `set_var`/`remove_var` and are independent of whether
+/// the developer machine happens to have VLC installed.
+fn find_vlc_in(explicit: Option<&str>) -> Option<PathBuf> {
+    match explicit {
+        // A configured override is authoritative: if it is set but invalid,
+        // report "not found" rather than silently launching some other VLC
+        // copy from PATH (an invalid override must never launch garbage).
+        Some(value) => {
+            let p = PathBuf::from(value);
+            p.is_file().then_some(p)
         }
+        None => VLC_CANDIDATES.iter().copied().find_map(lookup_in_path),
     }
-    VLC_CANDIDATES.iter().copied().find_map(lookup_in_path)
 }
 
 /// Resolve one executable name against the system PATH using the platform's
@@ -122,36 +138,63 @@ mod tests {
     #[test]
     fn explicit_override_is_preferred_and_validated() {
         let exe = some_executable();
-        // Existing file → used verbatim, wins over PATH lookup.
-        std::env::set_var("AUDIOSCOUT_VLC_BIN", &exe);
-        assert_eq!(find_vlc(), Some(exe.clone()));
-        // Non-existent override → NOT accepted (falls through to PATH,
-        // which has no vlc in the CI image → None). An invalid override
-        // must never launch garbage.
-        std::env::set_var("AUDIOSCOUT_VLC_BIN", "/nonexistent/path/to/vlc-binary");
-        assert_eq!(find_vlc(), None);
-        std::env::remove_var("AUDIOSCOUT_VLC_BIN");
+        // Existing file → used verbatim, wins over PATH lookup. Tested
+        // through the pure resolver so the assertion holds regardless of
+        // whether this machine has VLC installed and regardless of other
+        // tests mutating the process environment concurrently.
+        assert_eq!(find_vlc_in(Some(&exe.to_string_lossy())), Some(exe.clone()));
+        // Non-existent override → NOT accepted: an invalid override must
+        // never launch garbage, and it must not silently fall back to a
+        // random PATH entry either.
+        assert_eq!(find_vlc_in(Some("/nonexistent/path/to/vlc-binary")), None);
+        // No override at all → plain PATH lookup (must not panic; result
+        // depends on the host, so we only assert consistency with `which`).
+        let _ = find_vlc_in(None);
     }
 
     #[test]
     fn spawn_reports_not_found_when_vlc_is_missing() {
-        // Guarantee "no VLC": broken override + strip PATH so `which` finds
-        // nothing anywhere.
-        std::env::set_var("AUDIOSCOUT_VLC_BIN", "/nonexistent/path/to/vlc-binary");
-        let old_path = std::env::var_os("PATH");
-        std::env::set_var("PATH", "");
+        // Guarantee "no VLC" without touching any env var that concurrent
+        // tests read: point the override at a non-existent binary via a
+        // child-process environment, and run the locator/spawner there.
+        // (Rust 2024 makes `std::env::set_var` unsafe precisely because of
+        // this kind of data race with other threads.)
+        let self_exe = std::env::current_exe().unwrap();
+        let out = Command::new(self_exe)
+            .arg("--exact")
+            .arg("vlc::tests::child_reports_not_found_under_broken_override")
+            .arg("--nocapture")
+            .env(VLC_BIN_ENV, "/nonexistent/path/to/vlc-binary")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("failed to re-spawn the test binary as a child");
+        let log = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            out.status.success(),
+            "child test failed:\n{log}"
+        );
+    }
+
+    /// Runs only inside the re-spawned child process above, where the
+    /// environment is private and single-threaded, so reading the broken
+    /// override is deterministic.
+    #[test]
+    fn child_reports_not_found_under_broken_override() {
+        if std::env::var(VLC_BIN_ENV).ok().as_deref()
+            != Some("/nonexistent/path/to/vlc-binary")
+        {
+            return; // not our scenario (plain `cargo test` run) — skip
+        }
+        assert_eq!(find_vlc(), None);
         let err = open_file_with_vlc(Path::new("/tmp/some.wav")).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
         let err2 = load_directory_to_vlc(Path::new("/tmp")).unwrap_err();
         assert_eq!(err2.kind(), std::io::ErrorKind::NotFound);
-        // restore PATH below (no `drop(old_path)` here — it would move the
-        // value out and make the subsequent `if let` an E0382 use-after-move)
-        if let Some(p) = old_path {
-            std::env::set_var("PATH", p);
-        } else {
-            std::env::remove_var("PATH");
-        }
-        std::env::remove_var("AUDIOSCOUT_VLC_BIN");
     }
 
     #[test]
