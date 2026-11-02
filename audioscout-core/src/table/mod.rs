@@ -236,6 +236,33 @@ impl ColumnLayout {
         out
     }
 
+    /// Materialise the explicit full arrangement (visible + hidden columns)
+    /// from the current live display order. Afterwards `full_order` filtered
+    /// through `visible` reproduces the display order exactly, and every
+    /// still-hidden column keeps a stable slot next to its visible
+    /// neighbours — which is what makes hide → store → restore → re-show land
+    /// the column back where it sat before it was hidden. No-op when an
+    /// arrangement consistent with the live order already exists.
+    fn ensure_full_order(&mut self) {
+        let derived_visible: Vec<Column> = self
+            .full_order
+            .iter()
+            .filter(|c| self.visible.contains(c))
+            .cloned()
+            .collect();
+        if !self.full_order.is_empty()
+            && derived_visible == self.visible
+            && self.full_order.len() == Column::all().len()
+        {
+            return;
+        }
+        self.full_order = self
+            .full_order_keys()
+            .iter()
+            .filter_map(|k| Column::from_key(k))
+            .collect();
+    }
+
     pub fn width(&self, col: &Column) -> f32 { self.widths.get(col.key()).copied().unwrap_or(col.default_width()) }
     pub fn set_width(&mut self, col: &Column, width: f32) { self.widths.insert(col.key().to_string(), width); }
 
@@ -247,24 +274,34 @@ impl ColumnLayout {
         let vis = self.visible_keys();
         cfg.visible = Some(vis.clone());
         cfg.order = vis;
+        // Persist the FULL arrangement (with hidden columns parked in their
+        // stable slots), not just the visible order — otherwise a hide →
+        // restart → re-show cycle loses the pre-hide slot of the column.
         cfg.full_order = self.full_order_keys();
         cfg.widths = self.widths.clone();
     }
 
     pub fn toggle_visibility(&mut self, col: &Column) {
         if let Some(pos) = self.visible.iter().position(|c| c == col) {
-            // Remember where the column sat before hiding it so a later
-            // re-show can put it back in the same slot (see below).
-            self.full_order.retain(|c| c != col);
-            self.full_order.insert(pos, *col);
+            // Materialise the full arrangement BEFORE removing the column
+            // from `visible`, so the hidden column keeps its live display
+            // slot — a later re-show puts it back exactly there (see below).
+            self.ensure_full_order();
             if self.visible.len() > 1 { self.visible.remove(pos); }
         } else {
             // Re-show rule (in priority order):
             // 1. If the layout carries an explicit FULL arrangement that has
             //    a slot for this column (restored from `columns/full_order`,
             //    or written by the hide itself), insert it right after the
-            //    last visible column preceding that slot — i.e. exactly where
-            //    it sat before it was hidden, even across restarts and drags.
+            //    LAST visible column preceding that slot in the full
+            //    arrangement — i.e. exactly where it sat before it was
+            //    hidden, even across restarts and drags. Counting only over
+            //    `full_order[..fp]` (not via a search through the whole list)
+            //    is what keeps the slot correct when a visible neighbour sits
+            //    AFTER the parked column in the full arrangement (e.g. Size
+            //    dragged to the front: full = [size, name, preview, duration,
+            //    …] → re-shown Duration must land right after Name, not at
+            //    the end).
             // 2. Otherwise land next to its canonical predecessor when that
             //    neighbour is visible; failing that, append at the end.
             let full_slot = self
@@ -282,18 +319,26 @@ impl ColumnLayout {
                         == self.visible
                 });
             let insert_at = match full_slot {
-                Some(fp) => self
-                    .full_order[..fp]
-                    .iter()
-                    .rev()
-                    .find_map(|c| {
-                        if self.visible.contains(c) {
-                            self.visible.iter().position(|v| v == c)
-                        } else {
-                            None
-                        }
-                    })
-                    .map_or(0, |p| p + 1),
+                Some(fp) => {
+                    let last_before = self.full_order[..fp]
+                        .iter()
+                        .rev()
+                        .find_map(|c| {
+                            if self.visible.contains(c) {
+                                self.visible.iter().position(|v| v == c)
+                            } else {
+                                None
+                            }
+                        });
+                    match last_before {
+                        // A visible neighbour precedes the parked slot in the
+                        // full arrangement: land right after it.
+                        Some(p) => p + 1,
+                        // The column is parked at the very front of the full
+                        // arrangement — mirror rule 2 and put it first.
+                        None => 0,
+                    }
+                }
                 None => {
                     let idx = Column::all().iter().position(|c| c == col).unwrap_or(0);
                     Column::all()[..idx]
@@ -318,6 +363,15 @@ impl ColumnLayout {
         }
         let col = self.visible.remove(from);
         self.visible.insert(to, col);
+        // Keep an explicitly carried full arrangement in sync with the new
+        // display order (drag-and-drop reorder): rebuild it so the moved
+        // column takes its live slot and every hidden column stays parked
+        // next to its current visible neighbours. Without this the stale
+        // arrangement would win on the next store/restore cycle and undo
+        // the drag across a restart.
+        if !self.full_order.is_empty() {
+            self.ensure_full_order();
+        }
     }
 
     /// Move column `col` before/after its new neighbour by key — convenience
