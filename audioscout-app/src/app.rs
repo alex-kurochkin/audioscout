@@ -395,6 +395,12 @@ pub struct AudioScoutApp {
     /// it to tell an intentional horizontal reorder drag apart from a purely
     /// vertical one (see `handle_column_drag`).
     col_pointer_delta: egui::Vec2,
+    /// Frame on which a header capture ended (release) or was cancelled;
+    /// until the NEXT frame is fully laid out the files-list ScrollArea may
+    /// still hold an unconsumed horizontal offset from the blocked gesture
+    /// (see `end_col_capture_block`). Recorded here so `update()` can drop it
+    /// before the panels render.
+    col_capture_release_frame: u64,
     /// Own frame counter (egui 0.29 `Context` has no `frame_index()`);
     /// bumped once per processed frame at the START of `update()`, so both
     /// the layout pass and the end-of-frame drag resolver see the same id.
@@ -1801,6 +1807,22 @@ impl AudioScoutApp {
             self.col_suppress_click_frame = frame_id;
             ctx.request_repaint();
         }
+    }
+
+    /// End the header capture that blocks horizontal scrolling of the files
+    /// list (release / cancellation). Besides clearing the flag this records
+    /// the ending frame: egui's ScrollArea keeps its horizontal offset in
+    /// `Memory` and only clamps it while laying out, so an h-scroll delta
+    /// that arrived one frame EARLIER (before the capture was armed — the
+    /// arming happens at the start of the following frame) can still be
+    /// pending there. The next frame's `update()` resets that offset once
+    /// (see `col_capture_release_frame`) so the table never visibly pans
+    /// sideways around a header grab.
+    fn end_col_capture_block(&mut self) {
+        if self.col_capture_blocks_hscroll {
+            self.col_capture_release_frame = self.col_frame_counter;
+        }
+        self.col_capture_blocks_hscroll = false;
     }
 
     /// Called from the header-cell widgets during the layout pass when the
