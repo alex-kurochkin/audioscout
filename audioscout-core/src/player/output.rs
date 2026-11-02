@@ -231,6 +231,16 @@ enum Cmd {
     SetLoop { enabled: bool },
     /// Live volume change via `Sink::set_volume` — no restart needed (§5.2).
     SetVolume(f32),
+    /// BUGFIX (audio stayed stale after an edit while playing): swap the PCM
+    /// buffer in place WITHOUT resetting the transport. Mute/normalize/undo/
+    /// redo produce a fresh document; `Cmd::Load` parks the playhead at frame
+    /// 0 and stops playback, so while Playing the app sends this command
+    /// instead: the controller replaces its buffer + the pump's copy, bumps
+    /// `PumpState::doc_generation` (the pump flushes every chunk sliced from
+    /// the old buffer on its next tick) and re-seeds the clock at the current
+    /// feed frame — the samples fed to the Sink afterwards come from the
+    /// EDITED audio.
+    UpdateDoc { doc: Arc<Document> },
     /// Quit the controller thread (app shutdown).
     Shutdown,
 }
@@ -289,6 +299,15 @@ struct PumpState {
     shared: Option<Arc<SharedOutput>>,
     /// Stop signal for the pump thread (controller-thread shutdown / app exit).
     quit: AtomicBool,
+    /// BUGFIX (audio stayed stale after an edit while playing): generation
+    /// counter of `doc`. The controller bumps it on every `Cmd::Load` and on
+    /// every in-place document swap (`Cmd::UpdateDoc`); the pump compares it
+    /// against its own last-seen value and flushes the Sink queue so no chunk
+    /// sliced from the OLD buffer is ever appended afterwards. Without this
+    /// the already-queued chunks kept playing pre-edit samples even though
+    /// the fresh document was published — exactly the reported "picture
+    /// changes, sound does not" symptom after Normalize/Mute.
+    doc_generation: AtomicU64,
     /// BUGFIX (regression "controller thread is gone"): set when the
     /// controller thread has terminated (panic or clean exit) so the pump
     /// stops feeding the orphaned Sink and `poll_stall` can tell a dead
@@ -700,6 +719,18 @@ impl RodioOutput {
         if let Err(e) = self.tx.send(Cmd::Load { doc }) {
             tracing::error!("[output] Cmd::Load send FAILED: {e} — controller thread is gone");
         }
+    }
+
+    /// BUGFIX (audio stayed stale after an edit while playing): publish a
+    /// freshly edited document to the output thread WITHOUT stopping or
+    /// rewinding the transport. Used by the app after mute/normalize/undo/
+    /// redo while playback is live; when stopped/paused the app keeps using
+    /// `load_document` (full reset semantics). See the `Cmd::UpdateDoc` arm
+    /// in the controller loop for the queue-flush contract with the pump.
+    pub fn update_document(&self, doc: Arc<Document>) -> bool {
+        tracing::debug!("[output] send Cmd::UpdateDoc frames={} sr={} ch={}", doc.total_frames(), doc.sample_rate, doc.channels);
+        self.document_sample_rate.store(doc.sample_rate.max(1), Ordering::Release);
+        self.tx.send(Cmd::UpdateDoc { doc }).is_ok()
     }
 
     pub fn play(&self, start: u64, end: u64) {
@@ -1220,6 +1251,11 @@ fn controller_thread(
                 // Publish the document for the pump thread (single writer —
                 // this controller thread; the pump only ever reads it).
                 *pump.doc.lock().unwrap_or_else(|p| p.into_inner()) = Some(new_doc);
+                // BUGFIX (audio stayed stale after an edit while playing):
+                // every buffer swap bumps the generation so the pump's own
+                // flush check (`sink.clear()` before appending anything from
+                // the new doc) can never be skipped by a race.
+                pump.doc_generation.fetch_add(1, Ordering::Release);
                 sel_start = 0;
                 sel_end = 0;
                 shared.session_start_frame.store(0, Ordering::Relaxed);
@@ -1381,6 +1417,71 @@ fn controller_thread(
                 let mut ctrl = controller.lock().unwrap_or_else(|p| p.into_inner());
                 ctrl.set_volume(vol);
                 sink.set_volume(ctrl.volume());
+            }
+            Some(Cmd::UpdateDoc { doc: new_doc }) => {
+                // BUGFIX (audio stayed stale after an edit while playing):
+                // replace the audible buffer IN PLACE. Chunks already appended
+                // to the Sink were sliced from the OLD buffer — they must
+                // never reach the speakers after an edit. `sink.clear()`
+                // drops them now and the bumped `doc_generation` makes the
+                // pump treat the refilled session as brand-new (queue-budget
+                // counter is owned by the pump; it resets on its own flush
+                // detection below since the cursor never moved forward).
+                let was_playing = {
+                    let ctrl = controller.lock().unwrap_or_else(|p| p.into_inner());
+                    ctrl.state() == TransportState::Playing
+                };
+                if !was_playing {
+                    // Stopped/paused: nothing is audible right now, so the
+                    // full-load semantics apply (same path as Cmd::Load) to
+                    // keep every resume/clock invariant consistent.
+                    let deferred = pending_play.take();
+                    sink.stop();
+                    *pump.session.lock().unwrap_or_else(|p| p.into_inner()) = None;
+                    shared.pumped_to_frame.store(0, Ordering::Release);
+                    shared.true_playhead_file_frame.store(0, Ordering::Release);
+                    doc = Some(new_doc.clone());
+                    *pump.doc.lock().unwrap_or_else(|p| p.into_inner()) = Some(new_doc);
+                    sel_start = 0;
+                    sel_end = 0;
+                    shared.session_start_frame.store(0, Ordering::Relaxed);
+                    shared.source_active.store(false, Ordering::Relaxed);
+                    pump.doc_generation.fetch_add(1, Ordering::Release);
+                    {
+                        let mut ctrl = controller.lock().unwrap_or_else(|p| p.into_inner());
+                        ctrl.reset();
+                        sink.set_volume(ctrl.volume());
+                        loop_enabled = ctrl.is_looping();
+                    }
+                    if let Some((ps, pe)) = deferred {
+                        apply_play!(ps, pe);
+                    }
+                } else {
+                    doc = Some(new_doc.clone());
+                    *pump.doc.lock().unwrap_or_else(|p| p.into_inner()) = Some(new_doc);
+                    // Edits never change the frame count, but clamp anyway so
+                    // the pump's [start,end) stays honest for any document.
+                    let total = doc.as_ref().map(|d| d.total_frames()).unwrap_or(0);
+                    sel_end = sel_end.min(total);
+                    // Drop every queued chunk sliced from the old buffer;
+                    // the pump refills from `cursor_frame` within ~25 ms.
+                    sink.clear();
+                    pump.doc_generation.fetch_add(1, Ordering::Release);
+                    // Rewind the hardware clock to the true feed position so
+                    // the UI cursor cannot run ahead while the queue is being
+                    // refilled (mirrors the Seek arm's seeding).
+                    let cur = pump.cursor_frame.load(Ordering::Relaxed).min(total.saturating_sub(1));
+                    shared.pos_offset.store(cur, Ordering::Relaxed);
+                    let sr = doc.as_ref().map(|d| d.sample_rate).unwrap_or(44100);
+                    shared.consumed_samples.store(frame_to_stream_samples(cur, sr, stream_format), Ordering::Relaxed);
+                    shared.pumped_to_frame.store(cur, Ordering::Release);
+                    shared.true_playhead_file_frame.store(cur, Ordering::Release);
+                    // BUGFIX ("sometimes needs a second Play press"): the
+                    // stall detector must grant the refilled session a fresh
+                    // grace period — the clock intentionally rewinds here.
+                    shared.session_epoch.fetch_add(1, Ordering::Release);
+                    tracing::info!("[output] UpdateDoc applied mid-session: refill from frame {cur} of [{sel_start},{sel_end})");
+                }
             }
             // BUGFIX: bare `None` here used to mean "recv timed out" and broke
             // the loop - an idle app killed its own audio threads after 50 ms.
@@ -1620,14 +1721,25 @@ fn pump_thread(pump: Arc<PumpState>, stream_format: (u32, u16)) {
         {
             let prev_start = LAST_SESSION_START.with(|c| c.get());
             let prev_fed = LAST_FED_CURSOR.with(|c| c.get());
-            if prev_start != s_start || cursor < prev_fed {
+            // BUGFIX (audio stayed stale after an edit while playing): chunks
+            // appended BEFORE the edit still sit in the Sink queue and would
+            // keep reaching the speakers even after `Cmd::UpdateDoc` swapped
+            // the buffer — the audible stream kept the pre-edit samples while
+            // the waveform picture was already new. Every document swap bumps
+            // `doc_generation`; when it moves, the whole queue is dropped and
+            // refilled from the current cursor, so the very next chunk is
+            // sliced from the EDITED buffer.
+            let gen = pump.doc_generation.load(Ordering::Acquire);
+            let prev_gen = LAST_DOC_GENERATION.with(|c| c.get());
+            if prev_start != s_start || cursor < prev_fed || gen != prev_gen {
                 sink.clear();
                 queued_chunks.store(0, Ordering::Release);
                 LAST_SESSION_START.with(|c| c.set(s_start));
                 LAST_FED_CURSOR.with(|c| c.set(cursor));
+                LAST_DOC_GENERATION.with(|c| c.set(gen));
                 tracing::debug!(
-                    "[output] pump flushed stale queue: session {} -> {}, fed {} -> {}",
-                    prev_start, s_start, prev_fed, cursor
+                    "[output] pump flushed stale queue: session {} -> {}, fed {} -> {}, doc gen {} -> {}",
+                    prev_start, s_start, prev_fed, cursor, prev_gen, gen
                 );
             }
         }
