@@ -891,6 +891,56 @@ impl AudioScoutApp {
         }
     }
 
+    /// BUGFIX (audio stayed stale after an edit): the player output thread
+    /// owns its own immutable copy of the PCM buffer (`Arc<Document>` handed
+    /// over via `Cmd::Load`). Mute/normalize/undo/redo mutate
+    /// `self.document.samples` and repaint the waveform view, but without a
+    /// fresh `load_document` the audible stream kept playing the pre-edit
+    /// buffer. This helper re-publishes the current document to the output
+    /// thread and parks the transport at frame 0 so the very next Play
+    /// streams the edited samples from the start (the same contract a plain
+    /// file load has — see `load_file`).
+    fn reload_player_audio(&mut self) {
+        if self.active_file.is_none() || self.document.source_path.as_os_str().is_empty() {
+            return;
+        }
+        // Stop first: `Cmd::Load` on the output thread also stops the sink,
+        // but doing it here keeps the UI-side state machine consistent even
+        // when no audio device is available.
+        self.transport_stop();
+        if let Some(out) = &self.output {
+            out.load_document(Arc::new(self.document.clone()));
+        }
+        // A fresh document means a fresh playhead — mirror what `load_file`
+        // does (§3.5: park at the start of the newly loaded buffer).
+        {
+            let mut ctrl = self.player.lock().unwrap_or_else(|p| p.into_inner());
+            ctrl.reset();
+        }
+        self.audio_view.set_cursor(0);
+        self.playhead_est_frame = 0;
+    }
+
+    /// BUGFIX (file-list preview not refreshed after Save): the thumbnail is
+    /// cached by (path, mtime, size, channels) — both in the SQLite previews
+    /// table and as a deterministic PNG name. After saving, the file's mtime
+    /// changed, so the old uuid is stale. Drop the row's uuid and re-submit a
+    /// preview job; the worker sees the new mtime, misses its caches and
+    /// renders a fresh image, delivered back as `UiEvent::PreviewReady`.
+    fn refresh_row_preview(&mut self, path: &Path) {
+        let mode = *self.preview_mode.lock().unwrap();
+        let generation = self.scan_generation;
+        if let Some(row) = self.file_rows.iter_mut().find(|r| r.path == path) {
+            row.preview_uuid = None;
+        }
+        // Stale bookkeeping for this path would make `submit` reject the job
+        // as a duplicate; clear it so the re-render always goes through.
+        self.preview_retry.remove(path);
+        if self.preview_worker.submit(PreviewJob { path: path.to_path_buf(), generation, mode }) {
+            self.preview_inflight.insert(path.to_path_buf());
+        }
+    }
+
     /// Rebuild peaks tree cache after loading a new file or after edits
     fn rebuild_peaks_cache(&mut self) {
         let ch = self.document.channels as usize;
@@ -972,6 +1022,9 @@ impl AudioScoutApp {
                     let mtime = meta.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_secs()).unwrap_or(0);
                     let _ = self.db.save_markers(&path, size, mtime, &self.document.markers);
                 }
+                // BUGFIX: after the final save, refresh the file-list preview
+                // thumbnail so it reflects the just-written audio content.
+                self.refresh_row_preview(&path);
             }
             Err(e) => { self.status_message = format!("Save failed: {}", e); }
         }
@@ -997,6 +1050,9 @@ impl AudioScoutApp {
 
         // Rebuild peaks cache after edit
         self.rebuild_peaks_cache();
+        // BUGFIX: the audible stream must follow the edited buffer, not just
+        // the waveform view — republish the document to the output thread.
+        self.reload_player_audio();
     }
 
     fn normalize_selection(&mut self) {
@@ -1022,6 +1078,8 @@ impl AudioScoutApp {
 
         // Rebuild peaks cache after edit
         self.rebuild_peaks_cache();
+        // BUGFIX: keep the played-back audio in sync with the edit (§ above).
+        self.reload_player_audio();
     }
 
     fn undo(&mut self) {
@@ -1044,6 +1102,8 @@ impl AudioScoutApp {
 
             // Rebuild peaks cache after undo
             self.rebuild_peaks_cache();
+            // Undo changes the audible content too — refresh the player buffer.
+            self.reload_player_audio();
         }
     }
 
@@ -1074,6 +1134,8 @@ impl AudioScoutApp {
 
             // Rebuild peaks cache after redo
             self.rebuild_peaks_cache();
+            // Redo changes the audible content too — refresh the player buffer.
+            self.reload_player_audio();
         }
     }
 
