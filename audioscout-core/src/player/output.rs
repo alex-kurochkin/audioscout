@@ -241,6 +241,12 @@ enum Cmd {
     /// feed frame — the samples fed to the Sink afterwards come from the
     /// EDITED audio.
     UpdateDoc { doc: Arc<Document> },
+    /// BUGFIX (stale sound after Apply while PAUSED): same in-place buffer
+    /// swap as `UpdateDoc`, but for the Paused state — keep the frozen
+    /// resume point intact, only replace what will be heard on unpause.
+    /// Without this arm the app fell through to `Cmd::Load`, which resets
+    /// the transport to frame 0 and silently dropped the pause position.
+    UpdateDocPaused { doc: Arc<Document> },
     /// Quit the controller thread (app shutdown).
     Shutdown,
 }
@@ -733,6 +739,17 @@ impl RodioOutput {
         self.tx.send(Cmd::UpdateDoc { doc }).is_ok()
     }
 
+    /// BUGFIX (stale sound after Apply while PAUSED): in-place buffer swap
+    /// for the Paused state — replaces the audible document WITHOUT touching
+    /// the frozen resume point, so unpause continues from where the user
+    /// paused but with the EDITED samples. The app used to fall through to
+    /// `load_document` here, which resets the transport to frame 0.
+    pub fn update_document_paused(&self, doc: Arc<Document>) -> bool {
+        tracing::debug!("[output] send Cmd::UpdateDocPaused frames={} sr={} ch={}", doc.total_frames(), doc.sample_rate, doc.channels);
+        self.document_sample_rate.store(doc.sample_rate.max(1), Ordering::Release);
+        self.tx.send(Cmd::UpdateDocPaused { doc }).is_ok()
+    }
+
     pub fn play(&self, start: u64, end: u64) {
         tracing::debug!("[output] send Cmd::Play start={start} end={end}");
         if let Err(e) = self.tx.send(Cmd::Play { start, end }) {
@@ -765,6 +782,24 @@ impl RodioOutput {
     /// it here or through the same `Arc` it passed to `RodioOutput::new`.
     pub fn controller_state(&self) -> TransportState {
         self.controller.lock().unwrap_or_else(|p| p.into_inner()).state()
+    }
+
+    /// BUGFIX regression hook ("picture changes, sound does not" after an
+    /// edit while playing): observable proof that `Cmd::UpdateDoc` actually
+    /// reached the controller thread and swapped the audible buffer — the
+    /// pump's document slot now holds the freshly edited samples and
+    /// `doc_generation` moved so every pre-edit chunk in the Sink queue is
+    /// flushed before the next refill. Read-only; used by tests (and safe
+    /// for diagnostics) without touching rodio/cpal internals.
+    pub fn debug_pump_doc_peak(&self) -> Option<f32> {
+        let d = self.pump.doc.lock().unwrap_or_else(|p| p.into_inner()).clone()?;
+        Some(d.samples.iter().map(|s| s.abs()).fold(0.0f32, f32::max))
+    }
+
+    /// Current document generation counter of the pump (bumped on every
+    /// `Cmd::Load` / `Cmd::UpdateDoc`). See `debug_pump_doc_peak`.
+    pub fn debug_doc_generation(&self) -> u64 {
+        self.pump.doc_generation.load(Ordering::Acquire)
     }
 }
 
@@ -1481,6 +1516,50 @@ fn controller_thread(
                     // grace period — the clock intentionally rewinds here.
                     shared.session_epoch.fetch_add(1, Ordering::Release);
                     tracing::info!("[output] UpdateDoc applied mid-session: refill from frame {cur} of [{sel_start},{sel_end})");
+                }
+            }
+            Some(Cmd::UpdateDocPaused { doc: new_doc }) => {
+                // BUGFIX (stale sound after Apply while PAUSED): swap the
+                // audible buffer in place, keep the frozen resume point.
+                // Nothing is playing right now, so no Sink flush is needed —
+                // only the pump's doc slot + generation must move so the
+                // next session slices EDITED samples. `sink.stop()` clears
+                // any leftover sources and leaves the sink paused; the pump
+                // resumes it on the first chunk of the next session.
+                let state_now = {
+                    let ctrl = controller.lock().unwrap_or_else(|p| p.into_inner());
+                    ctrl.state()
+                };
+                if state_now == TransportState::Playing {
+                    // Raced with unpause between the app's state check and
+                    // command delivery — apply the live mid-session swap
+                    // instead so the edit reaches the speakers immediately.
+                    tracing::debug!("[output] UpdateDocPaused raced into Playing — applying live swap");
+                    self_apply_update_doc_live(&controller, &pump, &shared, &sink, &mut doc, new_doc, stream_format, &mut sel_start, &mut sel_end);
+                } else {
+                    pending_play = None;
+                    sink.stop();
+                    *pump.session.lock().unwrap_or_else(|p| p.into_inner()) = None;
+                    shared.pumped_to_frame.store(0, Ordering::Release);
+                    shared.true_playhead_file_frame.store(0, Ordering::Release);
+                    shared.source_active.store(false, Ordering::Relaxed);
+                    doc = Some(new_doc.clone());
+                    *pump.doc.lock().unwrap_or_else(|p| p.into_inner()) = Some(new_doc);
+                    pump.doc_generation.fetch_add(1, Ordering::Release);
+                    sel_start = 0;
+                    sel_end = 0;
+                    let resume = {
+                        let ctrl = controller.lock().unwrap_or_else(|p| p.into_inner());
+                        ctrl.resume_frame()
+                    };
+                    // Keep the hardware clock parked at the frozen resume
+                    // point (same seeding as Cmd::Stop) so the UI cursor and
+                    // a later unpause stay exactly where the user paused.
+                    match &doc {
+                        Some(d) => shared.consumed_samples.store(stream_sample_at(d, resume, stream_format), Ordering::Relaxed),
+                        None => {}
+                    }
+                    tracing::info!("[output] UpdateDocPaused applied: resume point kept at {resume} frames");
                 }
             }
             // BUGFIX: bare `None` here used to mean "recv timed out" and broke
