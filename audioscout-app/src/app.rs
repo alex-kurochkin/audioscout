@@ -3170,6 +3170,13 @@ impl eframe::App for AudioScoutApp {
         // column title is grabbed (see the call site below).
         let header_grab_now = self.col_header_grab_active(ctx);
 
+        // "Open with VLC" picked from a file row's right-click menu
+        // (§ context menu). Declared OUTSIDE the CentralPanel closure so the
+        // deferred spawn below (after the closure) can read it — `open_in_vlc`
+        // needs `&mut self`, which is unavailable while the grid immutably
+        // borrows `file_rows`/`preview_cache`/`selected_row` inside.
+        let mut file_to_vlc: Option<PathBuf> = None;
+
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.label(format!("{} files", self.file_rows.len()));
@@ -3315,12 +3322,9 @@ impl eframe::App for AudioScoutApp {
                 // after the whole CentralPanel closure (the layout is only
                 // borrowed immutably inside).
                 let mut sort_request: Option<Column> = None;
-                // "Open with VLC" picked from a file row's right-click menu
-                // (§ context menu). Spawned AFTER the CentralPanel closure —
-                // like every other deferred action — because `open_in_vlc`
-                // needs `&mut self`, which is not available while the grid
-                // borrows `file_rows`/`preview_cache`/`selected_row`.
-                let mut file_to_vlc: Option<PathBuf> = None;
+                // NOTE: `file_to_vlc` is declared in the enclosing scope of
+                // `update()` (before the CentralPanel closure) so the deferred
+                // spawn after the panel can read it.
 
                 // BUGFIX (horizontal scrollbar): the list used to be hosted by
                 // `ScrollArea::vertical()`, which explicitly disables
