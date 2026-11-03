@@ -901,7 +901,11 @@ impl AudioScoutApp {
     /// missing, keep the UI pumping at a modest rate so results show up as
     /// soon as they arrive.
     fn previews_pending(&self) -> bool {
-        self.file_rows.iter().any(|r| r.preview_uuid.is_none())
+        // A purge in flight also counts as "pending": the UI must keep
+        // pumping repaints so `UiEvent::PreviewsPurged` is drained promptly
+        // and regeneration starts without waiting for user input.
+        self.preview_purge_inflight.is_some()
+            || self.file_rows.iter().any(|r| r.preview_uuid.is_none())
     }
 
     /// Re-submit rows that are neither cached nor currently in flight
@@ -1034,6 +1038,13 @@ impl AudioScoutApp {
                 }
                 UiEvent::DisksChanged { disks } => {
                     self.disks = disks;
+                }
+                UiEvent::PreviewsPurged { dir, rows_removed } => {
+                    // The background purge started by the "Refresh preview"
+                    // button finished: DB rows and PNG files for `dir` are
+                    // gone for real. Only now it is safe to submit fresh
+                    // generation jobs (see `finish_preview_purge`).
+                    self.finish_preview_purge(&dir, rows_removed, ctx);
                 }
             }
         }

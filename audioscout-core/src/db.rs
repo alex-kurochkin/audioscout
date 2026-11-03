@@ -155,7 +155,8 @@ impl Database {
     /// and unlink the real cache files on disk before deleting the rows.
     pub fn list_previews_in_dir_any_spelling(&self, dir: &Path) -> Result<Vec<(String, String)>, rusqlite::Error> {
         let want: PathBuf = normalize_path(dir);
-        if want.is_empty() {
+        // `Path::is_empty` is unstable; compare against the empty path instead.
+        if want == PathBuf::new() {
             return Ok(Vec::new());
         }
         let mut out = Vec::new();
@@ -189,7 +190,8 @@ impl Database {
     /// `dir`, so every spelling maps to the same scope.
     pub fn delete_all_previews_in_dir(&self, dir: &Path) -> Result<usize, rusqlite::Error> {
         let want: PathBuf = normalize_path(dir);
-        if want.is_empty() {
+        // `Path::is_empty` is unstable; compare against the empty path instead.
+        if want == PathBuf::new() {
             return Ok(0);
         }
         let paths: Vec<String> = {
