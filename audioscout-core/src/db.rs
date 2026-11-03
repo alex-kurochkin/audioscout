@@ -2,6 +2,22 @@ use rusqlite::{Connection, params};
 use std::path::{Path, PathBuf};
 use crate::Marker;
 
+/// Escape the LIKE wildcards (`%`, `_`) and the escape char itself in a
+/// literal prefix so it can be used safely in `LIKE '<prefix>%' ESCAPE '\'`.
+fn escape_like_prefix(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 8);
+    for c in s.chars() {
+        match c {
+            'x' | '%' | '_' => {
+                out.push('x');
+                out.push(c);
+            }
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 /// Database wrapper for SQLite storage
 pub struct Database {
     conn: Connection,
@@ -105,6 +121,21 @@ impl Database {
             params![path_str, size as i64, mtime as i64, mode],
             |row| row.get::<_, String>(0),
         ).ok()
+    }
+
+    /// Delete preview rows whose path is directly inside `dir` (non-recursive).
+    /// The trailing separator in the prefix keeps `.../music` from matching
+    /// `.../music2/...` and excludes subdirectory entries.
+    pub fn delete_previews_in_dir(&self, dir: &Path) -> Result<usize, rusqlite::Error> {
+        // Escaped directory + escaped separator are literal; only the final
+        // `%` stays a wildcard. `ESCAPE 'x'` avoids the backslash-in-string
+        // pitfall (SQLite requires the escape clause to be one character).
+        let sep = std::path::MAIN_SEPARATOR.to_string();
+        let pattern = format!("{}{}%", escape_like_prefix(&dir.to_string_lossy()), escape_like_prefix(&sep));
+        self.conn.execute(
+            "DELETE FROM previews WHERE path LIKE ?1 ESCAPE 'x'",
+            params![pattern],
+        )
     }
 
     /// Invalidate previews for a directory
@@ -213,5 +244,38 @@ impl Database {
             .filter_map(|r| r.ok())
             .collect();
         Ok(uuids)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `delete_previews_in_dir` must remove only the rows of files directly
+    /// inside the target directory: neither sibling directories whose names
+    /// share a prefix (`music2`), nor nested subdirectories.
+    #[test]
+    fn delete_previews_in_dir_is_non_recursive_and_prefix_safe() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(&dir.path().join("app.db")).unwrap();
+
+        let root = Path::new("/data/music");
+        let sibling = Path::new("/data/music2/song.wav");
+        let nested = Path::new("/data/music/sub/song.wav");
+        let plain = root.join("a.wav");
+        let underscored = root.join("b_1.wav");
+        let percented = root.join("c%50.wav");
+
+        for p in [sibling, nested, &plain, &underscored, &percented] {
+            db.save_preview(p, 10, 20, "wave", &format!("uuid-{}", p.display())).unwrap();
+        }
+
+        let removed = db.delete_previews_in_dir(root).unwrap();
+        assert_eq!(removed, 3, "only direct children (incl. _ and % in names) match");
+
+        let left: Vec<String> = db.get_all_preview_uuids().unwrap();
+        assert_eq!(left.len(), 2);
+        assert!(left.contains(&format!("uuid-{}", sibling.display())));
+        assert!(left.contains(&format!("uuid-{}", nested.display())));
     }
 }

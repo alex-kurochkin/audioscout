@@ -324,6 +324,58 @@ fn preview_png_path(uuid: &str) -> PathBuf {
         .join(format!("{}.png", uuid))
 }
 
+/// Delete preview cache entries (DB rows + PNG files on disk) for the audio
+/// files directly inside `dir` — non-recursive, matching exactly what the
+/// file list shows for that directory. Returns the number of DB rows removed.
+/// Used by the toolbar "Refresh preview" button.
+pub fn delete_previews_for_dir(dir: &Path) -> std::io::Result<usize> {
+    let db_path = crate::config::config_dir().join("app.db");
+    let db = crate::db::Database::open(&db_path)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    // Collect UUIDs *before* deleting the rows — the uuid column is the only
+    // pointer to the PNG filenames on disk. Uses the live row metadata
+    // (size/mtime) plus both mode suffixes, so previews cached under the
+    // inactive style are purged too.
+    let mut uuids: Vec<String> = Vec::new();
+    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let path = match entry.path().canonicalize() {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        if !path.is_file() {
+            continue;
+        }
+        let meta = match entry.metadata() {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        if !meta.is_file() {
+            continue;
+        }
+        let size = meta.len();
+        let mtime = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        for mode_suffix in [PreviewMode::Waveform.uuid_suffix(), PreviewMode::Spectrogram.uuid_suffix()] {
+            // `load_preview` matches on path+size+mtime+mode only (uuid is
+            // returned, not an input), so one lookup per mode suffices.
+            if let Some(uuid) = db.load_preview(&path, size, mtime, mode_suffix) {
+                uuids.push(uuid);
+            }
+        }
+    }
+    let removed_rows = db
+        .delete_previews_in_dir(dir)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    for uuid in uuids {
+        let _ = std::fs::remove_file(preview_png_path(&uuid));
+    }
+    Ok(removed_rows)
+}
+
 /// Fast, *synchronous*, lock-free cache lookup used by the scanner: returns
 /// the UUID of an already-generated preview if its PNG is sitting in the
 /// previews directory.

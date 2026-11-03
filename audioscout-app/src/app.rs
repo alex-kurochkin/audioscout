@@ -778,6 +778,38 @@ impl AudioScoutApp {
         }
     }
 
+    /// Toolbar "Refresh preview": purge the preview cache of the *current*
+    /// directory (DB rows + PNG files on disk — see
+    /// `preview_worker::delete_previews_for_dir`), drop the stale UUIDs and
+    /// texture caches, then re-run generation for the visible rows.
+    fn refresh_current_dir_previews(&mut self, ctx: &egui::Context) {
+        let Some(dir) = self.current_dir.clone() else {
+            self.status_message = "No current directory".to_string();
+            return;
+        };
+        match audioscout_core::preview_worker::delete_previews_for_dir(&dir) {
+            Ok(n) => self.status_message = format!("Previews refreshed ({n} cleared)…"),
+            Err(e) => self.status_message = format!("Preview refresh failed: {e}"),
+        }
+        // The PNGs behind these textures no longer exist; drop both mode
+        // caches so the rows re-load whatever gets regenerated.
+        self.preview_cache_wave.clear();
+        self.preview_cache_spectro.clear();
+        // Stale UUIDs would make `request_previews` skip every row (it only
+        // submits jobs for rows with `preview_uuid == None`).
+        for row in &mut self.file_rows {
+            row.preview_uuid = None;
+        }
+        // Cancel in-flight jobs that rendered the deleted images and reset
+        // bookkeeping so fresh submissions are not rejected as duplicates.
+        self.preview_worker.clear_queue();
+        self.preview_inflight.clear();
+        self.preview_retry.clear();
+        // Kick off regeneration for the current directory.
+        self.request_previews();
+        ctx.request_repaint();
+    }
+
     /// Background preview generation is event-driven: without an active
     /// repaint loop, `PreviewReady` events could sit unread in the channel
     /// long after the PNGs appeared on disk. While any thumbnail is still
@@ -2680,6 +2712,15 @@ impl eframe::App for AudioScoutApp {
                 );
                 if hand_cursor(&ui.add(preview_btn).on_hover_text("Toggle table previews between waveform and spectrogram")) {
                     self.toggle_preview_mode();
+                }
+                ui.separator();
+                // Purge the preview cache of the current directory (DB rows +
+                // PNG files) and immediately re-run generation for its files.
+                let r_refresh = ui.button("Refresh preview");
+                Self::hover_hand(ui, &r_refresh);
+                if r_refresh.clicked() {
+                    let ctx2 = ui.ctx().clone();
+                    self.refresh_current_dir_previews(&ctx2);
                 }
                 // §3.6: the table-preview switch lives ONLY on the top
                 // toolbar and the visualization-area switch lives ONLY on
