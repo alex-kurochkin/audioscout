@@ -329,59 +329,96 @@ fn preview_png_path(uuid: &str) -> PathBuf {
 /// file list shows for that directory. Returns the number of DB rows removed.
 /// Used by the toolbar "Refresh preview" button.
 ///
-/// The purge works in two steps:
-/// 1. UUIDs are collected from the *live* directory listing (current
-///    size/mtime plus both mode suffixes), so the deterministic PNG filenames
-///    can be located and deleted even for previews cached under the inactive
-///    thumbnail style.
-/// 2. Rows are then deleted by exact parent-directory scope
-///    (`Database::delete_previews_in_dir`), never via a `LIKE` prefix pattern:
-///    sibling directories with a shared name prefix or nested subdirectories
-///    can not be affected, and rows belonging to files that no longer exist
-///    on disk are removed as well.
+/// BUGFIX (previews were "refreshed" but the identical images came back): the
+/// previous implementation collected the PNG names from the *live* directory
+/// listing via `load_preview(path, size, mtime, …)` and deleted rows with a
+/// raw textual prefix match in SQL. Both steps silently matched nothing in
+/// real usage:
+/// - stored path strings are whatever spelling each writer used (`./dir/x`,
+///   `dir//x`, symlinked absolute forms), so neither the `substr = dir || '/'`
+///   DELETE nor the exact-text `load_preview` lookups hit any row;
+/// - every miss left both the DB row and its deterministic PNG intact, so the
+///   very next render call short-circuited on the still-existing cache and the
+///   old thumbnails were re-displayed — "nothing was deleted".
+///
+/// The purge is now driven entirely by the **DB contents**:
+/// 1. Snapshot `(path, uuid)` rows scoped to `dir` (component-wise parent
+///    comparison, tolerant of path spellings — `delete_all_previews_in_dir`).
+/// 2. Derive each PNG location two ways and delete both if present:
+///    a. the UUID recorded in the row (covers previews written under a
+///       different rendering style or older format), and
+///    b. the deterministic hash of the *exact stored path string* + current
+///       file metadata + channel count, for both mode suffixes — this catches
+///       PNGs whose rows never made it into the DB (the scanner treats the
+///       filesystem as the source of truth and back-fills lazily).
+/// 3. Delete the rows themselves.
 pub fn delete_previews_for_dir(dir: &Path) -> std::io::Result<usize> {
     let db_path = crate::config::config_dir().join("app.db");
     let db = crate::db::Database::open(&db_path)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-    // Collect UUIDs *before* deleting the rows — the uuid column is the only
-    // pointer to the PNG filenames on disk. Uses the live row metadata
-    // (size/mtime) plus both mode suffixes, so previews cached under the
-    // inactive style are purged too.
-    let mut uuids: Vec<String> = Vec::new();
-    let top_files: Vec<PathBuf> = crate::db::Database::top_level_files(dir);
-    for path in &top_files {
-        let canon = match path.canonicalize() {
-            Ok(p) => p,
-            Err(_) => continue,
-        };
-        let meta = match std::fs::metadata(&canon) {
-            Ok(m) => m,
-            Err(_) => continue,
-        };
-        if !meta.is_file() {
-            continue;
-        }
-        let size = meta.len();
-        let mtime = meta
-            .modified()
-            .ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        for mode_suffix in [PreviewMode::Waveform.uuid_suffix(), PreviewMode::Spectrogram.uuid_suffix()] {
-            // `load_preview` matches on path+size+mtime+mode only (uuid is
-            // returned, not an input), so one lookup per mode suffices.
-            if let Some(uuid) = db.load_preview(&canon, size, mtime, mode_suffix) {
-                uuids.push(uuid);
+
+    // Snapshot BEFORE deleting: the uuid column is the only pointer to the
+    // PNG filenames that were registered in the DB.
+    let rows = db
+        .list_previews_in_dir_any_spelling(dir)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+
+    let mut png_files: Vec<PathBuf> = Vec::new();
+    for (path_str, uuid) in &rows {
+        png_files.push(preview_png_path(uuid));
+
+        // Also unlink the deterministic-name PNGs for this exact stored path
+        // spelling (both styles), computed from live metadata when available.
+        let p = Path::new(path_str);
+        if let Ok(meta) = std::fs::metadata(p) {
+            if meta.is_file() {
+                let channels = crate::audio_io::probe_file_header(p).channels.max(1);
+                for mode in [PreviewMode::Waveform, PreviewMode::Spectrogram] {
+                    if let Ok(u) = generate_preview_uuid(p, channels, mode.uuid_suffix()) {
+                        png_files.push(preview_png_path(&u));
+                    }
+                }
             }
         }
     }
+
+    // Rows belonging to files that vanished from disk (or were saved under a
+    // spelling the snapshot missed) must not survive either — this deletes by
+    // normalised component scope over the whole table.
     let removed_rows = db
-        .delete_previews_in_dir(dir)
+        .delete_all_previews_in_dir(dir)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-    for uuid in uuids {
-        let _ = std::fs::remove_file(preview_png_path(&uuid));
+
+    // PNGs of *all* rows scoped to the directory, including ones whose DB row
+    // was missing (deterministic name from the live listing covers those).
+    for path in crate::db::Database::top_level_files(dir) {
+        let canon = path.clone();
+        if let Ok(meta) = std::fs::metadata(&canon) {
+            if !meta.is_file() {
+                continue;
+            }
+            let channels = crate::audio_io::probe_file_header(&canon).channels.max(1);
+            for mode in [PreviewMode::Waveform, PreviewMode::Spectrogram] {
+                if let Ok(u) = generate_preview_uuid(&canon, channels, mode.uuid_suffix()) {
+                    png_files.push(preview_png_path(&u));
+                }
+            }
+        }
     }
+
+    let mut removed_files = 0usize;
+    for png in png_files {
+        if std::fs::remove_file(&png).is_ok() {
+            removed_files += 1;
+        }
+    }
+
+    tracing::info!(
+        "Refresh preview: purged {} DB rows and {} PNG files for {}",
+        removed_rows,
+        removed_files,
+        dir.display()
+    );
     Ok(removed_rows)
 }
 

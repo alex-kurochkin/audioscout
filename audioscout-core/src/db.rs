@@ -113,27 +113,91 @@ impl Database {
     /// directory listing, it also removes rows for files that have since been
     /// deleted or renamed away from disk, so no orphaned DB entry survives.
     ///
-    /// Implemented with exact parent-directory prefix equality on the text
-    /// column (`substr`/`instr`, no `LIKE` wildcards), which makes it
-    /// inherently prefix-safe: sibling directories sharing a name prefix
-    /// (`.../music2`) and nested subdirectories (`.../music/sub/x.wav`) are
-    /// never matched.
+    /// BUGFIX (Refresh preview purged nothing): the old SQL matched rows via a
+    /// raw textual prefix (`substr(path,…) = dir || '/'`). Stored paths are
+    /// whatever string each writer happened to use — relative (`./music/a.wav`)
+    /// or an equivalent-but-different absolute form (e.g. a symlinked session
+    /// directory) — none of which share the literal prefix, so the DELETE
+    /// matched zero rows and every cache entry survived the refresh. Scope
+    /// matching now compares normalised path *components* resolved from the
+    /// stored path itself (`Path::parent()`), which stays prefix-safe (siblings
+    /// like `/data/music2`, nested subdirectories) while recognising every
+    /// spelling of the same location.
     pub fn delete_previews_in_dir(&self, dir: &Path) -> Result<usize, rusqlite::Error> {
-        // Normalise the directory so stored paths ending with a separator
-        // (`/data/music/`) match just like those without it.
-        let mut dir_str = dir.to_string_lossy().to_string();
-        while dir_str.len() > 1 && dir_str.ends_with('/') {
-            dir_str.pop();
+        self.delete_all_previews_in_dir(dir)
+    }
+
+    /// Snapshot `(path, uuid)` pairs of every cached preview whose **stored
+    /// path text** lies directly inside `dir` (non-recursive). The parent
+    /// directory is derived from the stored string itself (`Path::parent()`)
+    /// and compared component-wise against the normalised `dir`, so rows saved
+    /// under any spelling of the same location (`./dir/x`, `dir//x`) are all
+    /// returned — with their exact stored text, which is what the deterministic
+    /// PNG filename was hashed from. "Refresh preview" uses this list to locate
+    /// and unlink the real cache files on disk before deleting the rows.
+    pub fn list_previews_in_dir_any_spelling(&self, dir: &Path) -> Result<Vec<(String, String)>, rusqlite::Error> {
+        let want: Vec<&std::ffi::OsStr> = normalize_path(dir).components().collect();
+        if want.is_empty() {
+            return Ok(Vec::new());
         }
-        // A file directly inside `dir` looks like `<dir>/<name>` where `<name>`
-        // contains no further `/`. Matching is done purely with substr/instr on
-        // exact text equality — no `LIKE`, no wildcards — so sibling directories
-        // that share a name prefix and nested subdirectories are never touched.
-        self.conn.execute(
-            "DELETE FROM previews WHERE substr(path, 1, length(?1) + 1) = ?1 || '/' \
-             AND instr(substr(path, length(?1) + 2), '/') = 0",
-            params![dir_str],
-        )
+        let mut out = Vec::new();
+        {
+            let mut stmt = self.conn.prepare("SELECT path, uuid FROM previews")?;
+            let rows = stmt.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            for r in rows.flatten() {
+                let parent_ok = match Path::new(&r.0).parent() {
+                    Some(parent) => {
+                        let got: Vec<_> = normalize_path(parent).components().collect();
+                        got == want
+                    }
+                    None => false,
+                };
+                if parent_ok {
+                    out.push(r);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Delete every preview row whose stored path lies directly inside `dir`,
+    /// **including** rows whose PNG filename was derived from a non-normalised
+    /// spelling of that path (`./dir/x.wav`, `dir//x.wav`, …).
+    ///
+    /// This is the authoritative purge used by "Refresh preview": because the
+    /// PNG name hashes the *exact* path string, a scope check that only looked
+    /// at the normalised text would leave such rows (and their orphaned PNGs)
+    /// behind. Here the parent directory is resolved from the stored path
+    /// itself (`Path::parent()` — always exact) and compared component-wise to
+    /// `dir`, so every spelling maps to the same scope.
+    pub fn delete_all_previews_in_dir(&self, dir: &Path) -> Result<usize, rusqlite::Error> {
+        let want: Vec<&std::ffi::OsStr> = normalize_path(dir).components().collect();
+        if want.is_empty() {
+            return Ok(0);
+        }
+        let paths: Vec<String> = {
+            let mut stmt = self.conn.prepare("SELECT path FROM previews")?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+            rows.flatten()
+                .filter(|p| match Path::new(p).parent() {
+                    Some(parent) => {
+                        let got: Vec<_> = normalize_path(parent).components().collect();
+                        got == want
+                    }
+                    None => false,
+                })
+                .collect()
+        };
+        let mut removed = 0usize;
+        for path_str in &paths {
+            removed += self.conn.execute(
+                "DELETE FROM previews WHERE path = ?1",
+                params![path_str],
+            )?;
+        }
+        Ok(removed)
     }
 
     /// Enumerate regular files directly inside `dir` (one level, no
@@ -257,6 +321,15 @@ impl Database {
             .collect();
         Ok(uuids)
     }
+}
+
+/// Normalise a filesystem path for comparison purposes: strip `.` components,
+/// collapse repeated separators and drop a trailing separator. Implemented via
+/// `Path::components()`, which already performs this on Unix and Windows.
+fn normalize_path(path: &Path) -> PathBuf {
+    path.components()
+        .filter(|c| !matches!(c, std::path::Component::CurDir))
+        .collect()
 }
 
 #[cfg(test)]
