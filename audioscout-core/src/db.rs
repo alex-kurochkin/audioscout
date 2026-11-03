@@ -2,22 +2,6 @@ use rusqlite::{Connection, params};
 use std::path::{Path, PathBuf};
 use crate::Marker;
 
-/// Escape the LIKE wildcards (`%`, `_`) and the escape char itself in a
-/// literal prefix so it can be used safely in `LIKE '<prefix>%' ESCAPE '\'`.
-fn escape_like_prefix(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 8);
-    for c in s.chars() {
-        match c {
-            'x' | '%' | '_' => {
-                out.push('x');
-                out.push(c);
-            }
-            _ => out.push(c),
-        }
-    }
-    out
-}
-
 /// Database wrapper for SQLite storage
 pub struct Database {
     conn: Connection,
@@ -123,19 +107,35 @@ impl Database {
         ).ok()
     }
 
-    /// Delete preview rows whose path is directly inside `dir` (non-recursive).
-    /// The trailing separator in the prefix keeps `.../music` from matching
-    /// `.../music2/...` and excludes subdirectory entries.
-    pub fn delete_previews_in_dir(&self, dir: &Path) -> Result<usize, rusqlite::Error> {
-        // Escaped directory + escaped separator are literal; only the final
-        // `%` stays a wildcard. `ESCAPE 'x'` avoids the backslash-in-string
-        // pitfall (SQLite requires the escape clause to be one character).
-        let sep = std::path::MAIN_SEPARATOR.to_string();
-        let pattern = format!("{}{}%", escape_like_prefix(&dir.to_string_lossy()), escape_like_prefix(&sep));
-        self.conn.execute(
-            "DELETE FROM previews WHERE path LIKE ?1 ESCAPE 'x'",
-            params![pattern],
-        )
+    /// Delete preview rows for files located directly inside `dir`
+    /// (non-recursive), given as an explicit list of top-level file paths.
+    /// Matching is by exact `path = ?` equality — no `LIKE` wildcards at all,
+    /// so sibling directories with a shared name prefix (`.../music2`) and
+    /// nested subdirectories can never be touched, regardless of how their
+    /// paths were stored.
+    pub fn delete_previews_for_paths(&self, paths: &[PathBuf]) -> Result<usize, rusqlite::Error> {
+        let mut removed = 0usize;
+        for p in paths {
+            removed += self.conn.execute(
+                "DELETE FROM previews WHERE path = ?1",
+                params![p.to_string_lossy().as_ref()],
+            )?;
+        }
+        Ok(removed)
+    }
+
+    /// Enumerate regular files directly inside `dir` (one level, no
+    /// recursion). Unreadable directories yield an empty list.
+    pub fn top_level_files(dir: &Path) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                if entry.path().is_file() {
+                    out.push(entry.path());
+                }
+            }
+        }
+        out
     }
 
     /// Invalidate previews for a directory
@@ -251,9 +251,9 @@ impl Database {
 mod tests {
     use super::*;
 
-    /// `delete_previews_in_dir` must remove only the rows of files directly
-    /// inside the target directory: neither sibling directories whose names
-    /// share a prefix (`music2`), nor nested subdirectories.
+    /// Deletion by an explicit top-level file list must remove only the rows
+    /// of those files: neither sibling directories whose names share a prefix
+    /// (`music2`), nor nested subdirectories.
     #[test]
     fn delete_previews_in_dir_is_non_recursive_and_prefix_safe() {
         let dir = tempfile::tempdir().unwrap();
@@ -270,8 +270,11 @@ mod tests {
             db.save_preview(p, 10, 20, "wave", &format!("uuid-{}", p.display())).unwrap();
         }
 
-        let removed = db.delete_previews_in_dir(root).unwrap();
-        assert_eq!(removed, 3, "only direct children (incl. _ and % in names) match");
+        // Explicit list of top-level files (what the refresh flow builds from
+        // the directory listing) — exact-match deletes, no LIKE wildcards.
+        let top = vec![plain.clone(), underscored.clone(), percented.clone()];
+        let removed = db.delete_previews_for_paths(&top).unwrap();
+        assert_eq!(removed, 3, "only the explicitly listed files are removed");
 
         let left: Vec<String> = db.get_all_preview_uuids().unwrap();
         assert_eq!(left.len(), 2);

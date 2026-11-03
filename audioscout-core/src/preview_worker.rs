@@ -328,6 +328,11 @@ fn preview_png_path(uuid: &str) -> PathBuf {
 /// files directly inside `dir` — non-recursive, matching exactly what the
 /// file list shows for that directory. Returns the number of DB rows removed.
 /// Used by the toolbar "Refresh preview" button.
+///
+/// The DB purge works from an explicit list of top-level file paths (exact
+/// `path = ?` deletes), never from a `LIKE` prefix pattern: sibling
+/// directories with a shared name prefix or nested subdirectories can not be
+/// affected no matter how their rows were stored.
 pub fn delete_previews_for_dir(dir: &Path) -> std::io::Result<usize> {
     let db_path = crate::config::config_dir().join("app.db");
     let db = crate::db::Database::open(&db_path)
@@ -337,15 +342,13 @@ pub fn delete_previews_for_dir(dir: &Path) -> std::io::Result<usize> {
     // (size/mtime) plus both mode suffixes, so previews cached under the
     // inactive style are purged too.
     let mut uuids: Vec<String> = Vec::new();
-    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
-        let path = match entry.path().canonicalize() {
+    let top_files: Vec<PathBuf> = crate::db::Database::top_level_files(dir);
+    for path in &top_files {
+        let canon = match path.canonicalize() {
             Ok(p) => p,
             Err(_) => continue,
         };
-        if !path.is_file() {
-            continue;
-        }
-        let meta = match entry.metadata() {
+        let meta = match std::fs::metadata(&canon) {
             Ok(m) => m,
             Err(_) => continue,
         };
@@ -362,13 +365,13 @@ pub fn delete_previews_for_dir(dir: &Path) -> std::io::Result<usize> {
         for mode_suffix in [PreviewMode::Waveform.uuid_suffix(), PreviewMode::Spectrogram.uuid_suffix()] {
             // `load_preview` matches on path+size+mtime+mode only (uuid is
             // returned, not an input), so one lookup per mode suffices.
-            if let Some(uuid) = db.load_preview(&path, size, mtime, mode_suffix) {
+            if let Some(uuid) = db.load_preview(&canon, size, mtime, mode_suffix) {
                 uuids.push(uuid);
             }
         }
     }
     let removed_rows = db
-        .delete_previews_in_dir(dir)
+        .delete_previews_for_paths(&top_files)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
     for uuid in uuids {
         let _ = std::fs::remove_file(preview_png_path(&uuid));
