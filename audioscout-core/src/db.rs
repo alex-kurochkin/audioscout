@@ -107,21 +107,33 @@ impl Database {
         ).ok()
     }
 
-    /// Delete preview rows for files located directly inside `dir`
-    /// (non-recursive), given as an explicit list of top-level file paths.
-    /// Matching is by exact `path = ?` equality — no `LIKE` wildcards at all,
-    /// so sibling directories with a shared name prefix (`.../music2`) and
-    /// nested subdirectories can never be touched, regardless of how their
-    /// paths were stored.
-    pub fn delete_previews_for_paths(&self, paths: &[PathBuf]) -> Result<usize, rusqlite::Error> {
-        let mut removed = 0usize;
-        for p in paths {
-            removed += self.conn.execute(
-                "DELETE FROM previews WHERE path = ?1",
-                params![p.to_string_lossy().as_ref()],
-            )?;
+    /// Delete every preview row whose stored path lies directly inside `dir`
+    /// (non-recursive). This is the authoritative purge used by the toolbar
+    /// "Refresh preview" flow: unlike deletion driven by the *current*
+    /// directory listing, it also removes rows for files that have since been
+    /// deleted or renamed away from disk, so no orphaned DB entry survives.
+    ///
+    /// Implemented with exact parent-directory prefix equality on the text
+    /// column (`substr`/`instr`, no `LIKE` wildcards), which makes it
+    /// inherently prefix-safe: sibling directories sharing a name prefix
+    /// (`.../music2`) and nested subdirectories (`.../music/sub/x.wav`) are
+    /// never matched.
+    pub fn delete_previews_in_dir(&self, dir: &Path) -> Result<usize, rusqlite::Error> {
+        // Normalise the directory so stored paths ending with a separator
+        // (`/data/music/`) match just like those without it.
+        let mut dir_str = dir.to_string_lossy().to_string();
+        while dir_str.len() > 1 && dir_str.ends_with('/') {
+            dir_str.pop();
         }
-        Ok(removed)
+        // A file directly inside `dir` looks like `<dir>/<name>` where `<name>`
+        // contains no further `/`. Matching is done purely with substr/instr on
+        // exact text equality — no `LIKE`, no wildcards — so sibling directories
+        // that share a name prefix and nested subdirectories are never touched.
+        self.conn.execute(
+            "DELETE FROM previews WHERE substr(path, 1, length(?1) + 1) = ?1 || '/' \
+             AND instr(substr(path, length(?1) + 2), '/') = 0",
+            params![dir_str],
+        )
     }
 
     /// Enumerate regular files directly inside `dir` (one level, no
@@ -251,9 +263,9 @@ impl Database {
 mod tests {
     use super::*;
 
-    /// Deletion by an explicit top-level file list must remove only the rows
-    /// of those files: neither sibling directories whose names share a prefix
-    /// (`music2`), nor nested subdirectories.
+    /// Deletion scoped to a directory must remove only the rows of files
+    /// located *directly* inside it: neither sibling directories whose names
+    /// share a prefix (`music2`), nor nested subdirectories.
     #[test]
     fn delete_previews_in_dir_is_non_recursive_and_prefix_safe() {
         let dir = tempfile::tempdir().unwrap();
@@ -270,15 +282,17 @@ mod tests {
             db.save_preview(p, 10, 20, "wave", &format!("uuid-{}", p.display())).unwrap();
         }
 
-        // Explicit list of top-level files (what the refresh flow builds from
-        // the directory listing) — exact-match deletes, no LIKE wildcards.
-        let top = vec![plain.clone(), underscored.clone(), percented.clone()];
-        let removed = db.delete_previews_for_paths(&top).unwrap();
-        assert_eq!(removed, 3, "only the explicitly listed files are removed");
+        let removed = db.delete_previews_in_dir(root).unwrap();
+        assert_eq!(removed, 3, "only the files directly inside the dir are removed");
 
         let left: Vec<String> = db.get_all_preview_uuids().unwrap();
         assert_eq!(left.len(), 2);
         assert!(left.contains(&format!("uuid-{}", sibling.display())));
         assert!(left.contains(&format!("uuid-{}", nested.display())));
+
+        // A trailing separator in the queried directory must behave identically.
+        db.delete_previews_in_dir(Path::new("/data/music/")).unwrap();
+        let left: Vec<String> = db.get_all_preview_uuids().unwrap();
+        assert_eq!(left.len(), 2, "trailing slash does not widen/narrow the scope");
     }
 }

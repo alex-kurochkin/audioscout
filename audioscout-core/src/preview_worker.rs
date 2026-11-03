@@ -329,10 +329,16 @@ fn preview_png_path(uuid: &str) -> PathBuf {
 /// file list shows for that directory. Returns the number of DB rows removed.
 /// Used by the toolbar "Refresh preview" button.
 ///
-/// The DB purge works from an explicit list of top-level file paths (exact
-/// `path = ?` deletes), never from a `LIKE` prefix pattern: sibling
-/// directories with a shared name prefix or nested subdirectories can not be
-/// affected no matter how their rows were stored.
+/// The purge works in two steps:
+/// 1. UUIDs are collected from the *live* directory listing (current
+///    size/mtime plus both mode suffixes), so the deterministic PNG filenames
+///    can be located and deleted even for previews cached under the inactive
+///    thumbnail style.
+/// 2. Rows are then deleted by exact parent-directory scope
+///    (`Database::delete_previews_in_dir`), never via a `LIKE` prefix pattern:
+///    sibling directories with a shared name prefix or nested subdirectories
+///    can not be affected, and rows belonging to files that no longer exist
+///    on disk are removed as well.
 pub fn delete_previews_for_dir(dir: &Path) -> std::io::Result<usize> {
     let db_path = crate::config::config_dir().join("app.db");
     let db = crate::db::Database::open(&db_path)
@@ -371,7 +377,7 @@ pub fn delete_previews_for_dir(dir: &Path) -> std::io::Result<usize> {
         }
     }
     let removed_rows = db
-        .delete_previews_for_paths(&top_files)
+        .delete_previews_in_dir(dir)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
     for uuid in uuids {
         let _ = std::fs::remove_file(preview_png_path(&uuid));

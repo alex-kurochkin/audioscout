@@ -800,12 +800,20 @@ impl AudioScoutApp {
         for row in &mut self.file_rows {
             row.preview_uuid = None;
         }
-        // Cancel in-flight jobs that rendered the deleted images and reset
-        // bookkeeping so fresh submissions are not rejected as duplicates.
+        // Cancel queued jobs that would render into the deleted cache. Do NOT
+        // wipe the in-flight bookkeeping here: paths whose render thread is
+        // still running stay in the worker's internal `pending` set until it
+        // finishes, and clearing our mirror set would let `request_previews`
+        // re-submit them as "fresh" jobs while the old one is alive — the two
+        // concurrent renders of the same file then race on the deterministic
+        // PNG path (partial/overwritten image). Keeping the entries means the
+        // duplicate submission is rejected, and the render that is already
+        // running delivers a brand-new image (the old PNG was just deleted),
+        // which satisfies the refresh requirement anyway.
         self.preview_worker.clear_queue();
-        self.preview_inflight.clear();
-        self.preview_retry.clear();
-        // Kick off regeneration for the current directory.
+        // Kick off regeneration for the current directory. Rows currently in
+        // flight are skipped by `submit`'s dedup guard (see above); everything
+        // else gets a fresh job.
         self.request_previews();
         ctx.request_repaint();
     }
