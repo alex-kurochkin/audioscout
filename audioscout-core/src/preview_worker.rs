@@ -339,6 +339,13 @@ fn preview_png_path(uuid: &str) -> PathBuf {
         .join(format!("{}.png", uuid))
 }
 
+/// Does a cached preview PNG with this UUID exist in the storage directory?
+/// Used by the app to re-validate row UUIDs after a background purge — the
+/// filesystem (not SQLite) is the source of truth for thumbnails.
+pub fn preview_png_exists(uuid: &str) -> bool {
+    preview_png_path(uuid).is_file()
+}
+
 /// Delete preview cache entries (DB rows + PNG files on disk) for the audio
 /// files directly inside `dir` — non-recursive, matching exactly what the
 /// file list shows for that directory. Returns the number of DB rows removed.
@@ -462,6 +469,92 @@ pub fn delete_previews_for_dir_with_db_owned(db: Database, dir: &Path) -> std::i
     delete_previews_for_dir_with_db_no_reopen(&db, dir)
 }
 
+/// Delete **every** cached preview PNG that belongs to one audio file,
+/// regardless of how (or whether) it was registered in SQLite. Returns the
+/// list of unlinked files.
+///
+/// BUGFIX (context-menu "Refresh preview" deleted nothing): the per-file
+/// purge used to derive the PNG filenames exclusively from DB rows plus a
+/// re-hash of *live* metadata (`probe_file_header`, whose channel count can
+/// differ from what the original render recorded). Any cache entry whose row
+/// was missing or stale resolved to a filename that does not exist on disk,
+/// so zero files were unlinked. Because the scanner treats the **filesystem
+/// as the source of truth** for thumbnails (`cached_preview_png` only checks
+/// that `<uuid>.png` exists), the untouched PNG made the very next render
+/// short-circuit and hand back the identical image — "the preview is unloaded
+/// from memory and the same file is loaded back; nothing is deleted".
+///
+/// This helper closes that hole deterministically: every candidate UUID is
+/// recomputed for each spelling of the path stored in the DB **and** the live
+/// listing, across *both* preview modes and channel counts 1..=8 (the small
+/// set of values a header probe could ever have produced), and every existing
+/// PNG behind those names is removed before any regeneration starts. It runs
+/// on the purge's background thread (file I/O + header probes off the UI
+/// thread), immediately before the DB half of the purge.
+pub fn purge_preview_storage_for_file(file: &Path) -> Vec<PathBuf> {
+    let db_path = crate::config::config_dir().join("app.db");
+    purge_preview_storage_for_file_with_db(
+        crate::db::Database::open(&db_path).ok().as_ref(),
+        file,
+    )
+}
+
+/// Body of [`purge_preview_storage_for_file`] with an optional live DB handle
+/// used to enumerate the alternative path spellings recorded in `previews`.
+pub(crate) fn purge_preview_storage_for_file_with_db(
+    db: Option<&Database>,
+    file: &Path,
+) -> Vec<PathBuf> {
+    // Collect every textual spelling this file is known under: the live path,
+    // its canonical form (symlinks / `..` resolved — a render may have hashed
+    // that) plus whatever strings previous writers stored in the DB
+    // (`./dir/x.wav`, `dir//x.wav`, …). The deterministic PNG name hashes the
+    // *exact* string, so all spellings must be tried to find the real cached
+    // images.
+    let mut spellings: Vec<PathBuf> = Vec::new();
+    let mut add_spelling = |p: PathBuf| {
+        if !spellings.contains(&p) {
+            spellings.push(p);
+        }
+    };
+    add_spelling(file.to_path_buf());
+    if let Ok(canon) = std::fs::canonicalize(file) {
+        add_spelling(canon);
+    }
+    if let Some(db) = db {
+        if let Ok(rows) = db.list_previews_for_file_any_spelling(file) {
+            for (p, _uuid) in rows {
+                add_spelling(PathBuf::from(p));
+            }
+        }
+    }
+
+    let mut candidates: Vec<String> = Vec::new();
+    for mode in [PreviewMode::Waveform, PreviewMode::Spectrogram] {
+        for sp in &spellings {
+            // Hashing needs the file's mtime/size; every spelling of an
+            // existing file resolves through the same inode.
+            if std::fs::metadata(sp).is_err() {
+                continue;
+            }
+            for ch in 1u16..=8 {
+                if let Ok(u) = generate_preview_uuid(sp, ch, mode.uuid_suffix()) {
+                    candidates.push(u);
+                }
+            }
+        }
+    }
+
+    let mut removed = Vec::new();
+    for uuid in candidates {
+        let png = preview_png_path(&uuid);
+        if png.is_file() && std::fs::remove_file(&png).is_ok() {
+            removed.push(png);
+        }
+    }
+    removed
+}
+
 /// Purge the preview cache of a **single audio file** (context-menu
 /// "Refresh preview"): every DB row belonging to `file` (any path spelling,
 /// any preview style) plus every PNG behind those rows and the deterministic
@@ -470,33 +563,27 @@ pub fn delete_previews_for_dir_with_db_owned(db: Database, dir: &Path) -> std::i
 /// an independently opened connection apply (see
 /// [`delete_previews_for_dir_with_db`]).
 pub fn delete_preview_for_file_with_db_owned(db: Database, file: &Path) -> std::io::Result<usize> {
-    // Snapshot BEFORE deleting: the uuid column is the only pointer to the
-    // PNG filenames that were registered in the DB.
+    // Storage FIRST: unlink every PNG that could belong to this file before
+    // touching the DB (`purge_preview_storage_for_file` explains why a
+    // DB-row-driven filename list misses the real cache files). The DB handle
+    // is used only to enumerate alternative path spellings here; the rows are
+    // deleted afterwards, so no render job can observe "row gone, PNG still
+    // cached" and short-circuit onto the stale image.
+    let removed_files = purge_preview_storage_for_file_with_db(Some(&db), file).len();
+
+    // Snapshot BEFORE deleting (kept for logging/diagnostics of what the rows
+    // pointed at).
     let rows = db
         .list_previews_for_file_any_spelling(file)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
 
-    let mut png_files: Vec<PathBuf> = Vec::new();
+    // Rows whose UUID names a PNG the deterministic sweep above did not cover
+    // (e.g. previews written by an older format version) — unlink those too.
+    let mut extra_files = 0usize;
     for (_path_str, uuid) in &rows {
-        png_files.push(preview_png_path(uuid));
-    }
-
-    // Deterministic-name PNGs for both styles, hashed from the *exact* path
-    // string the row was stored under (the hash includes the raw text!) and
-    // from the live listing path — this catches orphaned images whose rows
-    // never made it into (or already left) the DB.
-    let mut spellings: Vec<PathBuf> = rows.iter().map(|(p, _)| PathBuf::from(p)).collect();
-    spellings.push(file.to_path_buf());
-    for p in &spellings {
-        if let Ok(meta) = std::fs::metadata(p) {
-            if meta.is_file() {
-                let channels = crate::audio_io::probe_file_header(p).channels.max(1);
-                for mode in [PreviewMode::Waveform, PreviewMode::Spectrogram] {
-                    if let Ok(u) = generate_preview_uuid(p, channels, mode.uuid_suffix()) {
-                        png_files.push(preview_png_path(&u));
-                    }
-                }
-            }
+        let png = preview_png_path(uuid);
+        if png.is_file() && std::fs::remove_file(&png).is_ok() {
+            extra_files += 1;
         }
     }
 
@@ -505,17 +592,10 @@ pub fn delete_preview_for_file_with_db_owned(db: Database, file: &Path) -> std::
         .delete_all_previews_for_file(file)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
 
-    let mut removed_files = 0usize;
-    for png in png_files {
-        if std::fs::remove_file(&png).is_ok() {
-            removed_files += 1;
-        }
-    }
-
     tracing::info!(
         "Refresh preview: purged {} DB rows and {} PNG files for {}",
         removed_rows,
-        removed_files,
+        removed_files + extra_files,
         file.display()
     );
     Ok(removed_rows)
@@ -742,4 +822,72 @@ pub fn cleanup_previews() -> Result<usize, String> {
     }
 
     Ok(removed_count)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// BUGFIX regression (context-menu "Refresh preview" deleted nothing):
+    /// the per-file purge used to resolve PNG names only from DB rows plus a
+    /// re-hash of *live* header metadata. When the row was missing/stale the
+    /// sweep matched zero files, the PNG survived, and the scanner (which
+    /// treats the storage dir as the source of truth) immediately handed the
+    /// identical image back — "previews are unloaded and the same ones load
+    /// again". The deterministic sweep must unlink the cached PNG even with
+    /// an empty database, for both modes and any plausible channel count.
+    #[test]
+    fn purge_preview_storage_removes_png_without_db_rows() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::set_var("AUDIOSCOUT_CONFIG_DIR", tmp.path());
+
+        // A real audio file on disk (the hash needs its mtime/size).
+        let audio_dir = tempfile::tempdir().unwrap();
+        let file = audio_dir.path().join("tone.wav");
+        std::fs::write(&file, b"RIFF fake wav contents").unwrap();
+
+        // Seed cached PNGs exactly the way the render pipeline names them:
+        // deterministic hash of (path spelling, mtime, size, channels, mode).
+        // Spellings used here: the live path, its canonical form and a `.`-
+        // prefixed variant — all resolve to existing files, which is the rule
+        // the purge sweep follows.
+        let canon = std::fs::canonicalize(&file).unwrap();
+        let odd_spelling = {
+            let mut p = audio_dir.path().to_path_buf();
+            p.push(".");
+            p.push("tone.wav");
+            p
+        };
+        let mut seeded = Vec::new();
+        for sp in [&file, &odd_spelling, &canon] {
+            for ch in [1u16, 2] {
+                for mode in [PreviewMode::Waveform, PreviewMode::Spectrogram] {
+                    if let Ok(uuid) = generate_preview_uuid(sp, ch, mode.uuid_suffix()) {
+                        let png = preview_png_path(&uuid);
+                        std::fs::create_dir_all(png.parent().unwrap()).unwrap();
+                        std::fs::write(&png, b"png").unwrap();
+                        seeded.push(png);
+                    }
+                }
+            }
+        }
+        assert!(!seeded.is_empty());
+        // An unrelated preview that must survive the per-file purge.
+        let other = preview_png_path("00000000-0000-0000-0000-000000000000");
+        std::fs::write(&other, b"png").unwrap();
+
+        // No DB involvement at all: empty/nonexistent app.db.
+        let removed = purge_preview_storage_for_file(&file);
+        assert_eq!(
+            removed.len(),
+            seeded.len(),
+            "every cached PNG of this file must be unlinked regardless of SQLite"
+        );
+        for png in &seeded {
+            assert!(!png.exists(), "stale preview {} survived the purge", png.display());
+        }
+        assert!(other.exists(), "previews of other files must not be touched");
+
+        std::env::remove_var("AUDIOSCOUT_CONFIG_DIR");
+    }
 }

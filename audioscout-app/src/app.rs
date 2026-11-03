@@ -961,8 +961,16 @@ impl AudioScoutApp {
         // re-delivered by the retry pump below / next repaint pass.
         self.scan_generation += 1;
 
-        // Perform the actual deletion off the UI thread. `Database::reopen`
-        // gives the worker its own SQLite connection to the same file.
+        // Perform the actual deletion off the UI thread. The storage sweep
+        // (`purge_preview_storage_for_file`) unlinks **every** PNG that can
+        // belong to this file — all path spellings, both preview modes, every
+        // plausible channel count — regardless of what SQLite recorded, and
+        // runs before the DB rows go away. Doing this on the UI thread used to
+        // be the bug: while it probed headers and unlinked files, the event
+        // loop kept consuming pre-purge `PreviewReady`s and the scanner
+        // re-resolved still-existing PNGs straight back into the rows, so the
+        // identical thumbnails were "unloaded and loaded again" and nothing
+        // appeared deleted.
         let db = match self.db.reopen() {
             Ok(db) => db,
             Err(e) => {
@@ -974,9 +982,20 @@ impl AudioScoutApp {
         let tx = self.event_tx.clone();
         let file = path.to_path_buf();
         std::thread::spawn(move || {
+            // Storage first even if the DB half fails afterwards: an orphaned
+            // row without its PNG still forces a genuine re-render (the render
+            // path checks the file exists), whereas a PNG without a row is
+            // what made refresh a no-op.
+            let purged_pngs =
+                audioscout_core::preview_worker::purge_preview_storage_for_file(&file);
             if let Err(e) = audioscout_core::preview_worker::delete_preview_for_file_with_db_owned(db, &file) {
                 tracing::warn!("Preview refresh purge failed for {}: {}", file.display(), e);
             }
+            tracing::info!(
+                "Refresh preview: removed {} cached PNG(s) for {}",
+                purged_pngs.len(),
+                file.display()
+            );
             let _ = tx.send(UiEvent::PreviewFilePurged { path: file });
         });
         ctx.request_repaint();
@@ -998,9 +1017,24 @@ impl AudioScoutApp {
         if !self.preview_file_purge_inflight.remove(path) {
             return;
         }
+        // The purge ran on a background thread while this frame's rows may
+        // have been re-populated by a `ScanDone` (the scanner resolves
+        // thumbnails straight from the storage dir — see
+        // `preview_worker::cached_preview_png`). Now that the PNGs really are
+        // gone, re-resolve every row's UUID from storage so a stale one can
+        // never short-circuit regeneration onto the deleted cache.
+        self.resync_row_previews_from_storage();
         self.status_message = "Preview refreshed; regenerating…".to_string();
         let mode = *self.preview_mode.lock().unwrap();
         let generation = self.scan_generation;
+        // Forget any lingering pipeline state for this path: the dedup flag
+        // inside the worker may still be held by an in-flight render whose
+        // (stale) result was discarded with the generation bump below —
+        // without this, `submit` would reject the fresh job as a duplicate
+        // and no regeneration would ever start.
+        self.preview_worker.forget_path(path);
+        self.preview_retry.remove(path);
+        self.preview_inflight.remove(path);
         if self.preview_worker.submit(PreviewJob { path: path.to_path_buf(), generation, mode }) {
             self.preview_inflight.insert(path.to_path_buf());
         } else {
@@ -1009,6 +1043,35 @@ impl AudioScoutApp {
             self.preview_retry.insert(path.to_path_buf());
         }
         ctx.request_repaint();
+    }
+
+    /// Re-check each visible row's thumbnail against the preview storage
+    /// directory (`cached_preview_png` is the filesystem existence check the
+    /// scanner itself uses). Rows whose PNG was just deleted lose their UUID
+    /// and fall back into the generation queue; rows whose PNG legitimately
+    /// exists keep it. Called after a purge completed off-thread, because a
+    /// `ScanDone` delivered during the purge could have re-armed rows with
+    /// UUIDs of files that were removed moments later.
+    fn resync_row_previews_from_storage(&mut self) {
+        let mode = *self.preview_mode.lock().unwrap();
+        for row in &mut self.file_rows {
+            let Some(uuid) = row.preview_uuid.clone() else { continue };
+            // Existence check for the recorded UUID, or for the deterministic
+            // name recomputed from live metadata — either keeps the row; both
+            // missing means the cache entry is gone for good.
+            let png_exists = audioscout_core::preview_worker::preview_png_exists(&uuid)
+                || audioscout_core::preview_worker::cached_preview_png(
+                    &row.path,
+                    row.channels.max(1),
+                    mode,
+                )
+                .is_some();
+            if !png_exists {
+                row.preview_uuid = None;
+                self.preview_cache_wave.remove(&uuid);
+                self.preview_cache_spectro.remove(&uuid);
+            }
+        }
     }
 
     /// Background preview generation is event-driven: without an active
