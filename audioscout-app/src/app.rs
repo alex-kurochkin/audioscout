@@ -2666,7 +2666,9 @@ impl eframe::App for AudioScoutApp {
                 ui.separator();
                 let r_columns = ui.button("Columns");
                 Self::hover_hand(ui, &r_columns);
-                if r_columns.clicked() { self.show_columns_dialog = true; }
+                // Toggle: a repeated click on the button closes the window
+                // that this same button opened.
+                if r_columns.clicked() { self.show_columns_dialog = !self.show_columns_dialog; }
                 ui.separator();
                 // Table thumbnail style toggle (§3.1): the code to switch
                 // modes existed but had no control — this button exposes the
@@ -2688,7 +2690,9 @@ impl eframe::App for AudioScoutApp {
                 ui.separator();
                 let r_settings = ui.button("Settings");
                 Self::hover_hand(ui, &r_settings);
-                if r_settings.clicked() { self.show_settings = true; }
+                // Toggle: a repeated click on the button closes the window
+                // that this same button opened.
+                if r_settings.clicked() { self.show_settings = !self.show_settings; }
             });
         });
 
@@ -4267,6 +4271,11 @@ impl eframe::App for AudioScoutApp {
             // button sets `SettingsAction::Close`; otherwise `.open()` keeps
             // the mirror in sync with the window's X-button state.
             self.show_settings = show_settings && action != SettingsAction::Close;
+            // Closing the window (toolbar toggle, X-button or Close) must not
+            // silently discard edits made since the last save: persist them.
+            if !self.show_settings {
+                let _ = self.config_store.save();
+            }
             self.settings_hotkey_capture = capture_toggle.clone();
             // Native folder picker for "Undo data directory" — runs outside
             // the egui frame so the blocking rfd dialog doesn't stall UI.
