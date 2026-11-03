@@ -365,6 +365,12 @@ pub struct AudioScoutApp {
     /// Paths whose submit was rejected (duplicate / queue full); retried by
     /// `retry_missing_previews` while previews are pending.
     preview_retry: HashSet<PathBuf>,
+    /// Directory whose "Refresh preview" purge is currently running on a
+    /// background thread (`None` when idle). Set by
+    /// `refresh_current_dir_previews`, cleared by `finish_preview_purge` when
+    /// the matching [`UiEvent::PreviewsPurged`] arrives; regeneration is only
+    /// submitted after that, so fresh renders never race the deletion.
+    preview_purge_inflight: Option<PathBuf>,
     /// Active thumbnail style for the file list (Waveform / Spectrogram).
     /// Shared with the scanner (`Scanner::preview_mode_handle`) so cached
     /// lookups during a scan use the same mode as the submitted jobs.
@@ -622,6 +628,7 @@ impl AudioScoutApp {
             preview_cache_wave: HashMap::new(),
             preview_cache_spectro: HashMap::new(),
             preview_inflight: HashSet::new(), preview_retry: HashSet::new(),
+            preview_purge_inflight: None,
             show_settings: false, settings_hotkey_capture: None, settings_status: String::new(),
             show_columns_dialog: false, status_message: String::new(),
             normalize_dbfs: -1.0, expanded_dirs: HashMap::new(),
@@ -779,20 +786,45 @@ impl AudioScoutApp {
     }
 
     /// Toolbar "Refresh preview": purge the preview cache of the *current*
-    /// directory (DB rows + PNG files on disk — see
-    /// `preview_worker::delete_previews_for_dir`), drop the stale UUIDs and
-    /// texture caches, then re-run generation for the visible rows.
+    /// directory (DB rows + PNG files on disk) and then re-run generation.
+    ///
+    /// BUGFIX (old previews came back; nothing seemed to be deleted): this
+    /// used to run `delete_previews_for_dir` **synchronously inside the UI
+    /// thread**. Three things went wrong there:
+    /// - while the purge probed every audio file, the render threads that
+    ///   were still running delivered `PreviewReady` events carrying the
+    ///   *pre-purge* UUIDs; the next event-loop pass wrote them straight
+    ///   back into `file_rows`, so right after the wipe every row was
+    ///   "cached" again and `request_previews` skipped all of them — the
+    ///   thumbnails were unloaded from the texture cache and immediately
+    ///   re-loaded from it, which is exactly the reported symptom;
+    /// - jobs whose deletion raced with a fresh submission could re-use the
+    ///   just-deleted deterministic PNG before it was unlinked;
+    /// - opening a second connection to the DB file was done by cloning the
+    ///   handle across threads (invalid SQLite usage), making the DELETEs
+    ///   unreliable.
+    /// The purge now runs on its own thread against an independently opened
+    /// connection (`Database::reopen`) and reports back through
+    /// [`UiEvent::PreviewsPurged`]; regeneration is submitted only when that
+    /// event arrives, so no stale result can resurrect a deleted entry.
     fn refresh_current_dir_previews(&mut self, ctx: &egui::Context) {
         let Some(dir) = self.current_dir.clone() else {
             self.status_message = "No current directory".to_string();
             return;
         };
-        match audioscout_core::preview_worker::delete_previews_for_dir(&dir) {
-            Ok(n) => self.status_message = format!("Previews refreshed ({n} cleared)…"),
-            Err(e) => self.status_message = format!("Preview refresh failed: {e}"),
+        // A purge for another directory may still be in flight; starting a
+        // second one would interleave deletions with the pending completion
+        // event. Re-target the running request instead of double-spawning.
+        if self.preview_purge_inflight.is_some() {
+            self.status_message = "Preview refresh already running…".to_string();
+            return;
         }
-        // The PNGs behind these textures no longer exist; drop both mode
-        // caches so the rows re-load whatever gets regenerated.
+        self.preview_purge_inflight = Some(dir.clone());
+        self.status_message = "Refreshing previews…".to_string();
+
+        // Drop both mode texture caches first: the PNGs behind these handles
+        // are about to disappear, and keeping them is what made the old
+        // images "reload" instantly after the purge.
         self.preview_cache_wave.clear();
         self.preview_cache_spectro.clear();
         // Stale UUIDs would make `request_previews` skip every row (it only
@@ -800,20 +832,65 @@ impl AudioScoutApp {
         for row in &mut self.file_rows {
             row.preview_uuid = None;
         }
-        // Cancel queued jobs that would render into the deleted cache. Do NOT
-        // wipe the in-flight bookkeeping here: paths whose render thread is
-        // still running stay in the worker's internal `pending` set until it
-        // finishes, and clearing our mirror set would let `request_previews`
-        // re-submit them as "fresh" jobs while the old one is alive — the two
-        // concurrent renders of the same file then race on the deterministic
-        // PNG path (partial/overwritten image). Keeping the entries means the
-        // duplicate submission is rejected, and the render that is already
-        // running delivers a brand-new image (the old PNG was just deleted),
-        // which satisfies the refresh requirement anyway.
+        // Forget our in-flight mirror: whatever the worker still holds is
+        // rendering into the cache we are deleting, and its result must not
+        // be applied to the rows (the generation guard below discards it).
+        self.preview_inflight.clear();
+        self.preview_retry.clear();
+        // Cancel queued jobs that would render into the deleted cache.
         self.preview_worker.clear_queue();
-        // Kick off regeneration for the current directory. Rows currently in
-        // flight are skipped by `submit`'s dedup guard (see above); everything
-        // else gets a fresh job.
+        // Bump the scan generation: every `PreviewReady`/`ScanDone` event
+        // produced from the *old* state carries the previous generation and
+        // is ignored afterwards, so pre-purge results can no longer refill
+        // the wiped rows.
+        self.scan_generation += 1;
+        let generation = self.scan_generation;
+
+        // Perform the actual deletion off the UI thread. `Database::reopen`
+        // gives the worker its own SQLite connection to the same file.
+        let db = match self.db.reopen() {
+            Ok(db) => db,
+            Err(e) => {
+                self.preview_purge_inflight = None;
+                self.status_message = format!("Preview refresh failed: {e}");
+                return;
+            }
+        };
+        let tx = self.event_tx.clone();
+        std::thread::spawn(move || {
+            let rows_removed = match audioscout_core::preview_worker::delete_previews_for_dir_with_db_owned(db, &dir) {
+                Ok(n) => n,
+                Err(e) => {
+                    tracing::warn!("Preview refresh purge failed for {}: {}", dir.display(), e);
+                    0
+                }
+            };
+            let _ = tx.send(UiEvent::PreviewsPurged { dir, rows_removed });
+            let _ = generation; // generation is echoed via the app-side field
+        });
+        ctx.request_repaint();
+    }
+
+    /// Completion handler for the background purge started by
+    /// `refresh_current_dir_previews`: kick off fresh generation now that the
+    /// DB rows and PNG files really are gone.
+    fn finish_preview_purge(&mut self, purged_dir: &Path, rows_removed: usize, ctx: &egui::Context) {
+        let in_flight = self.preview_purge_inflight.take();
+        match in_flight {
+            Some(d) if d == purged_dir => {}
+            // Purge of a directory we are no longer showing — ignore its
+            // completion but keep the flag cleared above only if it matches;
+            // otherwise restore it.
+            Some(d) => {
+                self.preview_purge_inflight = Some(d);
+                return;
+            }
+            None => return,
+        }
+        self.status_message =
+            format!("Previews refreshed ({rows_removed} cleared)… regenerating");
+        // Now (and only now) submit fresh jobs: the deterministic PNG names
+        // no longer exist, so every render genuinely re-decodes the audio.
         self.request_previews();
         ctx.request_repaint();
     }

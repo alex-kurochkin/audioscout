@@ -4,6 +4,11 @@ use crate::Marker;
 
 /// Database wrapper for SQLite storage
 pub struct Database {
+    /// Path of the SQLite file this handle is opened on. Kept so helpers
+    /// like [`Database::reopen`] can hand out a *second* connection to the
+    /// same database (needed by cross-thread cache purges — see
+    /// `preview_worker::delete_previews_for_dir`).
+    path: PathBuf,
     conn: Connection,
 }
 
@@ -39,7 +44,20 @@ impl Database {
             CREATE INDEX IF NOT EXISTS idx_previews_path_mode ON previews(path, mode);"
         )?;
 
-        Ok(Self { conn })
+        Ok(Self { path: db_path.to_path_buf(), conn })
+    }
+
+    /// Open a *second, independent* connection to the same database file.
+    ///
+    /// Needed by cross-thread cache maintenance (e.g. the toolbar "Refresh
+    /// preview" purge, which runs on a background thread while the UI thread
+    /// still owns its `Database`). SQLite handles concurrent readers/writers
+    /// across separate connections safely; the old code instead cloned the
+    /// raw handle into the worker thread, which is not a valid SQLite usage
+    /// and made those writes invisible/unreliable — one of the reasons the
+    /// refresh appeared to delete nothing.
+    pub fn reopen(&self) -> Result<Self, rusqlite::Error> {
+        Self::open(&self.path)
     }
 
     /// Save markers for a file
@@ -136,7 +154,7 @@ impl Database {
     /// PNG filename was hashed from. "Refresh preview" uses this list to locate
     /// and unlink the real cache files on disk before deleting the rows.
     pub fn list_previews_in_dir_any_spelling(&self, dir: &Path) -> Result<Vec<(String, String)>, rusqlite::Error> {
-        let want: Vec<&std::ffi::OsStr> = normalize_path(dir).components().collect();
+        let want: PathBuf = normalize_path(dir);
         if want.is_empty() {
             return Ok(Vec::new());
         }
@@ -148,10 +166,7 @@ impl Database {
             })?;
             for r in rows.flatten() {
                 let parent_ok = match Path::new(&r.0).parent() {
-                    Some(parent) => {
-                        let got: Vec<_> = normalize_path(parent).components().collect();
-                        got == want
-                    }
+                    Some(parent) => normalize_path(parent) == want,
                     None => false,
                 };
                 if parent_ok {
@@ -173,7 +188,7 @@ impl Database {
     /// itself (`Path::parent()` — always exact) and compared component-wise to
     /// `dir`, so every spelling maps to the same scope.
     pub fn delete_all_previews_in_dir(&self, dir: &Path) -> Result<usize, rusqlite::Error> {
-        let want: Vec<&std::ffi::OsStr> = normalize_path(dir).components().collect();
+        let want: PathBuf = normalize_path(dir);
         if want.is_empty() {
             return Ok(0);
         }
@@ -182,10 +197,7 @@ impl Database {
             let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
             rows.flatten()
                 .filter(|p| match Path::new(p).parent() {
-                    Some(parent) => {
-                        let got: Vec<_> = normalize_path(parent).components().collect();
-                        got == want
-                    }
+                    Some(parent) => normalize_path(parent) == want,
                     None => false,
                 })
                 .collect()

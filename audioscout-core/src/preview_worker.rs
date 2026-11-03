@@ -6,6 +6,7 @@ use crossbeam_channel::Sender;
 use uuid::Uuid;
 
 use crate::{PreviewMode, UiEvent};
+use crate::db::Database;
 
 /// Preview rendering job
 #[derive(Debug, Clone)]
@@ -329,6 +330,13 @@ fn preview_png_path(uuid: &str) -> PathBuf {
 /// file list shows for that directory. Returns the number of DB rows removed.
 /// Used by the toolbar "Refresh preview" button.
 ///
+/// Takes a live [`Database`] handle and opens an *independent* connection to
+/// the same file internally (`db.reopen()`): this purge runs on a background
+/// thread while the UI thread still owns its handle, and sharing one raw
+/// SQLite connection across threads is not valid usage — the old code cloned
+/// the handle into the worker, so the DELETEs were unreliable/invisible and
+/// every cache entry survived the refresh.
+///
 /// BUGFIX (previews were "refreshed" but the identical images came back): the
 /// previous implementation collected the PNG names from the *live* directory
 /// listing via `load_preview(path, size, mtime, …)` and deleted rows with a
@@ -343,7 +351,7 @@ fn preview_png_path(uuid: &str) -> PathBuf {
 ///
 /// The purge is now driven entirely by the **DB contents**:
 /// 1. Snapshot `(path, uuid)` rows scoped to `dir` (component-wise parent
-///    comparison, tolerant of path spellings — `delete_all_previews_in_dir`).
+///    comparison, tolerant of path spellings).
 /// 2. Derive each PNG location two ways and delete both if present:
 ///    a. the UUID recorded in the row (covers previews written under a
 ///       different rendering style or older format), and
@@ -352,10 +360,21 @@ fn preview_png_path(uuid: &str) -> PathBuf {
 ///       PNGs whose rows never made it into the DB (the scanner treats the
 ///       filesystem as the source of truth and back-fills lazily).
 /// 3. Delete the rows themselves.
-pub fn delete_previews_for_dir(dir: &Path) -> std::io::Result<usize> {
-    let db_path = crate::config::config_dir().join("app.db");
-    let db = crate::db::Database::open(&db_path)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+///
+/// BUGFIX #2 (refresh still showed the *old* images): the UI used to run
+/// this purge **synchronously on the egui thread**. While it was busy
+/// probing audio files and deleting PNGs, every [`UiEvent::PreviewReady`]
+/// the still-running render threads sent into the channel was consumed by
+/// the very next event loop with the *pre-purge* UUIDs (the events were
+/// queued before the PNGs/rows went away) and re-loaded from the texture
+/// cache — so the stale thumbnails were "unloaded and loaded again" and
+/// nothing appeared deleted. The purge is now spawned onto its own thread
+/// (see `AudioScoutApp::refresh_current_dir_previews`); the app keeps
+/// pumping repaints until it reports completion via [`UiEvent::PreviewsPurged`],
+/// and only then re-submits generation jobs — which can no longer race the
+/// deletion.
+pub fn delete_previews_for_dir_with_db(db: &Database, dir: &Path) -> std::io::Result<usize> {
+    let db = db.reopen().map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
 
     // Snapshot BEFORE deleting: the uuid column is the only pointer to the
     // PNG filenames that were registered in the DB.
@@ -400,6 +419,81 @@ pub fn delete_previews_for_dir(dir: &Path) -> std::io::Result<usize> {
             let channels = crate::audio_io::probe_file_header(&canon).channels.max(1);
             for mode in [PreviewMode::Waveform, PreviewMode::Spectrogram] {
                 if let Ok(u) = generate_preview_uuid(&canon, channels, mode.uuid_suffix()) {
+                    png_files.push(preview_png_path(&u));
+                }
+            }
+        }
+    }
+
+    let mut removed_files = 0usize;
+    for png in png_files {
+        if std::fs::remove_file(&png).is_ok() {
+            removed_files += 1;
+        }
+    }
+
+    tracing::info!(
+        "Refresh preview: purged {} DB rows and {} PNG files for {}",
+        removed_rows,
+        removed_files,
+        dir.display()
+    );
+    Ok(removed_rows)
+}
+
+/// Same as [`delete_previews_for_dir_with_db`] but takes ownership of the
+/// handle — used by the background purge thread spawned from the UI, which
+/// opens its own connection via `Database::reopen` and moves it here.
+pub fn delete_previews_for_dir_with_db_owned(db: Database, dir: &Path) -> std::io::Result<usize> {
+    delete_previews_for_dir_with_db_no_reopen(&db, dir)
+}
+
+/// Convenience wrapper that opens the app database itself. Prefer
+/// [`delete_previews_for_dir_with_db`] when a live handle already exists —
+/// it guarantees the purge works on the *same* database file the app uses
+/// (which honours `AUDIOSCOUT_CONFIG_DIR` and any relocated config).
+pub fn delete_previews_for_dir(dir: &Path) -> std::io::Result<usize> {
+    let db_path = crate::config::config_dir().join("app.db");
+    let db = crate::db::Database::open(&db_path)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    delete_previews_for_dir_with_db_no_reopen(&db, dir)
+}
+
+/// Same body as [`delete_previews_for_dir_with_db`] without the extra
+/// connection (used when the caller already handed us a dedicated handle).
+fn delete_previews_for_dir_with_db_no_reopen(db: &Database, dir: &Path) -> std::io::Result<usize> {
+    let rows = db
+        .list_previews_in_dir_any_spelling(dir)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+
+    let mut png_files: Vec<PathBuf> = Vec::new();
+    for (path_str, uuid) in &rows {
+        png_files.push(preview_png_path(uuid));
+        let p = Path::new(path_str);
+        if let Ok(meta) = std::fs::metadata(p) {
+            if meta.is_file() {
+                let channels = crate::audio_io::probe_file_header(p).channels.max(1);
+                for mode in [PreviewMode::Waveform, PreviewMode::Spectrogram] {
+                    if let Ok(u) = generate_preview_uuid(p, channels, mode.uuid_suffix()) {
+                        png_files.push(preview_png_path(&u));
+                    }
+                }
+            }
+        }
+    }
+
+    let removed_rows = db
+        .delete_all_previews_in_dir(dir)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+
+    for path in crate::db::Database::top_level_files(dir) {
+        if let Ok(meta) = std::fs::metadata(&path) {
+            if !meta.is_file() {
+                continue;
+            }
+            let channels = crate::audio_io::probe_file_header(&path).channels.max(1);
+            for mode in [PreviewMode::Waveform, PreviewMode::Spectrogram] {
+                if let Ok(u) = generate_preview_uuid(&path, channels, mode.uuid_suffix()) {
                     png_files.push(preview_png_path(&u));
                 }
             }

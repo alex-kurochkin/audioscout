@@ -83,6 +83,15 @@ pub enum UiEvent {
     DisksChanged {
         disks: Vec<disk::DiskInfo>,
     },
+    /// The toolbar "Refresh preview" purge (DB rows + PNG files for the
+    /// current directory) finished on its background thread. `dir` is the
+    /// directory that was purged; `rows_removed` counts the deleted DB rows.
+    /// The UI waits for this event before re-submitting generation jobs, so
+    /// fresh renders can never race (and re-use) the cache being deleted.
+    PreviewsPurged {
+        dir: PathBuf,
+        rows_removed: usize,
+    },
 }
 
 /// Application-wide event channel
