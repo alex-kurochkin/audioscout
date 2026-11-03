@@ -371,6 +371,12 @@ pub struct AudioScoutApp {
     /// the matching [`UiEvent::PreviewsPurged`] arrives; regeneration is only
     /// submitted after that, so fresh renders never race the deletion.
     preview_purge_inflight: Option<PathBuf>,
+    /// Paths whose per-file "Refresh preview" purge (context menu) is
+    /// currently running on a background thread. Cleared by
+    /// `finish_file_preview_purge` when the matching
+    /// [`UiEvent::PreviewFilePurged`] arrives; the single regeneration job is
+    /// submitted only then, so it cannot re-use the cache being deleted.
+    preview_file_purge_inflight: HashSet<PathBuf>,
     /// Active thumbnail style for the file list (Waveform / Spectrogram).
     /// Shared with the scanner (`Scanner::preview_mode_handle`) so cached
     /// lookups during a scan use the same mode as the submitted jobs.
@@ -629,6 +635,7 @@ impl AudioScoutApp {
             preview_cache_spectro: HashMap::new(),
             preview_inflight: HashSet::new(), preview_retry: HashSet::new(),
             preview_purge_inflight: None,
+            preview_file_purge_inflight: HashSet::new(),
             show_settings: false, settings_hotkey_capture: None, settings_status: String::new(),
             show_columns_dialog: false, status_message: String::new(),
             normalize_dbfs: -1.0, expanded_dirs: HashMap::new(),
@@ -895,6 +902,115 @@ impl AudioScoutApp {
         ctx.request_repaint();
     }
 
+    /// Context-menu "Refresh preview" on a file row: purge the preview cache
+    /// of this single file (DB rows + PNG files in the previews storage, both
+    /// styles) and then re-run generation for it.
+    ///
+    /// Same architecture as the toolbar's directory-wide refresh, scoped down
+    /// to one path: the deletion runs on a background thread over an
+    /// independently opened SQLite connection (`Database::reopen`) and reports
+    /// back through [`UiEvent::PreviewFilePurged`]; regeneration is submitted
+    /// only when that event arrives, so a fresh render can never short-circuit
+    /// onto the still-existing cache (the bug that made the toolbar button
+    /// "unload and reload" the same images).
+    fn refresh_file_preview(&mut self, path: &Path, ctx: &egui::Context) {
+        // The directory-wide purge owns the whole cache (it clears both
+        // texture maps and wipes this file too) — don't interleave.
+        if self.preview_purge_inflight.is_some() {
+            self.status_message = "Preview refresh already running…".to_string();
+            return;
+        }
+        // A per-file refresh for the same path is still in flight; starting a
+        // second would double-submit and race the pending completion event.
+        if self.preview_file_purge_inflight.contains(path) {
+            self.status_message = "Preview refresh already running…".to_string();
+            return;
+        }
+        // Capture the row's UUID BEFORE wiping it — needed below to evict the
+        // stale texture handles from both mode caches.
+        let purged_uuid = self.row_purged_uuid(path);
+        self.preview_file_purge_inflight.insert(path.to_path_buf());
+        self.status_message = format!(
+            "Refreshing preview for {}…",
+            path.file_name().unwrap_or(path.as_os_str()).to_string_lossy()
+        );
+
+        // Forget the stale UUID on the row: while the purge runs, the cell
+        // shows ⏳ instead of the about-to-be-deleted thumbnail (which the
+        // texture caches below still hold).
+        if let Some(row) = self.file_rows.iter_mut().find(|r| r.path == path) {
+            row.preview_uuid = None;
+        }
+        // Drop the cached textures keyed by this row's UUID from BOTH mode
+        // maps (the active mode may change before regeneration completes);
+        // keeping them is exactly what made old images "reload" instantly.
+        if let Some(uuid) = purged_uuid {
+            self.preview_cache_wave.remove(&uuid);
+            self.preview_cache_spectro.remove(&uuid);
+        }
+        // Stale bookkeeping would make the follow-up submit reject the job as
+        // a duplicate.
+        self.preview_retry.remove(path);
+        // Cancel a queued job for this path: it would render into the cache
+        // being deleted right now.
+        self.preview_worker.forget_path(path);
+        self.preview_inflight.remove(path);
+        // Bump the scan generation so a *currently rendering* job's stale
+        // `PreviewReady` (pre-purge UUID) can never refill the wiped row.
+        // Mirrors the directory-wide refresh; other in-flight rows are simply
+        // re-delivered by the retry pump below / next repaint pass.
+        self.scan_generation += 1;
+
+        // Perform the actual deletion off the UI thread. `Database::reopen`
+        // gives the worker its own SQLite connection to the same file.
+        let db = match self.db.reopen() {
+            Ok(db) => db,
+            Err(e) => {
+                self.preview_file_purge_inflight.remove(path);
+                self.status_message = format!("Preview refresh failed: {e}");
+                return;
+            }
+        };
+        let tx = self.event_tx.clone();
+        let file = path.to_path_buf();
+        std::thread::spawn(move || {
+            if let Err(e) = audioscout_core::preview_worker::delete_preview_for_file_with_db_owned(db, &file) {
+                tracing::warn!("Preview refresh purge failed for {}: {}", file.display(), e);
+            }
+            let _ = tx.send(UiEvent::PreviewFilePurged { path: file });
+        });
+        ctx.request_repaint();
+    }
+
+    /// Remembered UUID of the row for `path`, used to evict its texture from
+    /// both mode caches before the purge deletes the PNG behind it.
+    fn row_purged_uuid(&self, path: &Path) -> Option<String> {
+        self.file_rows
+            .iter()
+            .find(|r| r.path == path)
+            .and_then(|r| r.preview_uuid.clone())
+    }
+
+    /// Completion handler for the per-file purge started from the file row's
+    /// context menu: the cache of this file really is gone now, so submit one
+    /// fresh generation job for it.
+    fn finish_file_preview_purge(&mut self, path: &Path, ctx: &egui::Context) {
+        if !self.preview_file_purge_inflight.remove(path) {
+            return;
+        }
+        self.status_message = "Preview refreshed; regenerating…".to_string();
+        let mode = *self.preview_mode.lock().unwrap();
+        let generation = self.scan_generation;
+        if self.preview_worker.submit(PreviewJob { path: path.to_path_buf(), generation, mode }) {
+            self.preview_inflight.insert(path.to_path_buf());
+        } else {
+            // Worker saturated — `retry_missing_previews` picks it up while
+            // previews are pending.
+            self.preview_retry.insert(path.to_path_buf());
+        }
+        ctx.request_repaint();
+    }
+
     /// Background preview generation is event-driven: without an active
     /// repaint loop, `PreviewReady` events could sit unread in the channel
     /// long after the PNGs appeared on disk. While any thumbnail is still
@@ -902,9 +1018,11 @@ impl AudioScoutApp {
     /// soon as they arrive.
     fn previews_pending(&self) -> bool {
         // A purge in flight also counts as "pending": the UI must keep
-        // pumping repaints so `UiEvent::PreviewsPurged` is drained promptly
-        // and regeneration starts without waiting for user input.
+        // pumping repaints so `UiEvent::PreviewsPurged` /
+        // `UiEvent::PreviewFilePurged` are drained promptly and regeneration
+        // starts without waiting for user input.
         self.preview_purge_inflight.is_some()
+            || !self.preview_file_purge_inflight.is_empty()
             || self.file_rows.iter().any(|r| r.preview_uuid.is_none())
     }
 
@@ -1045,6 +1163,12 @@ impl AudioScoutApp {
                     // gone for real. Only now it is safe to submit fresh
                     // generation jobs (see `finish_preview_purge`).
                     self.finish_preview_purge(&dir, rows_removed, ctx);
+                }
+                UiEvent::PreviewFilePurged { path } => {
+                    // Per-file purge (context-menu "Refresh preview") done:
+                    // the file's DB rows and PNGs really are deleted, so now
+                    // (and only now) re-submit one generation job for it.
+                    self.finish_file_preview_purge(&path, ctx);
                 }
             }
         }
@@ -3352,6 +3476,10 @@ impl eframe::App for AudioScoutApp {
         // needs `&mut self`, which is unavailable while the grid immutably
         // borrows `file_rows`/`preview_cache`/`selected_row` inside.
         let mut file_to_vlc: Option<PathBuf> = None;
+        // "Refresh preview" picked from the same menu: one file row's cache
+        // (DB rows + PNGs, both styles) to purge and regenerate. Deferred for
+        // the same borrow reason as `file_to_vlc`.
+        let mut file_preview_refresh: Option<PathBuf> = None;
 
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -3866,7 +3994,10 @@ impl eframe::App for AudioScoutApp {
                         }
                         let open_state = ctx.data(|d| d.get_temp::<FileMenuState>(menu_claim));
                         if let Some(state) = open_state {
-                            let items = ["Open with VLC"];
+                            // Menu items: "Open with VLC" and per-file
+                            // "Refresh preview" (purge this file's cache — DB
+                            // rows + PNGs, both styles — and regenerate it).
+                            let items = ["Open with VLC", "Refresh preview"];
                             let mut chosen: Option<&str> = None;
                             let frame = egui::Frame::menu(&ctx.style());
                             egui::Area::new(file_vlc_menu_id().with("menu"))
@@ -3900,8 +4031,14 @@ impl eframe::App for AudioScoutApp {
                             if close || chosen.is_some() {
                                 ctx.data_mut(|d| d.remove::<FileMenuState>(menu_claim));
                             }
-                            if chosen.is_some() {
-                                file_to_vlc = Some(state.path.clone());
+                            match chosen {
+                                Some("Open with VLC") => {
+                                    file_to_vlc = Some(state.path.clone());
+                                }
+                                Some("Refresh preview") => {
+                                    file_preview_refresh = Some(state.path.clone());
+                                }
+                                _ => {}
                             }
                         }
 
@@ -3942,6 +4079,13 @@ impl eframe::App for AudioScoutApp {
         // `&mut self` (§ context menu).
         if let Some(file) = file_to_vlc {
             self.open_in_vlc(&file, false);
+        }
+
+        // "Refresh preview" picked from the same menu: purge this one file's
+        // cache (DB rows + PNG files) and regenerate it. Deferred outside the
+        // panel closures for the same `&mut self` borrow reason as above.
+        if let Some(file) = file_preview_refresh {
+            self.refresh_file_preview(&file, ctx);
         }
 
 

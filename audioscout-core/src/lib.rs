@@ -92,6 +92,15 @@ pub enum UiEvent {
         dir: PathBuf,
         rows_removed: usize,
     },
+    /// Per-file counterpart of [`UiEvent::PreviewsPurged`] (context-menu
+    /// "Refresh preview"): the cache of the single audio file `path` (all
+    /// modes — DB rows + PNG files) was purged on a background thread. The
+    /// UI drops the stale texture handles and re-submits one generation job
+    /// only after this event arrives, so the fresh render cannot re-use the
+    /// cache being deleted.
+    PreviewFilePurged {
+        path: PathBuf,
+    },
 }
 
 /// Application-wide event channel

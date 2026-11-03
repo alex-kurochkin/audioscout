@@ -163,6 +163,20 @@ impl PreviewWorker {
         }
     }
 
+    /// Drop every trace of `path` from the pipeline: its queued job (if any)
+    /// and its dedup flag. Used by the per-file context-menu "Refresh
+    /// preview": before purging a file's cache the app forgets the path here,
+    /// so (a) a queued job can never render into the PNG being deleted and
+    /// (b) the follow-up regeneration job is not rejected as a duplicate.
+    /// An *actively rendering* job cannot be cancelled; its stale result is
+    /// discarded on the app side via the bumped scan generation.
+    pub fn forget_path(&self, path: &Path) {
+        let mut queue = self.inner.queue.lock().unwrap();
+        queue.retain(|job| job.path != path);
+        drop(queue);
+        self.inner.pending.lock().unwrap().remove(path);
+    }
+
     /// Stop accepting work and wait for running renders to finish.
     pub fn shutdown(&mut self) {
         self.inner.quit.store(true, Ordering::SeqCst);
@@ -446,6 +460,65 @@ pub fn delete_previews_for_dir_with_db(db: &Database, dir: &Path) -> std::io::Re
 /// opens its own connection via `Database::reopen` and moves it here.
 pub fn delete_previews_for_dir_with_db_owned(db: Database, dir: &Path) -> std::io::Result<usize> {
     delete_previews_for_dir_with_db_no_reopen(&db, dir)
+}
+
+/// Purge the preview cache of a **single audio file** (context-menu
+/// "Refresh preview"): every DB row belonging to `file` (any path spelling,
+/// any preview style) plus every PNG behind those rows and the deterministic
+/// names computed from live metadata. Mirrors the directory-wide purge scoped
+/// down to one file; the same rules about running on a background thread with
+/// an independently opened connection apply (see
+/// [`delete_previews_for_dir_with_db`]).
+pub fn delete_preview_for_file_with_db_owned(db: Database, file: &Path) -> std::io::Result<usize> {
+    // Snapshot BEFORE deleting: the uuid column is the only pointer to the
+    // PNG filenames that were registered in the DB.
+    let rows = db
+        .list_previews_for_file_any_spelling(file)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+
+    let mut png_files: Vec<PathBuf> = Vec::new();
+    for (_path_str, uuid) in &rows {
+        png_files.push(preview_png_path(uuid));
+    }
+
+    // Deterministic-name PNGs for both styles, hashed from the *exact* path
+    // string the row was stored under (the hash includes the raw text!) and
+    // from the live listing path — this catches orphaned images whose rows
+    // never made it into (or already left) the DB.
+    let mut spellings: Vec<PathBuf> = rows.iter().map(|(p, _)| PathBuf::from(p)).collect();
+    spellings.push(file.to_path_buf());
+    for p in &spellings {
+        if let Ok(meta) = std::fs::metadata(p) {
+            if meta.is_file() {
+                let channels = crate::audio_io::probe_file_header(p).channels.max(1);
+                for mode in [PreviewMode::Waveform, PreviewMode::Spectrogram] {
+                    if let Ok(u) = generate_preview_uuid(p, channels, mode.uuid_suffix()) {
+                        png_files.push(preview_png_path(&u));
+                    }
+                }
+            }
+        }
+    }
+
+    // Remove the rows themselves (all modes / all spellings of this file).
+    let removed_rows = db
+        .delete_all_previews_for_file(file)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+
+    let mut removed_files = 0usize;
+    for png in png_files {
+        if std::fs::remove_file(&png).is_ok() {
+            removed_files += 1;
+        }
+    }
+
+    tracing::info!(
+        "Refresh preview: purged {} DB rows and {} PNG files for {}",
+        removed_rows,
+        removed_files,
+        file.display()
+    );
+    Ok(removed_rows)
 }
 
 /// Convenience wrapper that opens the app database itself. Prefer

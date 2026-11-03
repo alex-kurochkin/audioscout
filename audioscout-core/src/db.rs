@@ -214,6 +214,53 @@ impl Database {
         Ok(removed)
     }
 
+    /// Snapshot `(path, uuid)` pairs of every cached preview belonging to the
+    /// single audio file `file`. The stored path text is compared after
+    /// normalisation (`./dir/x.wav`, `dir//x.wav`, … all match `dir/x.wav`),
+    /// so rows saved under any spelling of the same location are returned —
+    /// with their exact stored text, which is what the deterministic PNG
+    /// filename was hashed from. Used by the per-file context-menu
+    /// "Refresh preview" to locate and unlink the real cache files.
+    pub fn list_previews_for_file_any_spelling(&self, file: &Path) -> Result<Vec<(String, String)>, rusqlite::Error> {
+        let want = normalize_path(file);
+        let mut out = Vec::new();
+        {
+            let mut stmt = self.conn.prepare("SELECT path, uuid FROM previews")?;
+            let rows = stmt.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            for r in rows.flatten() {
+                if normalize_path(Path::new(&r.0)) == want {
+                    out.push(r);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Delete every preview row that belongs to the single audio file `file`,
+    /// regardless of the exact path spelling it was stored under (normalised
+    /// component-wise equality). Returns the number of rows removed. This is
+    /// the DB half of the per-file "Refresh preview" purge; the PNG files
+    /// themselves are unlinked by `preview_worker::delete_preview_for_file`.
+    pub fn delete_all_previews_for_file(&self, file: &Path) -> Result<usize, rusqlite::Error> {
+        let paths: Vec<String> = {
+            let mut stmt = self.conn.prepare("SELECT path FROM previews")?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+            rows.flatten()
+                .filter(|p| normalize_path(Path::new(p)) == normalize_path(file))
+                .collect()
+        };
+        let mut removed = 0usize;
+        for path_str in &paths {
+            removed += self.conn.execute(
+                "DELETE FROM previews WHERE path = ?1",
+                params![path_str],
+            )?;
+        }
+        Ok(removed)
+    }
+
     /// Enumerate regular files directly inside `dir` (one level, no
     /// recursion). Unreadable directories yield an empty list.
     pub fn top_level_files(dir: &Path) -> Vec<PathBuf> {
@@ -381,5 +428,39 @@ mod tests {
         db.delete_previews_in_dir(Path::new("/data/music/")).unwrap();
         let left: Vec<String> = db.get_all_preview_uuids().unwrap();
         assert_eq!(left.len(), 2, "trailing slash does not widen/narrow the scope");
+    }
+
+    /// Per-file purge (context-menu "Refresh preview") must remove every row
+    /// of exactly one file — including rows stored under a different but
+    /// equivalent spelling of its path (`./dir/x.wav`) — while leaving all
+    /// other files (siblings in the same directory included) untouched.
+    #[test]
+    fn delete_previews_for_file_is_exact_and_spelling_tolerant() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(&dir.path().join("app.db")).unwrap();
+
+        let target = Path::new("/data/music/a.wav");
+        let sibling = Path::new("/data/music/b.wav");
+        let nested = Path::new("/data/music/sub/a.wav");
+
+        db.save_preview(target, 10, 20, "wave", "uuid-target").unwrap();
+        // Same file, another spelling + the other preview style.
+        db.save_preview(Path::new("/data/music/./a.wav"), 10, 20, "spectro", "uuid-target-alt").unwrap();
+        db.save_preview(sibling, 10, 20, "wave", "uuid-sibling").unwrap();
+        db.save_preview(nested, 10, 20, "wave", "uuid-nested").unwrap();
+
+        // The snapshot used to locate PNG files returns both spellings.
+        let listed = db.list_previews_for_file_any_spelling(Path::new("/data/music/a.wav")).unwrap();
+        let uuids: Vec<&str> = listed.iter().map(|(_, u)| u.as_str()).collect();
+        assert!(uuids.contains(&"uuid-target"));
+        assert!(uuids.contains(&"uuid-target-alt"));
+
+        let removed = db.delete_all_previews_for_file(target).unwrap();
+        assert_eq!(removed, 2, "all rows of the file (any spelling, any mode) are gone");
+
+        let left: Vec<String> = db.get_all_preview_uuids().unwrap();
+        assert_eq!(left.len(), 2);
+        assert!(left.contains(&"uuid-sibling".to_string()));
+        assert!(left.contains(&"uuid-nested".to_string()));
     }
 }
