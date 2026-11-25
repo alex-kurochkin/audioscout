@@ -1,3 +1,4 @@
+pub mod actions;
 pub mod audio_io;
 pub mod audio_view;
 pub mod config;

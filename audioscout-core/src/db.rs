@@ -357,19 +357,71 @@ impl Database {
         ).ok()
     }
 
-    /// Rename path in markers and previews
+    /// Rename path in markers and previews (tz §3.4/§7: "Rename файла →
+    /// UPDATE путей в markers и previews").
+    ///
+    /// BUGFIX (rename silently orphaned every DB row): the old implementation
+    /// matched rows with a raw textual equality (`WHERE path = ?`). Stored
+    /// paths are whatever string each writer happened to use — relative
+    /// (`./music/a.wav`), doubled separators (`dir//a.wav`), `./.`-prefixed or
+    /// an equivalent-but-different absolute spelling — while the rename call
+    /// site passes the freshly canonicalised target path. Neither side of the
+    /// comparison was normalised, so the UPDATE matched zero rows: the renamed
+    /// file lost its markers and preview cache entry to orphaned rows keyed by
+    /// the old spelling, exactly like the directory-purge bug fixed in
+    /// [`Database::delete_previews_in_dir`].
+    ///
+    /// Matching now compares normalised path *components* (see
+    /// [`normalize_path`]) computed from the stored text against the
+    /// normalised `old_path`, so every spelling of the same location is found.
+    /// The replacement keeps the original parent-directory spelling of each
+    /// matched row and swaps only the file name: renaming `x.wav` to `y.wav`
+    /// inside `./music` rewrites the row to `./music/y.wav`, never collapsing
+    /// it into a differently-spelled (and possibly stale) path.
     pub fn rename_path(&self, old_path: &Path, new_path: &Path) -> Result<(), rusqlite::Error> {
-        let old_str = old_path.to_string_lossy().to_string();
-        let new_str = new_path.to_string_lossy().to_string();
+        let want = normalize_path(old_path);
+        if want == PathBuf::new() {
+            return Ok(());
+        }
+        let new_name = match new_path.file_name() {
+            Some(n) => n.to_owned(),
+            None => return Ok(()),
+        };
 
-        self.conn.execute(
-            "UPDATE markers SET path = ?1 WHERE path = ?2",
-            params![new_str, old_str],
-        )?;
-        self.conn.execute(
-            "UPDATE previews SET path = ?1 WHERE path = ?2",
-            params![new_str, old_str],
-        )?;
+        // Collect the matching rows first: mutating the table while a SELECT
+        // statement over it is still alive would invalidate the iteration.
+        let mut updates: Vec<(String, String)> = Vec::new();
+        for table in ["markers", "previews"] {
+            let mut stmt =
+                self.conn.prepare(&format!("SELECT DISTINCT path FROM {table}"))?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+            for r in rows {
+                let stored = r?;
+                let stored_path = Path::new(&stored);
+                let matches = normalize_path(stored_path) == want;
+                if matches {
+                    let updated = match stored_path.parent() {
+                        Some(parent) => parent.join(&new_name),
+                        None => PathBuf::from(&new_name),
+                    };
+                    let updated_str = updated.to_string_lossy().into_owned();
+                    if updated_str != stored {
+                        updates.push((stored, updated_str));
+                    }
+                }
+            }
+        }
+
+        for (old_str, new_str) in &updates {
+            self.conn.execute(
+                "UPDATE markers SET path = ?1 WHERE path = ?2",
+                params![new_str, old_str],
+            )?;
+            self.conn.execute(
+                "UPDATE previews SET path = ?1 WHERE path = ?2",
+                params![new_str, old_str],
+            )?;
+        }
 
         Ok(())
     }
